@@ -21,7 +21,7 @@ type MyNode struct {
 // We require lfstack objects to live outside the heap so that
 // checkptr passes on the unsafe shenanigans used.
 func allocMyNode(data int) *MyNode {
-	n := (*MyNode)(PersistentAlloc(unsafe.Sizeof(MyNode{})))
+	n := (*MyNode)(PersistentAlloc(unsafe.Sizeof(MyNode{}), TagAlign))
 	LFNodeValidate(&n.LFNode)
 	n.data = data
 	return n
@@ -82,8 +82,9 @@ func TestLFStack(t *testing.T) {
 }
 
 func TestLFStackStress(t *testing.T) {
+	t.Parallel()
 	const K = 100
-	P := 4 * GOMAXPROCS(-1)
+	P := 4 * min(GOMAXPROCS(-1), 16)
 	N := 100000
 	if testing.Short() {
 		N /= 10

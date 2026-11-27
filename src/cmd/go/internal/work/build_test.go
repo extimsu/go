@@ -5,7 +5,6 @@
 package work
 
 import (
-	"fmt"
 	"internal/testenv"
 	"io/fs"
 	"os"
@@ -217,6 +216,30 @@ func pkgImportPath(pkgpath string) *load.Package {
 	}
 }
 
+func TestMoveOrCopyFileOutsideWorkDir(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "cached.a")
+	dst := filepath.Join(dir, "installed.a")
+	const content = "archive contents"
+	if err := os.WriteFile(src, []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	sh := NewShell(filepath.Join(dir, "work"), nil)
+	if err := sh.moveOrCopyFile(dst, src, 0666, true); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range []string{src, dst} {
+		got, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != content {
+			t.Errorf("%s = %q; want %q", file, got, content)
+		}
+	}
+}
+
 // When installing packages, the installed package directory should
 // respect the SetGID bit and group name of the destination
 // directory.
@@ -226,21 +249,16 @@ func TestRespectSetgidDir(t *testing.T) {
 	// of `(*Shell).ShowCmd` afterwards as a sanity check.
 	cfg.BuildX = true
 	var cmdBuf strings.Builder
-	sh := NewShell("", func(a ...any) (int, error) {
-		return cmdBuf.WriteString(fmt.Sprint(a...))
-	})
+	workDir := t.TempDir()
+	sh := NewShell(workDir, &load.TextPrinter{Writer: &cmdBuf})
 
-	setgiddir, err := os.MkdirTemp("", "SetGroupID")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(setgiddir)
+	setgiddir := t.TempDir()
 
 	// BSD mkdir(2) inherits the parent directory group, and other platforms
 	// can inherit the parent directory group via setgid. The test setup (chmod
 	// setgid) will fail if the process does not have the group permission to
 	// the new temporary directory.
-	err = os.Chown(setgiddir, os.Getuid(), os.Getgid())
+	err := os.Chown(setgiddir, os.Getuid(), os.Getgid())
 	if err != nil {
 		if testenv.SyscallIsNotSupported(err) {
 			t.Skip("skipping: chown is not supported on " + runtime.GOOS)
@@ -261,9 +279,9 @@ func TestRespectSetgidDir(t *testing.T) {
 		t.Skip("skipping: Chmod ignored ModeSetgid on " + runtime.GOOS)
 	}
 
-	pkgfile, err := os.CreateTemp("", "pkgfile")
+	pkgfile, err := os.CreateTemp(workDir, "pkgfile")
 	if err != nil {
-		t.Fatalf("os.CreateTemp(\"\", \"pkgfile\"): %v", err)
+		t.Fatalf("os.CreateTemp(%q, \"pkgfile\"): %v", workDir, err)
 	}
 	defer os.Remove(pkgfile.Name())
 	defer pkgfile.Close()

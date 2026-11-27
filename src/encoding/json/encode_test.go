@@ -2,11 +2,14 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+//go:build !goexperiment.jsonv2
+
 package json
 
 import (
 	"bytes"
 	"encoding"
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -14,10 +17,13 @@ import (
 	"regexp"
 	"runtime/debug"
 	"strconv"
+	"sync"
 	"testing"
+	"testing/synctest"
+	"time"
 )
 
-type Optionals struct {
+type OptionalsEmpty struct {
 	Sr string `json:"sr"`
 	So string `json:"so,omitempty"`
 	Sw string `json:"-"`
@@ -45,7 +51,7 @@ type Optionals struct {
 }
 
 func TestOmitEmpty(t *testing.T) {
-	var want = `{
+	const want = `{
  "sr": "",
  "omitempty": 0,
  "slr": null,
@@ -56,8 +62,189 @@ func TestOmitEmpty(t *testing.T) {
  "str": {},
  "sto": {}
 }`
-	var o Optionals
+	var o OptionalsEmpty
 	o.Sw = "something"
+	o.Mr = map[string]any{}
+	o.Mo = map[string]any{}
+
+	got, err := MarshalIndent(&o, "", " ")
+	if err != nil {
+		t.Fatalf("MarshalIndent error: %v", err)
+	}
+	if got := string(got); got != want {
+		t.Errorf("MarshalIndent:\n\tgot:  %s\n\twant: %s\n", indentNewlines(got), indentNewlines(want))
+	}
+}
+
+type NonZeroStruct struct{}
+
+func (nzs NonZeroStruct) IsZero() bool {
+	return false
+}
+
+type NoPanicStruct struct {
+	Int int `json:"int,omitzero"`
+}
+
+func (nps *NoPanicStruct) IsZero() bool {
+	return nps.Int != 0
+}
+
+type OptionalsZero struct {
+	Sr string `json:"sr"`
+	So string `json:"so,omitzero"`
+	Sw string `json:"-"`
+
+	Ir int `json:"omitzero"` // actually named omitzero, not an option
+	Io int `json:"io,omitzero"`
+
+	Slr       []string `json:"slr,random"`
+	Slo       []string `json:"slo,omitzero"`
+	SloNonNil []string `json:"slononnil,omitzero"`
+
+	Mr  map[string]any `json:"mr"`
+	Mo  map[string]any `json:",omitzero"`
+	Moo map[string]any `json:"moo,omitzero"`
+
+	Fr   float64    `json:"fr"`
+	Fo   float64    `json:"fo,omitzero"`
+	Foo  float64    `json:"foo,omitzero"`
+	Foo2 [2]float64 `json:"foo2,omitzero"`
+
+	Br bool `json:"br"`
+	Bo bool `json:"bo,omitzero"`
+
+	Ur uint `json:"ur"`
+	Uo uint `json:"uo,omitzero"`
+
+	Str struct{} `json:"str"`
+	Sto struct{} `json:"sto,omitzero"`
+
+	Time      time.Time     `json:"time,omitzero"`
+	TimeLocal time.Time     `json:"timelocal,omitzero"`
+	Nzs       NonZeroStruct `json:"nzs,omitzero"`
+
+	NilIsZeroer    isZeroer       `json:"niliszeroer,omitzero"`    // nil interface
+	NonNilIsZeroer isZeroer       `json:"nonniliszeroer,omitzero"` // non-nil interface
+	NoPanicStruct0 isZeroer       `json:"nps0,omitzero"`           // non-nil interface with nil pointer
+	NoPanicStruct1 isZeroer       `json:"nps1,omitzero"`           // non-nil interface with non-nil pointer
+	NoPanicStruct2 *NoPanicStruct `json:"nps2,omitzero"`           // nil pointer
+	NoPanicStruct3 *NoPanicStruct `json:"nps3,omitzero"`           // non-nil pointer
+	NoPanicStruct4 NoPanicStruct  `json:"nps4,omitzero"`           // concrete type
+}
+
+func TestOmitZero(t *testing.T) {
+	const want = `{
+ "sr": "",
+ "omitzero": 0,
+ "slr": null,
+ "slononnil": [],
+ "mr": {},
+ "Mo": {},
+ "fr": 0,
+ "br": false,
+ "ur": 0,
+ "str": {},
+ "nzs": {},
+ "nps1": {},
+ "nps3": {},
+ "nps4": {}
+}`
+	var o OptionalsZero
+	o.Sw = "something"
+	o.SloNonNil = make([]string, 0)
+	o.Mr = map[string]any{}
+	o.Mo = map[string]any{}
+
+	o.Foo = -0
+	o.Foo2 = [2]float64{+0, -0}
+
+	o.TimeLocal = time.Time{}.Local()
+
+	o.NonNilIsZeroer = time.Time{}
+	o.NoPanicStruct0 = (*NoPanicStruct)(nil)
+	o.NoPanicStruct1 = &NoPanicStruct{}
+	o.NoPanicStruct3 = &NoPanicStruct{}
+
+	got, err := MarshalIndent(&o, "", " ")
+	if err != nil {
+		t.Fatalf("MarshalIndent error: %v", err)
+	}
+	if got := string(got); got != want {
+		t.Errorf("MarshalIndent:\n\tgot:  %s\n\twant: %s\n", indentNewlines(got), indentNewlines(want))
+	}
+}
+
+func TestOmitZeroMap(t *testing.T) {
+	const want = `{
+ "foo": {
+  "sr": "",
+  "omitzero": 0,
+  "slr": null,
+  "mr": null,
+  "fr": 0,
+  "br": false,
+  "ur": 0,
+  "str": {},
+  "nzs": {},
+  "nps4": {}
+ }
+}`
+	m := map[string]OptionalsZero{"foo": {}}
+	got, err := MarshalIndent(m, "", " ")
+	if err != nil {
+		t.Fatalf("MarshalIndent error: %v", err)
+	}
+	if got := string(got); got != want {
+		fmt.Println(got)
+		t.Errorf("MarshalIndent:\n\tgot:  %s\n\twant: %s\n", indentNewlines(got), indentNewlines(want))
+	}
+}
+
+type OptionalsEmptyZero struct {
+	Sr string `json:"sr"`
+	So string `json:"so,omitempty,omitzero"`
+	Sw string `json:"-"`
+
+	Io int `json:"io,omitempty,omitzero"`
+
+	Slr       []string `json:"slr,random"`
+	Slo       []string `json:"slo,omitempty,omitzero"`
+	SloNonNil []string `json:"slononnil,omitempty,omitzero"`
+
+	Mr map[string]any `json:"mr"`
+	Mo map[string]any `json:",omitempty,omitzero"`
+
+	Fr float64 `json:"fr"`
+	Fo float64 `json:"fo,omitempty,omitzero"`
+
+	Br bool `json:"br"`
+	Bo bool `json:"bo,omitempty,omitzero"`
+
+	Ur uint `json:"ur"`
+	Uo uint `json:"uo,omitempty,omitzero"`
+
+	Str struct{} `json:"str"`
+	Sto struct{} `json:"sto,omitempty,omitzero"`
+
+	Time time.Time     `json:"time,omitempty,omitzero"`
+	Nzs  NonZeroStruct `json:"nzs,omitempty,omitzero"`
+}
+
+func TestOmitEmptyZero(t *testing.T) {
+	const want = `{
+ "sr": "",
+ "slr": null,
+ "mr": {},
+ "fr": 0,
+ "br": false,
+ "ur": 0,
+ "str": {},
+ "nzs": {}
+}`
+	var o OptionalsEmptyZero
+	o.Sw = "something"
+	o.SloNonNil = make([]string, 0)
 	o.Mr = map[string]any{}
 	o.Mo = map[string]any{}
 
@@ -243,6 +430,76 @@ func TestUnsupportedValues(t *testing.T) {
 	}
 }
 
+// Issue 81176: UnsupportedValueError.Value should hold the NaN or ±Inf value.
+func TestUnsupportedValueErrorValue(t *testing.T) {
+	type NamedFloat float64
+	tests := []struct {
+		CaseName
+		in   any
+		want any
+	}{
+		{Name(""), NamedFloat(math.NaN()), NamedFloat(math.NaN())},
+		{Name(""), math.Inf(-1), math.Inf(-1)},
+		{Name(""), NamedFloat(math.Inf(1)), NamedFloat(math.Inf(1))},
+		{Name(""), map[string]float64{"x": math.Inf(1)}, math.Inf(1)},
+		{Name(""), []NamedFloat{NamedFloat(math.NaN())}, NamedFloat(math.NaN())},
+		{Name(""), struct{ F float64 }{math.Inf(-1)}, math.Inf(-1)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.Name, func(t *testing.T) {
+			_, err := Marshal(tt.in)
+			uve, ok := err.(*UnsupportedValueError)
+			if !ok {
+				t.Fatalf("%s: Marshal error:\n\tgot:  %T\n\twant: %T", tt.Where, err, new(UnsupportedValueError))
+			}
+			got := uve.Value
+			want := reflect.ValueOf(tt.want)
+			if got.Type() != want.Type() {
+				t.Fatalf("%s: UnsupportedValueError.Value.Type = %v, want %v", tt.Where, got.Type(), want.Type())
+			}
+			equalFloat := func(x, y float64) bool {
+				return x == y || math.IsNaN(x) == math.IsNaN(y)
+			}
+			if !equalFloat(got.Float(), want.Float()) {
+				t.Fatalf("%s: UnsupportedValueError.Value.Float = %v, want %v", tt.Where, got.Float(), want.Float())
+			}
+		})
+	}
+}
+
+// Issue 82079: UnsupportedValueError.Value should hold the value with the cycle.
+func TestUnsupportedValueErrorValueCycle(t *testing.T) {
+	tests := []struct {
+		CaseName
+		in   any
+		want reflect.Type
+	}{
+		{Name(""), pointerCycle, reflect.TypeFor[*PointerCycle]()},
+		{Name(""), pointerCycleIndirect, reflect.TypeFor[*PointerCycleIndirect]()},
+		{Name(""), mapCycle, reflect.TypeFor[map[string]any]()},
+		{Name(""), sliceCycle, reflect.TypeFor[[]any]()},
+		{Name(""), recursiveSliceCycle, reflect.TypeFor[RecursiveSlice]()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.Name, func(t *testing.T) {
+			_, err := Marshal(tt.in)
+			uve, ok := err.(*UnsupportedValueError)
+			if !ok {
+				t.Fatalf("%s: Marshal error:\n\tgot:  %T\n\twant: %T", tt.Where, err, new(UnsupportedValueError))
+			}
+			if !uve.Value.IsValid() {
+				t.Fatalf("%s: UnsupportedValueError.Value is invalid", tt.Where)
+			}
+			if got := uve.Value.Type(); got != tt.want {
+				t.Fatalf("%s: UnsupportedValueError.Value.Type = %v, want %v", tt.Where, got, tt.want)
+			}
+			if got, want := uve.Str, "encountered a cycle via "+tt.want.String(); got != want {
+				t.Fatalf("%s: UnsupportedValueError.Str = %q, want %q", tt.Where, got, want)
+			}
+		})
+	}
+}
+
 // Issue 43207
 func TestMarshalTextFloatMap(t *testing.T) {
 	m := map[textfloat]string{
@@ -324,6 +581,49 @@ func TestRefValMarshal(t *testing.T) {
 	}
 	if got := string(b); got != want {
 		t.Errorf("Marshal:\n\tgot:  %s\n\twant: %s", got, want)
+	}
+}
+
+// A pointer-receiver MarshalJSON is called for a field reached through an
+// embedded pointer, even when the outer value is not addressable.
+// It is not called for a field of an unaddressable value with no pointer in between.
+func TestMarshalEmbeddedPointer(t *testing.T) {
+	type inner struct {
+		R Ref    `json:"r"`
+		A [1]Ref `json:"a"`
+	}
+	type outer struct{ *inner }
+	in := inner{R: 1, A: [1]Ref{2}}
+
+	type direct struct {
+		R Ref `json:"r"`
+	}
+	type directArr struct {
+		A [1]Ref `json:"a"`
+	}
+
+	tests := []struct {
+		name string
+		in   any
+		want string
+	}{
+		{"embedded pointer", outer{&in}, `{"r":"ref","a":["ref"]}`},
+		{"pointer to outer", &outer{&in}, `{"r":"ref","a":["ref"]}`},
+		{"unaddressable field", direct{R: 1}, `{"r":1}`},
+		{"addressable field", &direct{R: 1}, `{"r":"ref"}`},
+		{"unaddressable array", directArr{A: [1]Ref{2}}, `{"a":[2]}`},
+		{"addressable array", &directArr{A: [1]Ref{2}}, `{"a":["ref"]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b, err := Marshal(tt.in)
+			if err != nil {
+				t.Fatalf("Marshal error: %v", err)
+			}
+			if got := string(b); got != tt.want {
+				t.Errorf("Marshal:\n\tgot:  %s\n\twant: %s", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -513,7 +813,7 @@ func TestAnonymousFields(t *testing.T) {
 		},
 		want: `{"MyInt1":1,"MyInt2":3}`,
 	}, {
-		// If an anonymous struct pointer field is nil, we should ignore
+		// If an embedded struct pointer field is nil, we should ignore
 		// the embedded fields behind it. Not properly doing so may
 		// result in the wrong output or reflect panics.
 		CaseName: Name("EmbeddedFieldBehindNilPointer"),
@@ -604,6 +904,10 @@ func TestNilMarshal(t *testing.T) {
 		{Name(""), struct{ M encoding.TextMarshaler }{}, `{"M":null}`},
 		{Name(""), struct{ M encoding.TextMarshaler }{(*nilTextMarshaler)(nil)}, `{"M":"0zenil0"}`},
 		{Name(""), struct{ M any }{(*nilTextMarshaler)(nil)}, `{"M":null}`},
+		{Name(""), struct{ M interface{ Marshaler } }{(*nilJSONMarshaler)(nil)}, `{"M":"0zenil0"}`},
+		{Name(""), struct {
+			M interface{ encoding.TextMarshaler }
+		}{(*nilTextMarshaler)(nil)}, `{"M":"0zenil0"}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.Name, func(t *testing.T) {
@@ -655,6 +959,23 @@ type BugD struct { // Same as BugA after tagging.
 type BugY struct {
 	BugA
 	BugD
+}
+
+// A tag name holding a character isValidTag rejects is not a name at all, so
+// the field keeps its Go name. See golang.org/issue/81383.
+func TestInvalidTagNameUsesFieldName(t *testing.T) {
+	var v struct {
+		Quote     int `json:"one\"two"`
+		Backslash int `json:"one\\two"`
+		Valid     int `json:"ok"`
+	}
+	got, err := Marshal(v)
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+	if want := `{"Quote":0,"Backslash":0,"ok":0}`; string(got) != want {
+		t.Errorf("Marshal:\n\tgot  %s\n\twant %s", got, want)
+	}
 }
 
 // Test that a field with a tag dominates untagged fields.
@@ -925,6 +1246,64 @@ func TestNilMarshalerTextMapKey(t *testing.T) {
 	}
 }
 
+// textMarshalerString is a string kind that implements encoding.TextMarshaler.
+type textMarshalerString string
+
+func (s textMarshalerString) MarshalText() ([]byte, error) {
+	return []byte("X_" + string(s)), nil
+}
+
+func (s textMarshalerString) AppendText(b []byte) ([]byte, error) {
+	return append(b, ("X_" + string(s))...), nil
+}
+
+// Issue 81355: string-kind map keys are used directly even if the key type
+// implements encoding.TextMarshaler. MarshalText is still called for values.
+func TestStringKindTextMarshalerMapKey(t *testing.T) {
+	got, err := Marshal(map[textMarshalerString]textMarshalerString{"foo": "bar"})
+	if err != nil {
+		t.Fatalf("Marshal error: %v", err)
+	}
+	const want = `{"foo":"X_bar"}`
+	if string(got) != want {
+		t.Errorf("Marshal:\n\tgot:  %s\n\twant: %s", got, want)
+	}
+}
+
+// ptrTextMarshalerString is a string kind that implements encoding.TextMarshaler
+// with a pointer receiver.
+type ptrTextMarshalerString string
+
+func (s *ptrTextMarshalerString) MarshalText() ([]byte, error) {
+	return []byte("P_" + string(*s)), nil
+}
+
+// Map keys of pointer kind are not used directly, so MarshalText is called
+// even if they point to a string kind, including when held in an interface.
+func TestPointerToStringKindTextMarshalerMapKey(t *testing.T) {
+	k1 := textMarshalerString("foo")
+	k2 := ptrTextMarshalerString("foo")
+	tests := []struct {
+		in   any
+		want string
+	}{
+		{map[*textMarshalerString]int{&k1: 1}, `{"X_foo":1}`},
+		{map[*ptrTextMarshalerString]int{&k2: 1}, `{"P_foo":1}`},
+		{map[ptrTextMarshalerString]int{"foo": 1}, `{"foo":1}`},
+		{map[encoding.TextMarshaler]int{&k1: 1}, `{"X_foo":1}`},
+		{map[encoding.TextMarshaler]int{&k2: 1}, `{"P_foo":1}`},
+	}
+	for _, tt := range tests {
+		got, err := Marshal(tt.in)
+		if err != nil {
+			t.Fatalf("Marshal(%T) error: %v", tt.in, err)
+		}
+		if string(got) != tt.want {
+			t.Errorf("Marshal(%T):\n\tgot:  %s\n\twant: %s", tt.in, got, tt.want)
+		}
+	}
+}
+
 var re = regexp.MustCompile
 
 // syntactic checks on form of marshaled floating point numbers.
@@ -1168,7 +1547,12 @@ func TestMarshalUncommonFieldNames(t *testing.T) {
 func TestMarshalerError(t *testing.T) {
 	s := "test variable"
 	st := reflect.TypeOf(s)
-	errText := "json: test error"
+	const errText = "json: test error"
+
+	marshalError := func(v any) *MarshalerError {
+		_, err := Marshal(v)
+		return err.(*MarshalerError)
+	}
 
 	tests := []struct {
 		CaseName
@@ -1182,6 +1566,14 @@ func TestMarshalerError(t *testing.T) {
 		Name(""),
 		&MarshalerError{st, fmt.Errorf(errText), "TestMarshalerError"},
 		"json: error calling TestMarshalerError for type " + st.String() + ": " + errText,
+	}, {
+		Name(""),
+		marshalError(marshalJSONError("")), // non-addressable value
+		"json: error calling MarshalJSON for type " + reflect.TypeFor[marshalJSONError]().String() + ": MarshalJSON error",
+	}, {
+		Name(""),
+		marshalError(new(marshalJSONError(""))), // addressable value
+		"json: error calling MarshalJSON for type *" + reflect.TypeFor[marshalJSONError]().String() + ": MarshalJSON error",
 	}}
 
 	for _, tt := range tests {
@@ -1192,6 +1584,12 @@ func TestMarshalerError(t *testing.T) {
 			}
 		})
 	}
+}
+
+type marshalJSONError string
+
+func (marshalJSONError) MarshalJSON() ([]byte, error) {
+	return nil, errors.New("MarshalJSON error")
 }
 
 type marshaledValue string
@@ -1218,4 +1616,22 @@ func TestIssue63379(t *testing.T) {
 			t.Errorf("expected error for %q", v)
 		}
 	}
+}
+
+// Issue #73733: encoding/json used a WaitGroup to coordinate access to cache entries.
+// Since WaitGroup.Wait is durably blocking, this caused apparent deadlocks when
+// multiple bubbles called json.Marshal at the same time.
+func TestSynctestMarshal(t *testing.T) {
+	var wg sync.WaitGroup
+	for range 5 {
+		wg.Go(func() {
+			synctest.Test(t, func(t *testing.T) {
+				_, err := Marshal([]string{})
+				if err != nil {
+					t.Errorf("Marshal: %v", err)
+				}
+			})
+		})
+	}
+	wg.Wait()
 }

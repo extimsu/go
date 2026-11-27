@@ -40,6 +40,17 @@ import (
 	"log"
 )
 
+const (
+	opMOVL = 0x8b // MOV r32, r/m32
+	opLEAL = 0x8d // LEA r32, m
+
+	// In the ModR/M byte (bits 7:6 = mod, 5:3 = reg, 2:0 = r/m),
+	// mod=00 with r/m=101 (0x05) encodes a 32-bit displacement-only
+	// memory operand ([disp32]) with no base or index register.
+	modrmModRM  = 0b11_000_111 // 0xc7: mask for mod (bits 7:6) and r/m (bits 2:0)
+	modrmDisp32 = 0b00_000_101 // 0x05: mod=00, r/m=101 ([disp32])
+)
+
 func gentext(ctxt *ld.Link, ldr *loader.Loader) {
 	if ctxt.DynlinkingGo() {
 		// We need get_pc_thunk.
@@ -72,6 +83,9 @@ func gentext(ctxt *ld.Link, ldr *loader.Loader) {
 		{"di", 7},
 	} {
 		thunkfunc := ldr.CreateSymForUpdate("__x86.get_pc_thunk."+r.name, 0)
+		if t := thunkfunc.Type(); t != 0 && t != sym.SXREF && t != sym.SDYNIMPORT && t != sym.SUNDEFEXT {
+			continue // symbol already exists, probably loaded from a C object
+		}
 		thunkfunc.SetType(sym.STEXT)
 		ldr.SetAttrLocal(thunkfunc.Sym(), true)
 		o := func(op ...uint8) {
@@ -224,51 +238,6 @@ func adddynrel(target *ld.Target, ldr *loader.Loader, syms *ld.ArchSyms, s loade
 		su := ldr.MakeSymbolUpdater(s)
 		su.SetRelocType(rIdx, objabi.R_ADDR)
 		return true
-
-	case objabi.MachoRelocOffset + ld.MACHO_GENERIC_RELOC_VANILLA*2 + 0:
-		su := ldr.MakeSymbolUpdater(s)
-		su.SetRelocType(rIdx, objabi.R_ADDR)
-		if targType == sym.SDYNIMPORT {
-			ldr.Errorf(s, "unexpected reloc for dynamic symbol %s", ldr.SymName(targ))
-		}
-		return true
-
-	case objabi.MachoRelocOffset + ld.MACHO_GENERIC_RELOC_VANILLA*2 + 1:
-		su := ldr.MakeSymbolUpdater(s)
-		if targType == sym.SDYNIMPORT {
-			addpltsym(target, ldr, syms, targ)
-			su.SetRelocSym(rIdx, syms.PLT)
-			su.SetRelocAdd(rIdx, int64(ldr.SymPlt(targ)))
-			su.SetRelocType(rIdx, objabi.R_PCREL)
-			return true
-		}
-
-		su.SetRelocType(rIdx, objabi.R_PCREL)
-		return true
-
-	case objabi.MachoRelocOffset + ld.MACHO_FAKE_GOTPCREL:
-		su := ldr.MakeSymbolUpdater(s)
-		if targType != sym.SDYNIMPORT {
-			// have symbol
-			// turn MOVL of GOT entry into LEAL of symbol itself
-			sData := ldr.Data(s)
-			if r.Off() < 2 || sData[r.Off()-2] != 0x8b {
-				ldr.Errorf(s, "unexpected GOT reloc for non-dynamic symbol %s", ldr.SymName(targ))
-				return false
-			}
-
-			su.MakeWritable()
-			writeableData := su.Data()
-			writeableData[r.Off()-2] = 0x8d
-			su.SetRelocType(rIdx, objabi.R_PCREL)
-			return true
-		}
-
-		ld.AddGotSym(target, ldr, syms, targ, uint32(elf.R_386_GLOB_DAT))
-		su.SetRelocSym(rIdx, syms.GOT)
-		su.SetRelocAdd(rIdx, r.Add()+int64(ldr.SymGot(targ)))
-		su.SetRelocType(rIdx, objabi.R_PCREL)
-		return true
 	}
 
 	// Handle references to ELF symbols from our own object files.
@@ -294,10 +263,42 @@ func adddynrel(target *ld.Target, ldr *loader.Loader, syms *ld.ArchSyms, s loade
 		return true
 
 	case objabi.R_ADDR:
-		if ldr.SymType(s) != sym.SDATA {
+		if ldr.SymType(s).IsText() && target.IsElf() && target.IsInternal() {
+			// Loading the address of a dynamic symbol. Rewrite
+			// LEAL sym(SB), reg to MOVL got_entry, reg.
+			//
+			// The compiler only emits R_ADDR in 386 text for the
+			// 4-byte displacement or immediate at the end of an
+			// instruction, and the assembler emits LEAL sym(SB), reg
+			// as the 2-byte opcode and ModR/M sequence 8d /r followed
+			// by that displacement, without prefixes. Other
+			// instructions taking the address of a dynamic symbol
+			// (such as MOVL $sym(SB), reg) are rejected below.
+			if r.Siz() != 4 || r.Add() != 0 {
+				ldr.Errorf(s, "unexpected relocation size or nonzero addend for dynamic symbol %s", ldr.SymName(targ))
+				return false
+			}
+			sData := ldr.Data(s)
+			if r.Off() >= 2 && sData[r.Off()-2] == opLEAL && sData[r.Off()-1]&modrmModRM == modrmDisp32 {
+				su := ldr.MakeSymbolUpdater(s)
+				su.MakeWritable()
+				su.Data()[r.Off()-2] = opMOVL
+				ld.AddGotSym(target, ldr, syms, targ, uint32(elf.R_386_GLOB_DAT))
+				su.SetRelocSym(rIdx, syms.GOT)
+				su.SetRelocAdd(rIdx, int64(ldr.SymGot(targ)))
+				return true
+			}
+			ldr.Errorf(s, "unexpected R_ADDR reloc in text for dynamic symbol %s: not preceded by LEAL instruction", ldr.SymName(targ))
+			return false
+		}
+		if t := ldr.SymType(s); !t.IsDATA() && !t.IsNOPTRDATA() && !t.IsRODATA() {
 			break
 		}
 		if target.IsElf() {
+			if r.Siz() != 4 {
+				ldr.Errorf(s, "unexpected relocation for dynamic symbol %s", ldr.SymName(targ))
+				return false
+			}
 			ld.Adddynsym(ldr, target, syms, targ)
 			rel := ldr.MakeSymbolUpdater(syms.Rel)
 			rel.AddAddrPlus(target.Arch, s, int64(r.Off()))
@@ -393,7 +394,7 @@ func pereloc1(arch *sys.Arch, out *ld.OutBuf, ldr *loader.Loader, s loader.Sym, 
 	default:
 		return false
 
-	case objabi.R_DWARFSECREF:
+	case objabi.R_ADDROFF, objabi.R_DWARFSECREF:
 		v = ld.IMAGE_REL_I386_SECREL
 
 	case objabi.R_ADDR:

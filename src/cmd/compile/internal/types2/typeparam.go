@@ -15,7 +15,10 @@ var lastID atomic.Uint32
 // each call, starting with 1. It may be called concurrently.
 func nextID() uint64 { return uint64(lastID.Add(1)) }
 
-// A TypeParam represents a type parameter type.
+// A TypeParam represents the type of a type parameter in a generic declaration.
+//
+// A TypeParam has a name; use the [TypeParam.Obj] method to access
+// its [TypeName] object.
 type TypeParam struct {
 	check *Checker  // for lazy type bound completion
 	id    uint64    // unique id, for debugging only
@@ -25,8 +28,8 @@ type TypeParam struct {
 }
 
 // NewTypeParam returns a new TypeParam. Type parameters may be set on a Named
-// or Signature type by calling SetTypeParams. Setting a type parameter on more
-// than one type will result in a panic.
+// type by calling SetTypeParams. Setting a type parameter on more than one type
+// will result in a panic.
 //
 // The constraint argument can be nil, and set later via SetConstraint. If the
 // constraint is non-nil, it must be fully defined.
@@ -67,6 +70,18 @@ func (t *TypeParam) Index() int {
 
 // Constraint returns the type constraint specified for t.
 func (t *TypeParam) Constraint() Type {
+	if t.bound == nil {
+		// Before CL 825744, Constraint() returned t.bound directly, which could be nil
+		// for incomplete or uninitialized TypeParams (e.g. created via NewTypeParam
+		// without a subsequent SetConstraint). Callers (such as typeWriter,
+		// objectpath, and typeutil.Map) calling methods on the returned constraint would
+		// panic with unhandled nil-pointer dereferences.
+		//
+		// An incomplete TypeParam has no defined constraint. Constraint panics if
+		// called on an incomplete TypeParam whose constraint has not yet been set.
+		// Callers must ensure SetConstraint has been called before querying Constraint.
+		panic("incomplete TypeParam: constraint not set")
+	}
 	return t.bound
 }
 
@@ -86,6 +101,10 @@ func (t *TypeParam) SetConstraint(bound Type) {
 	t.iface()
 }
 
+// Underlying returns the [underlying type] of the type parameter t, which is
+// the underlying type of its constraint. This type is always an interface.
+//
+// [underlying type]: https://go.dev/ref/spec#Underlying_types.
 func (t *TypeParam) Underlying() Type {
 	return t.iface()
 }
@@ -96,6 +115,22 @@ func (t *TypeParam) String() string { return TypeString(t, nil) }
 // Implementation
 
 func (t *TypeParam) cleanup() {
+	// Before CL 825744, an unresolved type parameter constraint could leave
+	// t.bound as nil, causing t.iface() below to panic on bound.Underlying().
+	//
+	// Change incomplete type parameters to Typ[Invalid] so the
+	// published package graph never contains buried nils.
+	//
+	// Invariant: The type checker must never return Typ[Invalid] unless an error was
+	// reported. If a TypeParam created during package checking has a nil bound
+	// at cleanup time, verify that an error occurred; if not, this is an
+	// internal compiler bug, so report an error.
+	if t.bound == nil {
+		if t.check != nil && t.check.firstErr == nil {
+			t.check.internalErrorf(t.obj, "%v has nil constraint", t)
+		}
+		t.bound = Typ[Invalid]
+	}
 	t.iface()
 	t.check = nil
 }
@@ -103,10 +138,18 @@ func (t *TypeParam) cleanup() {
 // iface returns the constraint interface of t.
 func (t *TypeParam) iface() *Interface {
 	bound := t.bound
+	if bound == nil {
+		// Before CL 825744 if bound was nil, bound.Underlying() below panicked
+		// with a nil-pointer dereference.
+		//
+		// iface panics if called on an incomplete TypeParam before its constraint
+		// is set.
+		panic("incomplete TypeParam: constraint not set")
+	}
 
 	// determine constraint interface
 	var ityp *Interface
-	switch u := under(bound).(type) {
+	switch u := bound.Underlying().(type) {
 	case *Basic:
 		if !isValid(u) {
 			// error is reported elsewhere
@@ -148,9 +191,10 @@ func (t *TypeParam) is(f func(*term) bool) bool {
 	return t.iface().typeSet().is(f)
 }
 
-// underIs calls f with the underlying types of the specific type terms
-// of t's constraint and reports whether all calls to f returned true.
-// If there are no specific terms, underIs returns the result of f(nil).
-func (t *TypeParam) underIs(f func(Type) bool) bool {
-	return t.iface().typeSet().underIs(f)
+// typeset reports whether f(t, y) is true for all (type/underlying type) pairs of the
+// specific type terms of t's constraint.
+// If there are no specific terms, typeset returns f(nil, nil).
+// In any case, typeset is guaranteed to call f at least once.
+func (t *TypeParam) typeset(f func(t, u Type) bool) bool {
+	return t.iface().typeSet().all(f)
 }

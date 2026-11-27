@@ -5,6 +5,7 @@
 package os
 
 import (
+	"errors"
 	"io"
 	"runtime"
 	"syscall"
@@ -25,16 +26,24 @@ func (d *dirInfo) close() {
 }
 
 func (f *File) readdir(n int, mode readdirMode) (names []string, dirents []DirEntry, infos []FileInfo, err error) {
-	if f.dirinfo == nil {
+	// If this file has no dirinfo, create one.
+	var d *dirInfo
+	for {
+		d = f.dirinfo.Load()
+		if d != nil {
+			break
+		}
 		dir, call, errno := f.pfd.OpenDir()
 		if errno != nil {
 			return nil, nil, nil, &PathError{Op: call, Path: f.name, Err: errno}
 		}
-		f.dirinfo = &dirInfo{
-			dir: dir,
+		d = &dirInfo{dir: dir}
+		if f.dirinfo.CompareAndSwap(nil, d) {
+			break
 		}
+		// We lost the race: try again.
+		d.close()
 	}
-	d := f.dirinfo
 
 	size := n
 	if size <= 0 {
@@ -80,10 +89,16 @@ func (f *File) readdir(n int, mode readdirMode) (names []string, dirents []DirEn
 		if mode == readdirName {
 			names = append(names, string(name))
 		} else if mode == readdirDirEntry {
-			de, err := newUnixDirent(f.name, string(name), dtToType(dirent.Type))
+			de, err := newUnixDirent(f, string(name), dtToType(dirent.Type))
 			if IsNotExist(err) {
 				// File disappeared between readdir and stat.
 				// Treat as if it didn't exist.
+				continue
+			}
+			if errors.Is(err, syscall.EBADF) {
+				// Work around go.dev/issue/80143 during
+				// os.ReadDir("/dev/fd") by skipping kqueue fds.
+				// Exercised by TestReadDirFD.
 				continue
 			}
 			if err != nil {
@@ -91,7 +106,7 @@ func (f *File) readdir(n int, mode readdirMode) (names []string, dirents []DirEn
 			}
 			dirents = append(dirents, de)
 		} else {
-			info, err := lstat(f.name + "/" + string(name))
+			info, err := f.lstatat(string(name))
 			if IsNotExist(err) {
 				// File disappeared between readdir + stat.
 				// Treat as if it didn't exist.

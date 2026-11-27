@@ -5,29 +5,46 @@
 package noder
 
 import (
+	"cmp"
 	"fmt"
 	"internal/pkgbits"
+	"internal/types/errors"
 	"io"
 	"runtime"
-	"sort"
+	"slices"
 	"strings"
 
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/inline"
 	"cmd/compile/internal/ir"
-	"cmd/compile/internal/pgo"
+	"cmd/compile/internal/midway"
+	"cmd/compile/internal/pgoir"
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
 	"cmd/compile/internal/types2"
 	"cmd/internal/src"
 )
 
+// uirVersion is the unified IR version to use for encoding/decoding.
+// Use V5 for generic method index ordering.
+const uirVersion = pkgbits.V5
+
 // localPkgReader holds the package reader used for reading the local
 // package. It exists so the unified IR linker can refer back to it
 // later.
 var localPkgReader *pkgReader
 
-// LookupMethodFunc returns the ir.Func for an arbitrary full symbol name if
+// bridgePkgReader is used to read export data for "simd/internal/bridge"
+// bundled into "simd".
+// This is the direct case described in import.go.
+var bridgePkgReader *pkgReader
+
+// simdPkgReader is used to read export data for both "simd" and
+// "simd/internal/bridge" bundled into some other package.
+// This is the indirect case described in import.go
+var simdPkgReader *pkgReader
+
+// LookupFunc returns the ir.Func for an arbitrary full symbol name if
 // that function exists in the set of available export data.
 //
 // This allows lookup of arbitrary functions and methods that aren't otherwise
@@ -69,6 +86,14 @@ func LookupFunc(fullName string) (*ir.Func, error) {
 	return nil, fmt.Errorf("%s is not a function (%v) or method (%v)", fullName, err, mErr)
 }
 
+// PostLookupCleanup performs cleanup operations needed
+// after a series of calls to LookupFunc, specifically invoking
+// readBodies to post-process any funcs on the "todoBodies" list
+// that were added as a result of the lookup operations.
+func PostLookupCleanup() {
+	readBodies(typecheck.Target, false, nil)
+}
+
 func lookupFunction(pkg *types.Pkg, symName string) (*ir.Func, error) {
 	sym := pkg.Lookup(symName)
 
@@ -80,7 +105,11 @@ func lookupFunction(pkg *types.Pkg, symName string) (*ir.Func, error) {
 		return nil, fmt.Errorf("func sym %v missing objReader", sym)
 	}
 
-	name := pri.pr.objIdx(pri.idx, nil, nil, false).(*ir.Name)
+	node, err := pri.pr.objIdxMayFail(pri.idx, nil, nil, false)
+	if err != nil {
+		return nil, fmt.Errorf("func sym %v lookup error: %w", sym, err)
+	}
+	name := node.(*ir.Name)
 	if name.Op() != ir.ONAME || name.Class != ir.PFUNC {
 		return nil, fmt.Errorf("func sym %v refers to non-function name: %v", sym, name)
 	}
@@ -105,12 +134,19 @@ func lookupMethod(pkg *types.Pkg, symName string) (*ir.Func, error) {
 		return nil, fmt.Errorf("type sym %v missing objReader", typ)
 	}
 
-	name := pri.pr.objIdx(pri.idx, nil, nil, false).(*ir.Name)
+	node, err := pri.pr.objIdxMayFail(pri.idx, nil, nil, false)
+	if err != nil {
+		return nil, fmt.Errorf("func sym %v lookup error: %w", typ, err)
+	}
+	name := node.(*ir.Name)
 	if name.Op() != ir.OTYPE {
 		return nil, fmt.Errorf("type sym %v refers to non-type name: %v", typ, name)
 	}
 	if name.Alias() {
 		return nil, fmt.Errorf("type sym %v refers to alias", typ)
+	}
+	if name.Type().IsInterface() {
+		return nil, fmt.Errorf("type sym %v refers to interface type", typ)
 	}
 
 	for _, m := range name.Type().Methods() {
@@ -167,7 +203,8 @@ func lookupMethod(pkg *types.Pkg, symName string) (*ir.Func, error) {
 func unified(m posMap, noders []*noder) {
 	inline.InlineCall = unifiedInlineCall
 	typecheck.HaveInlineBody = unifiedHaveInlineBody
-	pgo.LookupFunc = LookupFunc
+	pgoir.LookupFunc = LookupFunc
+	pgoir.PostLookupCleanup = PostLookupCleanup
 
 	data := writePkgStub(m, noders)
 
@@ -176,10 +213,11 @@ func unified(m posMap, noders []*noder) {
 	localPkgReader = newPkgReader(pkgbits.NewPkgDecoder(types.LocalPkg.Path, data))
 	readPackage(localPkgReader, types.LocalPkg, true)
 
-	r := localPkgReader.newReader(pkgbits.RelocMeta, pkgbits.PrivateRootIdx, pkgbits.SyncPrivate)
+	r := localPkgReader.newReader(pkgbits.SectionMeta, pkgbits.PrivateRootIdx, pkgbits.SyncPrivate)
 	r.pkgInit(types.LocalPkg, target)
 
-	readBodies(target, false)
+	readBodies(target, false, nil)
+	findImportedInsts()
 
 	// Check that nothing snuck past typechecking.
 	for _, fn := range target.Funcs {
@@ -213,7 +251,7 @@ func unified(m posMap, noders []*noder) {
 // If duringInlining is true, then the inline.InlineDecls is called as
 // necessary on instantiations of imported generic functions, so their
 // inlining costs can be computed.
-func readBodies(target *ir.Package, duringInlining bool) {
+func readBodies(target *ir.Package, duringInlining bool, profile *pgoir.Profile) {
 	var inlDecls []*ir.Func
 
 	// Don't use range--bodyIdx can add closures to todoBodies.
@@ -280,7 +318,7 @@ func readBodies(target *ir.Package, duringInlining bool) {
 
 		oldLowerM := base.Flag.LowerM
 		base.Flag.LowerM = 0
-		inline.CanInlineFuncs(inlDecls, nil)
+		inline.CanInlineFuncs(inlDecls, profile)
 		base.Flag.LowerM = oldLowerM
 
 		for _, fn := range inlDecls {
@@ -289,18 +327,173 @@ func readBodies(target *ir.Package, duringInlining bool) {
 	}
 }
 
+// allowGenericsDedup reports whether unused imported generic instantiations may be dropped.
+func allowGenericsDedup() bool {
+	if base.Debug.GenericsDedup == 0 {
+		return false
+	}
+	// Skip when -linkshared (#58966) or a custom maxshapelen can break linking.
+	if base.Ctxt.Flag_linkshared ||
+		base.Debug.MaxShapeLen != base.DefaultMaxShapeLen {
+		return false
+	}
+	// Skip special package boundaries.
+	if base.Ctxt.IsFIPS() ||
+		base.Flag.CompilingRuntime ||
+		types.IsNoInstrumentPkg(types.LocalPkg) {
+		return false
+	}
+	return true
+}
+
+// findImportedInsts marks generic instantiations already compiled by an imported package
+// (from haveWrapperTypes and their transitive callees) as candidates for pruning.
+func findImportedInsts() {
+	if !allowGenericsDedup() || len(haveWrapperTypes) == 0 {
+		return
+	}
+
+	seen := make(map[*types.Type]bool)
+	var work []*ir.Func
+
+	markFunc := func(fn *ir.Func) {
+		if pri, ok := bodyReader[fn]; ok && pri.dict.hasTypeParams() && !fn.CompiledByImport() {
+			fn.SetCompiledByImport(true)
+			work = append(work, fn)
+		}
+	}
+
+	var markType func(t *types.Type)
+	markType = func(t *types.Type) {
+		if t == nil || seen[t] {
+			return
+		}
+		seen[t] = true
+
+		switch t.Kind() {
+		case types.TPTR, types.TSLICE, types.TARRAY, types.TCHAN:
+			markType(t.Elem())
+		case types.TMAP:
+			markType(t.Key())
+			markType(t.Elem())
+		case types.TSTRUCT:
+			for _, f := range t.Fields() {
+				markType(f.Type)
+			}
+		case types.TFUNC:
+			for _, f := range t.RecvParamsResults() {
+				markType(f.Type)
+			}
+		case types.TINTER:
+			return // no bodies
+		}
+
+		if t.IsFullyInstantiated() {
+			for _, m := range t.Methods() {
+				markFunc(m.Nname.(*ir.Name).Func)
+			}
+		}
+	}
+
+	for _, t := range haveWrapperTypes {
+		markType(t)
+	}
+	for len(work) > 0 {
+		fn := work[len(work)-1]
+		work = work[:len(work)-1]
+
+		markType(fn.Type())
+		ir.VisitFuncAndClosures(fn, func(n ir.Node) {
+			markType(n.Type())
+			if callee := referencedFunc(n); callee != nil {
+				markFunc(callee)
+			}
+		})
+	}
+}
+
+// referencedFunc returns the function directly referenced by n, matching the call graph
+// edges followed by ir.VisitFuncsBottomUp (closures are handled by the caller).
+func referencedFunc(n ir.Node) *ir.Func {
+	switch n.Op() {
+	case ir.ONAME:
+		if n := n.(*ir.Name); n.Class == ir.PFUNC {
+			return n.Func
+		}
+	case ir.ODOTMETH, ir.OMETHVALUE, ir.OMETHEXPR:
+		if m := ir.MethodExprName(n); m != nil {
+			return m.Func
+		}
+	}
+	return nil
+}
+
+// DropUnusedImportedInsts removes generic instantiations that an imported package already
+// compiled and that nothing in this package still references after inlining and MakeWrappers.
+// Keeping referenced instantiations ensures callers are only analyzed against bodies compiled
+// in this package. Dropped ones still resolve at link time to an imported package's copy.
+func DropUnusedImportedInsts(target *ir.Package) {
+	if !slices.ContainsFunc(target.Funcs, (*ir.Func).CompiledByImport) {
+		return
+	}
+
+	keep := make(map[*ir.Func]bool)
+	scanned := make(map[*ir.Func]bool)
+	for changed := true; changed; {
+		changed = false
+		for _, fn := range target.Funcs {
+			if scanned[fn] || fn.CompiledByImport() && !keep[fn.Outermost()] {
+				continue
+			}
+			scanned[fn] = true
+			ir.Visit(fn, func(n ir.Node) {
+				callee := referencedFunc(n)
+				if callee == nil || !callee.CompiledByImport() {
+					return
+				}
+				if callee = callee.Outermost(); !keep[callee] {
+					keep[callee] = true
+					changed = true
+				}
+			})
+		}
+	}
+
+	// Keep fn.Inl for DWARF in case a retained caller inlined fn.
+	target.Funcs = slices.DeleteFunc(target.Funcs, func(fn *ir.Func) bool {
+		if !fn.CompiledByImport() || keep[fn.Outermost()] {
+			return false
+		}
+		fn.Body = nil
+		fn.Dcl = nil
+		fn.ClosureVars = nil
+		return true
+	})
+
+	// Flush deferred symbol effects in target.Funcs order (not map order) for determinism.
+	var kept []*ir.Func
+	for _, fn := range target.Funcs {
+		if keep[fn] {
+			fn.SetCompiledByImport(false)
+			kept = append(kept, fn)
+		}
+	}
+	inline.FlushDeferredSymEffects(kept)
+}
+
 // writePkgStub type checks the given parsed source files,
 // writes an export data package stub representing them,
 // and returns the result.
 func writePkgStub(m posMap, noders []*noder) string {
-	pkg, info := checkFiles(m, noders)
+	pkg, info, otherInfo, midwayOriginals := checkFiles(m, noders)
 
-	pw := newPkgWriter(m, pkg, info)
+	pw := newPkgWriter(m, pkg, info, otherInfo)
+	pw.midwayOriginals = midwayOriginals
 
 	pw.collectDecls(noders)
 
-	publicRootWriter := pw.newWriter(pkgbits.RelocMeta, pkgbits.SyncPublic)
-	privateRootWriter := pw.newWriter(pkgbits.RelocMeta, pkgbits.SyncPrivate)
+	publicRootWriter := pw.newWriter(pkgbits.SectionMeta, pkgbits.SyncPublic)
+	privateRootWriter := pw.newWriter(pkgbits.SectionMeta, pkgbits.SyncPrivate)
 
 	assert(publicRootWriter.Idx == pkgbits.PublicRootIdx)
 	assert(privateRootWriter.Idx == pkgbits.PrivateRootIdx)
@@ -308,7 +501,10 @@ func writePkgStub(m posMap, noders []*noder) string {
 	{
 		w := publicRootWriter
 		w.pkg(pkg)
-		w.Bool(false) // TODO(mdempsky): Remove; was "has init"
+
+		if w.Version().Has(pkgbits.HasInit) {
+			w.Bool(false)
+		}
 
 		scope := pkg.Scope()
 		names := scope.Names()
@@ -380,22 +576,34 @@ func freePackage(pkg *types2.Package) {
 // import.
 func readPackage(pr *pkgReader, importpkg *types.Pkg, localStub bool) {
 	{
-		r := pr.newReader(pkgbits.RelocMeta, pkgbits.PublicRootIdx, pkgbits.SyncPublic)
+		r := pr.newReader(pkgbits.SectionMeta, pkgbits.PublicRootIdx, pkgbits.SyncPublic)
 
 		pkg := r.pkg()
-		base.Assertf(pkg == importpkg, "have package %q (%p), want package %q (%p)", pkg.Path, pkg, importpkg.Path, importpkg)
+		// This error can happen if "go tool compile" is called with wrong "-p" flag, see issue #54542.
+		if pkg != importpkg {
+			base.ErrorfAt(base.AutogeneratedPos, errors.BadImportPath, "mismatched import path, have %q (%p), want %q (%p)", pkg.Path, pkg, importpkg.Path, importpkg)
+			base.ErrorExit()
+		}
 
-		r.Bool() // TODO(mdempsky): Remove; was "has init"
+		if r.Version().Has(pkgbits.HasInit) {
+			r.Bool()
+		}
 
 		for i, n := 0, r.Len(); i < n; i++ {
 			r.Sync(pkgbits.SyncObject)
-			assert(!r.Bool())
-			idx := r.Reloc(pkgbits.RelocObj)
+			if r.Version().Has(pkgbits.DerivedFuncInstance) {
+				assert(!r.Bool())
+			}
+			idx := r.Reloc(pkgbits.SectionObj)
 			assert(r.Len() == 0)
 
 			path, name, code := r.p.PeekObj(idx)
 			if code != pkgbits.ObjStub {
 				objReader[types.NewPkg(path, "").Lookup(name)] = pkgReaderIndex{pr, idx, nil, nil, nil}
+				// Remember the first imported package with bundled export data for "simd".
+				if !localStub && path == midway.SimdPkg && base.Ctxt.Pkgpath != midway.SimdPkg && simdPkgReader == nil {
+					simdPkgReader = pr
+				}
 			}
 		}
 
@@ -403,7 +611,12 @@ func readPackage(pr *pkgReader, importpkg *types.Pkg, localStub bool) {
 	}
 
 	if !localStub {
-		r := pr.newReader(pkgbits.RelocMeta, pkgbits.PrivateRootIdx, pkgbits.SyncPrivate)
+		// When compiling "simd", remember the package reader for "simd/internal/bridge".
+		if base.Ctxt.Pkgpath == midway.SimdPkg && importpkg.Path == midway.SimdBridgePkg {
+			bridgePkgReader = pr
+		}
+
+		r := pr.newReader(pkgbits.SectionMeta, pkgbits.PrivateRootIdx, pkgbits.SyncPrivate)
 
 		if r.Bool() {
 			sym := importpkg.Lookup(".inittask")
@@ -415,7 +628,7 @@ func readPackage(pr *pkgReader, importpkg *types.Pkg, localStub bool) {
 		for i, n := 0, r.Len(); i < n; i++ {
 			path := r.String()
 			name := r.String()
-			idx := r.Reloc(pkgbits.RelocBody)
+			idx := r.Reloc(pkgbits.SectionBody)
 
 			sym := types.NewPkg(path, "").Lookup(name)
 			if _, ok := importBodyReader[sym]; !ok {
@@ -431,33 +644,43 @@ func readPackage(pr *pkgReader, importpkg *types.Pkg, localStub bool) {
 // Unified IR export data file for the current compilation unit.
 func writeUnifiedExport(out io.Writer) {
 	l := linker{
-		pw: pkgbits.NewPkgEncoder(base.Debug.SyncFrames),
+		pw: pkgbits.NewPkgEncoder(uirVersion, base.Debug.SyncFrames),
 
-		pkgs:   make(map[string]pkgbits.Index),
-		decls:  make(map[*types.Sym]pkgbits.Index),
-		bodies: make(map[*types.Sym]pkgbits.Index),
+		pkgs:   make(map[string]index),
+		decls:  make(map[*types.Sym]index),
+		bodies: make(map[*types.Sym]index),
 	}
 
-	publicRootWriter := l.pw.NewEncoder(pkgbits.RelocMeta, pkgbits.SyncPublic)
-	privateRootWriter := l.pw.NewEncoder(pkgbits.RelocMeta, pkgbits.SyncPrivate)
+	publicRootWriter := l.pw.NewEncoder(pkgbits.SectionMeta, pkgbits.SyncPublic)
+	privateRootWriter := l.pw.NewEncoder(pkgbits.SectionMeta, pkgbits.SyncPrivate)
 	assert(publicRootWriter.Idx == pkgbits.PublicRootIdx)
 	assert(privateRootWriter.Idx == pkgbits.PrivateRootIdx)
 
-	var selfPkgIdx pkgbits.Index
+	var selfPkgIdx index
 
 	{
 		pr := localPkgReader
-		r := pr.NewDecoder(pkgbits.RelocMeta, pkgbits.PublicRootIdx, pkgbits.SyncPublic)
+		r := pr.NewDecoder(pkgbits.SectionMeta, pkgbits.PublicRootIdx, pkgbits.SyncPublic)
 
 		r.Sync(pkgbits.SyncPkg)
-		selfPkgIdx = l.relocIdx(pr, pkgbits.RelocPkg, r.Reloc(pkgbits.RelocPkg))
+		selfPkgIdx = l.relocIdx(pr, pkgbits.SectionPkg, r.Reloc(pkgbits.SectionPkg))
 
-		r.Bool() // TODO(mdempsky): Remove; was "has init"
+		// Versions must match.
+		// TODO: It seems that we should be able to use r.Version() for NewPkgEncoder
+		// instead of passing uirVersion, but NewPkgEncoder is created before r.
+		// If that is correct, we should make that happen.
+		assert(r.Version() == uirVersion)
+
+		if r.Version().Has(pkgbits.HasInit) {
+			r.Bool()
+		}
 
 		for i, n := 0, r.Len(); i < n; i++ {
 			r.Sync(pkgbits.SyncObject)
-			assert(!r.Bool())
-			idx := r.Reloc(pkgbits.RelocObj)
+			if r.Version().Has(pkgbits.DerivedFuncInstance) {
+				assert(!r.Bool())
+			}
+			idx := r.Reloc(pkgbits.SectionObj)
 			assert(r.Len() == 0)
 
 			xpath, xname, xtag := pr.PeekObj(idx)
@@ -465,31 +688,127 @@ func writeUnifiedExport(out io.Writer) {
 			assert(xtag != pkgbits.ObjStub)
 
 			if types.IsExported(xname) {
-				l.relocIdx(pr, pkgbits.RelocObj, idx)
+				l.relocIdx(pr, pkgbits.SectionObj, idx)
 			}
 		}
 
 		r.Sync(pkgbits.SyncEOF)
 	}
 
+	// Ensure that downstream importers have access to the full export data for
+	// both "simd" and "simd/internal/bridge" even when their build system
+	// (-importcfg) does not include "simd/internal/bridge" (or "simd" itself,
+	// in the case of transitive SIMD dependencies):
+	//
+	// 1. When compiling "simd", bundle all of "simd/internal/bridge" into
+	//    "simd"'s export data (from bridgePkgReader).
+	// 2. When compiling any other package, the loop above has populated l.decls
+	//    with the local package's exported declarations and all objects they
+	//    transitively reference. If any of those referenced objects belong to
+	//    "simd" or "simd/internal/bridge", re-export the full "simd" and
+	//    "simd/internal/bridge" definitions, and all inline bodies, from
+	//    simdPkgReader so that any package importing this one receives them too.
+	var extraPkgReader *pkgReader
+	if base.Ctxt.Pkgpath == midway.SimdPkg {
+		extraPkgReader = bridgePkgReader
+	} else if simdPkgReader != nil {
+		for sym := range l.decls {
+			if sym.Pkg.Path == midway.SimdPkg || sym.Pkg.Path == midway.SimdBridgePkg {
+				extraPkgReader = simdPkgReader
+				break
+			}
+		}
+	}
+
+	if extraPkgReader != nil {
+		pr := extraPkgReader
+		// Copy all public declarations from "simd" and "simd/internal/bridge"
+		// into l.decls so they are emitted in the public root below.
+		{
+			r := pr.NewDecoder(pkgbits.SectionMeta, pkgbits.PublicRootIdx, pkgbits.SyncPublic)
+
+			r.Sync(pkgbits.SyncPkg)
+			l.relocIdx(pr, pkgbits.SectionPkg, r.Reloc(pkgbits.SectionPkg))
+
+			assert(r.Version() == uirVersion)
+
+			if r.Version().Has(pkgbits.HasInit) {
+				r.Bool()
+			}
+
+			for i, n := 0, r.Len(); i < n; i++ {
+				r.Sync(pkgbits.SyncObject)
+				if r.Version().Has(pkgbits.DerivedFuncInstance) {
+					assert(!r.Bool())
+				}
+				idx := r.Reloc(pkgbits.SectionObj)
+				assert(r.Len() == 0)
+
+				if xpath, _, xtag := pr.PeekObj(idx); xtag != pkgbits.ObjStub && (xpath == midway.SimdPkg || xpath == midway.SimdBridgePkg) {
+					l.relocIdx(pr, pkgbits.SectionObj, idx)
+				}
+			}
+
+			r.Sync(pkgbits.SyncEOF)
+		}
+		// Also copy every inlinable function body from pr into l.bodies, so
+		// they're written to this package's export data and importers can
+		// inline them. (Export data has a "public root", which lists the
+		// exported declarations, and a "private root", which indexes the
+		// inlinable function bodies. This copies the latter.)
+		//
+		// This includes bodies from every package, not just "simd" and
+		// "simd/internal/bridge". The bridge inlines functions from other
+		// packages, notably "simd/archsimd" and, in its emulated fallbacks,
+		// "math". A package normally re-exports the body of any function it
+		// inlines, but on architectures with SIMD support, "simd" is only
+		// stubs, so it would otherwise not inline these functions itself
+		// and exportBody wouldn't export their bodies. Packages that import
+		// "simd" need not import these other packages, so this is the only
+		// way they get these bodies.
+		{
+			r := pr.NewDecoder(pkgbits.SectionMeta, pkgbits.PrivateRootIdx, pkgbits.SyncPrivate)
+
+			r.Bool() // skip has init
+
+			for i, n := 0, r.Len(); i < n; i++ {
+				path := r.String()
+				name := r.String()
+				idx := r.Reloc(pkgbits.SectionBody)
+
+				sym := types.NewPkg(path, "").Lookup(name)
+				if _, ok := l.bodies[sym]; !ok {
+					l.bodies[sym] = l.relocIdx(pr, pkgbits.SectionBody, idx)
+				}
+			}
+
+			r.Sync(pkgbits.SyncEOF)
+		}
+	}
+
 	{
-		var idxs []pkgbits.Index
+		var idxs []index
 		for _, idx := range l.decls {
 			idxs = append(idxs, idx)
 		}
-		sort.Slice(idxs, func(i, j int) bool { return idxs[i] < idxs[j] })
+		slices.Sort(idxs)
 
 		w := publicRootWriter
 
 		w.Sync(pkgbits.SyncPkg)
-		w.Reloc(pkgbits.RelocPkg, selfPkgIdx)
-		w.Bool(false) // TODO(mdempsky): Remove; was "has init"
+		w.Reloc(pkgbits.SectionPkg, selfPkgIdx)
+
+		if w.Version().Has(pkgbits.HasInit) {
+			w.Bool(false)
+		}
 
 		w.Len(len(idxs))
 		for _, idx := range idxs {
 			w.Sync(pkgbits.SyncObject)
-			w.Bool(false)
-			w.Reloc(pkgbits.RelocObj, idx)
+			if w.Version().Has(pkgbits.DerivedFuncInstance) {
+				w.Bool(false)
+			}
+			w.Reloc(pkgbits.SectionObj, idx)
 			w.Len(0)
 		}
 
@@ -500,13 +819,13 @@ func writeUnifiedExport(out io.Writer) {
 	{
 		type symIdx struct {
 			sym *types.Sym
-			idx pkgbits.Index
+			idx index
 		}
 		var bodies []symIdx
 		for sym, idx := range l.bodies {
 			bodies = append(bodies, symIdx{sym, idx})
 		}
-		sort.Slice(bodies, func(i, j int) bool { return bodies[i].idx < bodies[j].idx })
+		slices.SortFunc(bodies, func(a, b symIdx) int { return cmp.Compare(a.idx, b.idx) })
 
 		w := privateRootWriter
 
@@ -516,7 +835,7 @@ func writeUnifiedExport(out io.Writer) {
 		for _, body := range bodies {
 			w.String(body.sym.Pkg.Path)
 			w.String(body.sym.Name)
-			w.Reloc(pkgbits.RelocBody, body.idx)
+			w.Reloc(pkgbits.SectionBody, body.idx)
 		}
 
 		w.Sync(pkgbits.SyncEOF)

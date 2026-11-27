@@ -2,15 +2,13 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build !android
+//go:build !android && !((ppc64 || ppc64le) && internal)
 
 package cgotest
 
 /*
-#include <complex.h>
-
-complex float complexFloatSquared(complex float a) { return a*a; }
-complex double complexDoubleSquared(complex double a) { return a*a; }
+_Complex float complexFloatSquared(_Complex float a) { return a*a; }
+_Complex double complexDoubleSquared(_Complex double a) { return a*a; }
 */
 import "C"
 

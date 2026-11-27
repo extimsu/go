@@ -39,8 +39,11 @@ type profileBuilder struct {
 	stringMap map[string]int
 	locs      map[uintptr]locInfo // list of locInfo starting with the given PC.
 	funcs     map[string]int      // Package path-qualified function name to Function.ID
-	mem       []memMap
-	deck      pcDeck
+	// IDs may be reserved for virtual locations and functions before real stacks are processed.
+	nextLocID  uint64
+	nextFuncID uint64
+	mem        []memMap
+	deck       pcDeck
 }
 
 type memMap struct {
@@ -259,16 +262,30 @@ type locInfo struct {
 func newProfileBuilder(w io.Writer) *profileBuilder {
 	zw, _ := gzip.NewWriterLevel(w, gzip.BestSpeed)
 	b := &profileBuilder{
-		w:         w,
-		zw:        zw,
-		start:     time.Now(),
-		strings:   []string{""},
-		stringMap: map[string]int{"": 0},
-		locs:      map[uintptr]locInfo{},
-		funcs:     map[string]int{},
+		w:          w,
+		zw:         zw,
+		start:      time.Now(),
+		strings:    []string{""},
+		stringMap:  map[string]int{"": 0},
+		locs:       map[uintptr]locInfo{},
+		funcs:      map[string]int{},
+		nextLocID:  1,
+		nextFuncID: 1,
 	}
 	b.readMapping()
 	return b
+}
+
+func (b *profileBuilder) reserveLocID() uint64 {
+	id := b.nextLocID
+	b.nextLocID++
+	return id
+}
+
+func (b *profileBuilder) reserveFuncID() uint64 {
+	id := b.nextFuncID
+	b.nextFuncID++
+	return id
 }
 
 // addCPUData adds the CPU profiling data to the profile.
@@ -345,7 +362,7 @@ func (b *profileBuilder) addCPUData(data []uint64, tags []unsafe.Pointer) error 
 }
 
 // build completes and returns the constructed profile.
-func (b *profileBuilder) build() {
+func (b *profileBuilder) build() error {
 	b.end = time.Now()
 
 	b.pb.int64Opt(tagProfile_TimeNanos, b.start.UnixNano())
@@ -367,8 +384,8 @@ func (b *profileBuilder) build() {
 		var labels func()
 		if e.tag != nil {
 			labels = func() {
-				for k, v := range *(*labelMap)(e.tag) {
-					b.pbLabel(tagSample_Label, k, v, 0)
+				for _, lbl := range (*labelMap)(e.tag).Set.List {
+					b.pbLabel(tagSample_Label, lbl.Key, lbl.Value, 0)
 				}
 			}
 		}
@@ -387,8 +404,11 @@ func (b *profileBuilder) build() {
 	// TODO: Anything for tagProfile_KeepFrames?
 
 	b.pb.strings(tagProfile_StringTable, b.strings)
-	b.zw.Write(b.pb.data)
-	b.zw.Close()
+	_, err := b.zw.Write(b.pb.data)
+	if err != nil {
+		return err
+	}
+	return b.zw.Close()
 }
 
 // appendLocsForStack appends the location IDs for the given stack trace to the given
@@ -404,6 +424,7 @@ func (b *profileBuilder) appendLocsForStack(locs []uint64, stk []uintptr) (newLo
 	b.deck.reset()
 
 	// The last frame might be truncated. Recover lost inline frames.
+	origStk := stk
 	stk = runtime_expandFinalInlineFrame(stk)
 
 	for len(stk) > 0 {
@@ -440,6 +461,9 @@ func (b *profileBuilder) appendLocsForStack(locs []uint64, stk []uintptr) (newLo
 			// Even if stk was truncated due to the stack depth
 			// limit, expandFinalInlineFrame above has already
 			// fixed the truncation, ensuring it is long enough.
+			if len(l.pcs) > len(stk) {
+				panic(fmt.Sprintf("stack too short to match cached location; stk = %#x, l.pcs = %#x, original stk = %#x", stk, l.pcs, origStk))
+			}
 			stk = stk[len(l.pcs):]
 			continue
 		}
@@ -598,7 +622,7 @@ func (b *profileBuilder) emitLocation() uint64 {
 	}
 	newFuncs := make([]newFunc, 0, 8)
 
-	id := uint64(len(b.locs)) + 1
+	id := b.reserveLocID()
 	b.locs[addr] = locInfo{
 		id:                     id,
 		pcs:                    append([]uintptr{}, b.deck.pcs...),
@@ -614,7 +638,7 @@ func (b *profileBuilder) emitLocation() uint64 {
 		funcName := runtime_FrameSymbolName(&frame)
 		funcID := uint64(b.funcs[funcName])
 		if funcID == 0 {
-			funcID = uint64(len(b.funcs)) + 1
+			funcID = b.reserveFuncID()
 			b.funcs[funcName] = int(funcID)
 			newFuncs = append(newFuncs, newFunc{
 				id:        funcID,

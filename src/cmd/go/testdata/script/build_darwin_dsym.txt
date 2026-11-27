@@ -1,0 +1,104 @@
+[!GOOS:darwin] skip
+[short] skip
+
+# go build of an executable should not emit .dSYM by default.
+go build
+exists m
+! exists m.dSYM
+
+# go build -ldflags=-splitdwarf should emit executable and .dSYM directory.
+go build -ldflags=-splitdwarf
+exists m
+exists m.dSYM/Contents/Resources/DWARF/m
+
+# go build -o should use the target executable name for .dSYM.
+go build -o sub/x -ldflags=-splitdwarf
+exists sub/x
+exists sub/x.dSYM/Contents/Resources/DWARF/x
+
+# Cached no-op rebuild should keep the existing .dSYM directory.
+go build -ldflags=-splitdwarf
+exists m
+exists m.dSYM/Contents/Resources/DWARF/m
+
+# Rebuilding without -splitdwarf should remove the existing .dSYM directory.
+go build
+exists m
+! exists m.dSYM
+
+# Rebuilding with -ldflags=-splitdwarf should recreate the .dSYM directory.
+go build -ldflags=-splitdwarf
+exists m
+exists m.dSYM/Contents/Resources/DWARF/m
+
+# Rebuilding with -ldflags=-splitdwarf=0 should remove the existing .dSYM directory.
+go build -ldflags=-splitdwarf=0
+exists m
+! exists m.dSYM
+
+# Rebuilding with -ldflags=-w should remove the existing .dSYM directory.
+go build -ldflags=-splitdwarf
+exists m
+exists m.dSYM/Contents/Resources/DWARF/m
+go build -ldflags=-w
+exists m
+! exists m.dSYM
+
+# go test -c should not emit .dSYM by default.
+go test -c
+exists m.test
+! exists m.test.dSYM
+
+# go test -c -ldflags=-splitdwarf should emit test executable and .dSYM directory.
+go test -c -ldflags=-splitdwarf
+exists m.test
+exists m.test.dSYM/Contents/Resources/DWARF/m.test
+
+go test -c -o sub/t.test -ldflags=-w
+exists sub/t.test
+! exists sub/t.test.dSYM
+
+# go install should not install the .dSYM directory.
+env GOBIN=$WORK/bin
+go install -ldflags=-splitdwarf .
+exists $GOBIN/m
+! exists $GOBIN/m.dSYM
+
+# go clean should remove executables and .dSYM directories.
+go build -ldflags=-splitdwarf
+exists m.dSYM/Contents/Resources/DWARF/m
+go clean
+! exists m
+! exists m.dSYM
+! exists m.test
+! exists m.test.dSYM
+
+# Non-executable build modes should emit .dSYM by default.
+[cgo] go build -buildmode=c-shared -o libm.dylib
+[cgo] exists libm.dylib
+[cgo] exists libm.dylib.dSYM/Contents/Resources/DWARF/libm.dylib
+[cgo] go build -buildmode=c-shared -o libm.dylib -ldflags=-splitdwarf=0
+[cgo] exists libm.dylib
+[cgo] ! exists libm.dylib.dSYM
+
+[cgo] go build -buildmode=plugin -o m.so
+[cgo] exists m.so
+[cgo] exists m.so.dSYM/Contents/Resources/DWARF/m.so
+[cgo] go build -buildmode=plugin -o m.so -ldflags=-splitdwarf=0
+[cgo] exists m.so
+[cgo] ! exists m.so.dSYM
+
+-- go.mod --
+module m
+
+go 1.21
+-- main.go --
+package main
+
+func main() {}
+-- main_test.go --
+package main
+
+import "testing"
+
+func TestMain(t *testing.T) {}

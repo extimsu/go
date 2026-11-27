@@ -7,17 +7,16 @@
 package big
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
+	"internal/byteorder"
 )
 
 // Gob codec version. Permits backward-compatible changes to the encoding.
 const floatGobVersion byte = 1
 
 // GobEncode implements the [encoding/gob.GobEncoder] interface.
-// The [Float] value and all its attributes (precision,
-// rounding mode, accuracy) are marshaled.
+// The [Float] value and all its attributes (precision, rounding mode, accuracy) are marshaled.
 func (x *Float) GobEncode() ([]byte, error) {
 	if x == nil {
 		return nil, nil
@@ -28,7 +27,8 @@ func (x *Float) GobEncode() ([]byte, error) {
 	n := 0          // number of mantissa words
 	if x.form == finite {
 		// add space for mantissa and exponent
-		n = int((x.prec + (_W - 1)) / _W) // required mantissa length in words for given precision
+		// (widen x.prec to uint64 before rounding up to avoid uint32 overflow near MaxPrec)
+		n = int((uint64(x.prec) + (_W - 1)) / _W) // required mantissa length in words for given precision
 		// actual mantissa slice could be shorter (trailing 0's) or longer (unused bits):
 		// - if shorter, only encode the words present
 		// - if longer, cut off unused words when encoding in bytes
@@ -48,10 +48,10 @@ func (x *Float) GobEncode() ([]byte, error) {
 		b |= 1
 	}
 	buf[1] = b
-	binary.BigEndian.PutUint32(buf[2:], x.prec)
+	byteorder.BEPutUint32(buf[2:], x.prec)
 
 	if x.form == finite {
-		binary.BigEndian.PutUint32(buf[6:], uint32(x.exp))
+		byteorder.BEPutUint32(buf[6:], uint32(x.exp))
 		x.mant[len(x.mant)-n:].bytes(buf[10:]) // cut off unused trailing words
 	}
 
@@ -80,17 +80,24 @@ func (z *Float) GobDecode(buf []byte) error {
 	oldMode := z.mode
 
 	b := buf[1]
-	z.mode = RoundingMode((b >> 5) & 7)
-	z.acc = Accuracy((b>>3)&3) - 1
-	z.form = form((b >> 1) & 3)
+	mode := RoundingMode((b >> 5) & 7)
+	acc := Accuracy((b>>3)&3) - 1
+	f := form((b >> 1) & 3)
+	if mode > ToPositiveInf || acc > Above || f > inf {
+		return errors.New("Float.GobDecode: invalid encoding")
+	}
+	if f == finite && len(buf) < 10 {
+		return errors.New("Float.GobDecode: buffer too small for finite form float")
+	}
+
+	z.mode = mode
+	z.acc = acc
+	z.form = f
 	z.neg = b&1 != 0
-	z.prec = binary.BigEndian.Uint32(buf[2:])
+	z.prec = byteorder.BEUint32(buf[2:])
 
 	if z.form == finite {
-		if len(buf) < 10 {
-			return errors.New("Float.GobDecode: buffer too small for finite form float")
-		}
-		z.exp = int32(binary.BigEndian.Uint32(buf[6:]))
+		z.exp = int32(byteorder.BEUint32(buf[6:]))
 		z.mant = z.mant.setBytes(buf[10:])
 	}
 
@@ -106,15 +113,21 @@ func (z *Float) GobDecode(buf []byte) error {
 	return nil
 }
 
+// AppendText implements the [encoding.TextAppender] interface.
+// Only the [Float] value is marshaled (in full precision), other
+// attributes such as precision or accuracy are ignored.
+func (x *Float) AppendText(b []byte) ([]byte, error) {
+	if x == nil {
+		return append(b, "<nil>"...), nil
+	}
+	return x.Append(b, 'g', -1), nil
+}
+
 // MarshalText implements the [encoding.TextMarshaler] interface.
 // Only the [Float] value is marshaled (in full precision), other
 // attributes such as precision or accuracy are ignored.
 func (x *Float) MarshalText() (text []byte, err error) {
-	if x == nil {
-		return []byte("<nil>"), nil
-	}
-	var buf []byte
-	return x.Append(buf, 'g', -1), nil
+	return x.AppendText(nil)
 }
 
 // UnmarshalText implements the [encoding.TextUnmarshaler] interface.

@@ -30,7 +30,7 @@ func TestMain(m *testing.M) {
 	ssagen.Arch.MAXWIDTH = 1 << 50
 	types.MaxWidth = ssagen.Arch.MAXWIDTH
 	base.Ctxt = obj.Linknew(ssagen.Arch.LinkArch)
-	base.Ctxt.DiagFunc = base.Errorf
+	base.Ctxt.DiagFunc = base.Diagf
 	base.Ctxt.DiagFlush = base.FlushErrors
 	base.Ctxt.Bso = bufio.NewWriter(os.Stdout)
 	types.LocalPkg = types.NewPkg("p", "local")
@@ -390,9 +390,9 @@ func TestABIUtilsComputePadding(t *testing.T) {
 	padding := make([]uint64, 32)
 	parm := regRes.InParams()[1]
 	padding = parm.ComputePadding(padding)
-	want := "[1 1 1 0]"
+	want := "[1 0 0 0]"
 	got := fmt.Sprintf("%+v", padding)
 	if got != want {
-		t.Errorf("padding mismatch: wanted %q got %q\n", got, want)
+		t.Errorf("padding mismatch: wanted %q got %q\n", want, got)
 	}
 }

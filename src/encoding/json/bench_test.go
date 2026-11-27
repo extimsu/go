@@ -8,18 +8,22 @@
 // We benchmark converting between the JSON form
 // and in-memory data structures.
 
+//go:build !goexperiment.jsonv2
+
 package json
 
 import (
 	"bytes"
-	"compress/gzip"
+	"crypto/sha256"
 	"fmt"
 	"internal/testenv"
+	"internal/zstd"
 	"io"
 	"os"
 	"reflect"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -44,15 +48,12 @@ var codeJSON []byte
 var codeStruct codeResponse
 
 func codeInit() {
-	f, err := os.Open("testdata/code.json.gz")
+	f, err := os.Open("internal/jsontest/_embed/golang_source.json.zst")
 	if err != nil {
 		panic(err)
 	}
 	defer f.Close()
-	gz, err := gzip.NewReader(f)
-	if err != nil {
-		panic(err)
-	}
+	gz := zstd.NewReader(f)
 	data, err := io.ReadAll(gz)
 	if err != nil {
 		panic(err)
@@ -145,6 +146,96 @@ func BenchmarkCodeMarshal(b *testing.B) {
 		}
 	})
 	b.SetBytes(int64(len(codeJSON)))
+}
+
+// Keep these workloads in sync with encoding/json/v2/bench_test.go.
+func BenchmarkMarshalRecords(b *testing.B) {
+	type record struct {
+		ID     int      `json:"id"`
+		Name   string   `json:"name"`
+		Email  string   `json:"email"`
+		Active bool     `json:"active"`
+		Score  float64  `json:"score"`
+		Tags   []string `json:"tags"`
+	}
+	for _, n := range []int{1, 10000} {
+		b.Run(strconv.Itoa(n), func(b *testing.B) {
+			records := make([]record, n)
+			tags := []string{"go", "json", "bench"}
+			for i := range records {
+				name := "user-" + strconv.Itoa(i)
+				records[i] = record{i, name, name + "@example.com", i%2 == 0, float64(i) * 0.5, tags}
+			}
+			var v any = records
+			out, err := Marshal(v)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.SetBytes(int64(len(out)))
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := Marshal(v); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkMarshalMapRecords(b *testing.B) {
+	type record struct {
+		ID       int
+		Name     string
+		Metadata map[string]string
+	}
+	records := make([]record, 1000)
+	metadata := map[string]string{"role": "user", "region": "west"}
+	for i := range records {
+		records[i] = record{i, "user-" + strconv.Itoa(i), metadata}
+	}
+	var v any = records
+	out, err := Marshal(v)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.SetBytes(int64(len(out)))
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := Marshal(v); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkMarshalScalarArrays(b *testing.B) {
+	for _, sample := range []any{true, "hello, world!", int64(-1234), uint64(1234), float32(1.234), float64(1.234)} {
+		t := reflect.TypeOf(sample)
+		for _, n := range []int{1, 2, 4, 8, 32, 1024} {
+			for _, kind := range []reflect.Kind{reflect.Slice, reflect.Array} {
+				b.Run(fmt.Sprintf("%s/%s/%d", t, kind, n), func(b *testing.B) {
+					array := reflect.New(reflect.ArrayOf(n, t))
+					for i := range n {
+						array.Elem().Index(i).Set(reflect.ValueOf(sample))
+					}
+					var v any = array.Elem().Interface()
+					if kind == reflect.Slice {
+						v = array.Elem().Slice(0, n).Interface()
+					}
+					out, err := Marshal(v)
+					if err != nil {
+						b.Fatal(err)
+					}
+					b.SetBytes(int64(len(out)))
+					b.ReportAllocs()
+					for b.Loop() {
+						if _, err := Marshal(v); err != nil {
+							b.Fatal(err)
+						}
+					}
+				})
+			}
+		}
+	}
 }
 
 func BenchmarkCodeMarshalError(b *testing.B) {
@@ -569,5 +660,32 @@ func BenchmarkNumberIsValidRegexp(b *testing.B) {
 	s := "-61657.61667E+61673"
 	for i := 0; i < b.N; i++ {
 		jsonNumberRegexp.MatchString(s)
+	}
+}
+
+func BenchmarkUnmarshalNumber(b *testing.B) {
+	b.ReportAllocs()
+	data := []byte(`"-61657.61667E+61673"`)
+	var number Number
+	for i := 0; i < b.N; i++ {
+		if err := Unmarshal(data, &number); err != nil {
+			b.Fatal("Unmarshal:", err)
+		}
+	}
+}
+
+func BenchmarkNewEncoderEncode(b *testing.B) {
+	m := make(map[string]string)
+	for i := range 100_000 {
+		k := fmt.Sprintf("key%d", i)
+		v := fmt.Sprintf("%x", sha256.Sum256([]byte(k)))
+		m[k] = v
+	}
+	b.ResetTimer()
+	b.ReportAllocs()
+	for b.Loop() {
+		if err := NewEncoder(io.Discard).Encode(m); err != nil {
+			b.Fatalf("Encode error: %v", err)
+		}
 	}
 }

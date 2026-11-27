@@ -141,7 +141,7 @@ func (pa *ABIParamAssignment) RegisterTypesAndOffsets() ([]*types.Type, []int64)
 	}
 	typs := make([]*types.Type, 0, l)
 	offs := make([]int64, 0, l)
-	offs, _ = appendParamOffsets(offs, 0, pa.Type)
+	offs, _ = appendParamOffsets(offs, 0, pa.Type) // 0 is aligned for everything.
 	return appendParamTypes(typs, pa.Type), offs
 }
 
@@ -150,12 +150,12 @@ func appendParamTypes(rts []*types.Type, t *types.Type) []*types.Type {
 	if w == 0 {
 		return rts
 	}
-	if t.IsScalar() || t.IsPtrShaped() {
+	if t.IsScalar() || t.IsPtrShaped() || t.IsSIMD() {
 		if t.IsComplex() {
 			c := types.FloatForComplex(t)
 			return append(rts, c, c)
 		} else {
-			if int(t.Size()) <= types.RegSize {
+			if int(t.Size()) <= types.RegSize || t.IsSIMD() {
 				return append(rts, t)
 			}
 			// assume 64bit int on 32-bit machine
@@ -193,11 +193,14 @@ func appendParamTypes(rts []*types.Type, t *types.Type) []*types.Type {
 
 // appendParamOffsets appends the offset(s) of type t, starting from "at",
 // to input offsets, and returns the longer slice and the next unused offset.
+// at should already be aligned for t.
 func appendParamOffsets(offsets []int64, at int64, t *types.Type) ([]int64, int64) {
-	at = align(at, t)
 	w := t.Size()
 	if w == 0 {
 		return offsets, at
+	}
+	if t.IsSIMD() {
+		return append(offsets, at), at + w
 	}
 	if t.IsScalar() || t.IsPtrShaped() {
 		if t.IsComplex() || int(t.Size()) > types.RegSize { // complex and *int64 on 32-bit
@@ -210,11 +213,15 @@ func appendParamOffsets(offsets []int64, at int64, t *types.Type) ([]int64, int6
 		typ := t.Kind()
 		switch typ {
 		case types.TARRAY:
+			te := t.Elem()
 			for i := int64(0); i < t.NumElem(); i++ {
-				offsets, at = appendParamOffsets(offsets, at, t.Elem())
+				at = align(at, te)
+				offsets, at = appendParamOffsets(offsets, at, te)
 			}
 		case types.TSTRUCT:
+			at0 := at
 			for i, f := range t.Fields() {
+				at = at0 + f.Offset // Fields may be over-aligned, see wasm32.
 				offsets, at = appendParamOffsets(offsets, at, f.Type)
 				if f.Type.Size() == 0 && i == t.NumFields()-1 {
 					at++ // last field has zero width
@@ -271,13 +278,6 @@ func NewABIConfig(iRegsCount, fRegsCount int, offsetForLocals int64, which uint8
 	return &ABIConfig{offsetForLocals: offsetForLocals, regAmounts: RegAmounts{iRegsCount, fRegsCount}, which: obj.ABI(which)}
 }
 
-// Copy returns config.
-//
-// TODO(mdempsky): Remove.
-func (config *ABIConfig) Copy() *ABIConfig {
-	return config
-}
-
 // Which returns the ABI number
 func (config *ABIConfig) Which() obj.ABI {
 	return config.which
@@ -331,7 +331,8 @@ func (config *ABIConfig) ABIAnalyzeTypes(params, results []*types.Type) *ABIPara
 
 	// Inputs
 	info.inparams = assignParams(params, false)
-	s.stackOffset = types.RoundUp(s.stackOffset, int64(types.RegSize))
+	// Stack results follow the ABI0 layout.
+	s.stackOffset = types.RoundUp(s.stackOffset, int64(types.PtrSize))
 	info.inRegistersUsed = s.rUsed.intRegs + s.rUsed.floatRegs
 
 	// Outputs
@@ -373,7 +374,8 @@ func (config *ABIConfig) ABIAnalyzeFuncType(ft *types.Type) *ABIParamResultInfo 
 
 	// Inputs
 	info.inparams = assignParams(ft.RecvParams(), false)
-	s.stackOffset = types.RoundUp(s.stackOffset, int64(types.RegSize))
+	// Stack results follow the ABI0 layout.
+	s.stackOffset = types.RoundUp(s.stackOffset, int64(types.PtrSize))
 	info.inRegistersUsed = s.rUsed.intRegs + s.rUsed.floatRegs
 
 	// Outputs
@@ -517,11 +519,11 @@ func (state *assignState) allocateRegs(regs []RegIndex, t *types.Type) []RegInde
 	}
 	ri := state.rUsed.intRegs
 	rf := state.rUsed.floatRegs
-	if t.IsScalar() || t.IsPtrShaped() {
+	if t.IsScalar() || t.IsPtrShaped() || t.IsSIMD() {
 		if t.IsComplex() {
 			regs = append(regs, RegIndex(rf+state.rTotal.intRegs), RegIndex(rf+1+state.rTotal.intRegs))
 			rf += 2
-		} else if t.IsFloat() {
+		} else if t.IsFloat() || t.IsSIMD() {
 			regs = append(regs, RegIndex(rf+state.rTotal.intRegs))
 			rf += 1
 		} else {
@@ -657,9 +659,7 @@ func (state *assignState) tryAllocRegs(typ *types.Type) []RegIndex {
 func (pa *ABIParamAssignment) ComputePadding(storage []uint64) []uint64 {
 	nr := len(pa.Registers)
 	padding := storage[:nr]
-	for i := 0; i < nr; i++ {
-		padding[i] = 0
-	}
+	clear(padding)
 	if pa.Type.Kind() != types.TSTRUCT || nr == 0 {
 		return padding
 	}
@@ -668,12 +668,12 @@ func (pa *ABIParamAssignment) ComputePadding(storage []uint64) []uint64 {
 	if len(types) != nr {
 		panic("internal error")
 	}
-	off := int64(0)
+	offsets, _ := appendParamOffsets([]int64{}, 0, pa.Type)
 	for idx, t := range types {
 		ts := t.Size()
-		off += int64(ts)
+		off := offsets[idx] + ts
 		if idx < len(types)-1 {
-			noff := align(off, types[idx+1])
+			noff := offsets[idx+1]
 			if noff != off {
 				padding[idx] = uint64(noff - off)
 			}

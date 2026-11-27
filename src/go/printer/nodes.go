@@ -11,7 +11,6 @@ package printer
 import (
 	"go/ast"
 	"go/token"
-	"math"
 	"strconv"
 	"strings"
 	"unicode"
@@ -183,9 +182,9 @@ func (p *printer) exprList(prev0 token.Pos, list []ast.Expr, depth int, mode exp
 
 	// We use the ratio between the geometric mean of the previous key sizes and
 	// the current size to determine if there should be a break in the alignment.
-	// To compute the geometric mean we accumulate the ln(size) values (lnsum)
+	// To compute the geometric mean we accumulate the log₂(size) values (log2sum)
 	// and the number of sizes included (count).
-	lnsum := 0.0
+	log2sum := 0.0
 	count := 0
 
 	// print all list elements
@@ -228,8 +227,8 @@ func (p *printer) exprList(prev0 token.Pos, list []ast.Expr, depth int, mode exp
 			if count == 0 || prevSize <= smallSize && size <= smallSize {
 				useFF = false
 			} else {
-				const r = 2.5                               // threshold
-				geomean := math.Exp(lnsum / float64(count)) // count > 0
+				const r = 2.5                                // threshold
+				geomean := exp2ish(log2sum / float64(count)) // count > 0
 				ratio := float64(size) / geomean
 				useFF = r*ratio <= 1 || r <= ratio
 			}
@@ -260,7 +259,7 @@ func (p *printer) exprList(prev0 token.Pos, list []ast.Expr, depth int, mode exp
 				// the section), reset the geomean variables since we are
 				// starting a new group of elements with the next element.
 				if nbreaks > 1 {
-					lnsum = 0
+					log2sum = 0
 					count = 0
 				}
 			}
@@ -284,7 +283,7 @@ func (p *printer) exprList(prev0 token.Pos, list []ast.Expr, depth int, mode exp
 		}
 
 		if size > 0 {
-			lnsum += math.Log(float64(size))
+			log2sum += log2ish(float64(size))
 			count++
 		}
 
@@ -380,7 +379,7 @@ func (p *printer) parameters(fields *ast.FieldList, mode paramMode) {
 		if closing := p.lineFor(fields.Closing); 0 < prevLine && prevLine < closing {
 			p.print(token.COMMA)
 			p.linebreak(closing, 0, ignore, true)
-		} else if mode == typeTParam && fields.NumFields() == 1 && combinesWithName(fields.List[0].Type) {
+		} else if mode == typeTParam && fields.NumFields() == 1 && combinesWithName(stripParensAlways(fields.List[0].Type)) {
 			// A type parameter list [P T] where the name P and the type expression T syntactically
 			// combine to another valid (value) expression requires a trailing comma, as in [P *T,]
 			// (or an enclosing interface as in [P interface(*T)]), so that the type parameter list
@@ -401,7 +400,7 @@ func (p *printer) parameters(fields *ast.FieldList, mode paramMode) {
 // combinesWithName reports whether a name followed by the expression x
 // syntactically combines to another valid (value) expression. For instance
 // using *T for x, "name *T" syntactically appears as the expression x*T.
-// On the other hand, using  P|Q or *P|~Q for x, "name P|Q" or name *P|~Q"
+// On the other hand, using  P|Q or *P|~Q for x, "name P|Q" or "name *P|~Q"
 // cannot be combined into a valid (value) expression.
 func combinesWithName(x ast.Expr) bool {
 	switch x := x.(type) {
@@ -411,9 +410,7 @@ func combinesWithName(x ast.Expr) bool {
 	case *ast.BinaryExpr:
 		return combinesWithName(x.X) && !isTypeElem(x.Y)
 	case *ast.ParenExpr:
-		// name(x) combines but we are making sure at
-		// the call site that x is never parenthesized.
-		panic("unexpected parenthesized expression")
+		return !isTypeElem(x.X)
 	}
 	return false
 }
@@ -657,7 +654,8 @@ func walkBinary(e *ast.BinaryExpr) (has4, has5 bool, maxProblem int) {
 		has5 = true
 	}
 
-	switch l := e.X.(type) {
+	// Look at e.X as binaryExpr prints it, possibly parenthesized.
+	switch l := parenIfContinued(e.X, e.Op).(type) {
 	case *ast.BinaryExpr:
 		if l.Op.Precedence() < e.Op.Precedence() {
 			// parens will be inserted.
@@ -774,7 +772,9 @@ func (p *printer) binaryExpr(x *ast.BinaryExpr, prec1, cutoff, depth int) {
 		// Note: The parser inserts an ast.ParenExpr node; thus this case
 		//       can only occur if the AST is created in a different way.
 		p.print(token.LPAREN)
+		p.exprLev++
 		p.expr0(x, reduceDepth(depth)) // parentheses undo one level of depth
+		p.exprLev--
 		p.print(token.RPAREN)
 		return
 	}
@@ -782,7 +782,8 @@ func (p *printer) binaryExpr(x *ast.BinaryExpr, prec1, cutoff, depth int) {
 	printBlank := prec < cutoff
 
 	ws := indent
-	p.expr1(x.X, prec, depth+diffPrec(x.X, prec))
+	l := parenIfContinued(x.X, x.Op)
+	p.expr1(l, prec, depth+diffPrec(l, prec))
 	if printBlank {
 		p.print(blank)
 	}
@@ -841,7 +842,9 @@ func (p *printer) expr1(expr ast.Expr, prec1, depth int) {
 			// parenthesis needed
 			p.print(token.LPAREN)
 			p.print(token.MUL)
+			p.exprLev++
 			p.expr(x.X)
+			p.exprLev--
 			p.print(token.RPAREN)
 		} else {
 			// no parenthesis needed
@@ -854,7 +857,9 @@ func (p *printer) expr1(expr ast.Expr, prec1, depth int) {
 		if prec < prec1 {
 			// parenthesis needed
 			p.print(token.LPAREN)
+			p.exprLev++
 			p.expr(x)
+			p.exprLev--
 			p.print(token.RPAREN)
 		} else {
 			// no parenthesis needed
@@ -878,7 +883,9 @@ func (p *printer) expr1(expr ast.Expr, prec1, depth int) {
 		// See the comment in funcDecl about how the header size is computed.
 		startCol := p.out.Column - len("func")
 		p.signature(x.Type)
+		p.exprLev++
 		p.funcBody(p.distanceFrom(x.Type.Pos(), startCol), blank, x.Body)
+		p.exprLev--
 
 	case *ast.ParenExpr:
 		if _, hasParens := x.X.(*ast.ParenExpr); hasParens {
@@ -887,7 +894,9 @@ func (p *printer) expr1(expr ast.Expr, prec1, depth int) {
 			p.expr0(x.X, depth)
 		} else {
 			p.print(token.LPAREN)
+			p.exprLev++
 			p.expr0(x.X, reduceDepth(depth)) // parentheses undo one level of depth
+			p.exprLev--
 			p.setPos(x.Rparen)
 			p.print(token.RPAREN)
 		}
@@ -896,7 +905,7 @@ func (p *printer) expr1(expr ast.Expr, prec1, depth int) {
 		p.selectorExpr(x, depth, false)
 
 	case *ast.TypeAssertExpr:
-		p.expr1(x.X, token.HighestPrec, depth)
+		p.expr1(parenIfContinued(x.X, token.PERIOD), token.HighestPrec, depth)
 		p.print(token.PERIOD)
 		p.setPos(x.Lparen)
 		p.print(token.LPAREN)
@@ -910,28 +919,33 @@ func (p *printer) expr1(expr ast.Expr, prec1, depth int) {
 
 	case *ast.IndexExpr:
 		// TODO(gri): should treat[] like parentheses and undo one level of depth
-		p.expr1(x.X, token.HighestPrec, 1)
+		p.expr1(parenIfContinued(x.X, token.LBRACK), token.HighestPrec, 1)
 		p.setPos(x.Lbrack)
 		p.print(token.LBRACK)
+		p.exprLev++
 		p.expr0(x.Index, depth+1)
+		p.exprLev--
 		p.setPos(x.Rbrack)
 		p.print(token.RBRACK)
 
 	case *ast.IndexListExpr:
 		// TODO(gri): as for IndexExpr, should treat [] like parentheses and undo
 		// one level of depth
-		p.expr1(x.X, token.HighestPrec, 1)
+		p.expr1(parenIfContinued(x.X, token.LBRACK), token.HighestPrec, 1)
 		p.setPos(x.Lbrack)
 		p.print(token.LBRACK)
+		p.exprLev++
 		p.exprList(x.Lbrack, x.Indices, depth+1, commaTerm, x.Rbrack, false)
+		p.exprLev--
 		p.setPos(x.Rbrack)
 		p.print(token.RBRACK)
 
 	case *ast.SliceExpr:
 		// TODO(gri): should treat[] like parentheses and undo one level of depth
-		p.expr1(x.X, token.HighestPrec, 1)
+		p.expr1(parenIfContinued(x.X, token.LBRACK), token.HighestPrec, 1)
 		p.setPos(x.Lbrack)
 		p.print(token.LBRACK)
+		p.exprLev++
 		indices := []ast.Expr{x.Low, x.High}
 		if x.Max != nil {
 			indices = append(indices, x.Max)
@@ -967,6 +981,7 @@ func (p *printer) expr1(expr ast.Expr, prec1, depth int) {
 				p.expr0(x, depth+1)
 			}
 		}
+		p.exprLev--
 		p.setPos(x.Rbrack)
 		p.print(token.RBRACK)
 
@@ -984,6 +999,7 @@ func (p *printer) expr1(expr ast.Expr, prec1, depth int) {
 		case *ast.ChanType:
 			paren = t.Dir == ast.RECV
 		}
+		paren = paren || continuesResult(x.Fun, token.LPAREN)
 		if paren {
 			p.print(token.LPAREN)
 		}
@@ -994,6 +1010,7 @@ func (p *printer) expr1(expr ast.Expr, prec1, depth int) {
 
 		p.setPos(x.Lparen)
 		p.print(token.LPAREN)
+		p.exprLev++
 		if x.Ellipsis.IsValid() {
 			p.exprList(x.Lparen, x.Args, depth, 0, x.Ellipsis, false)
 			p.setPos(x.Ellipsis)
@@ -1004,6 +1021,7 @@ func (p *printer) expr1(expr ast.Expr, prec1, depth int) {
 		} else {
 			p.exprList(x.Lparen, x.Args, depth, commaTerm, x.Rparen, false)
 		}
+		p.exprLev--
 		p.setPos(x.Rparen)
 		p.print(token.RPAREN)
 		if wasIndented {
@@ -1011,6 +1029,16 @@ func (p *printer) expr1(expr ast.Expr, prec1, depth int) {
 		}
 
 	case *ast.CompositeLit:
+		// In a control clause, the opening brace of a composite literal
+		// that starts with a type name is taken for the start of the
+		// statement body. Such a literal must be parenthesized. The parser
+		// requires the parentheses, so they are only missing here if the
+		// AST was created or modified in a different way.
+		paren := p.exprLev < 0 && isTypeName(x.Type)
+		if paren {
+			p.print(token.LPAREN)
+			p.exprLev++
+		}
 		// composite literal elements that are composite literals themselves may have the type omitted
 		if x.Type != nil {
 			p.expr1(x.Type, token.HighestPrec, depth)
@@ -1018,7 +1046,9 @@ func (p *printer) expr1(expr ast.Expr, prec1, depth int) {
 		p.level++
 		p.setPos(x.Lbrace)
 		p.print(token.LBRACE)
+		p.exprLev++
 		p.exprList(x.Lbrace, x.Elts, 1, commaTerm, x.Rbrace, x.Incomplete)
+		p.exprLev--
 		// do not insert extra line break following a /*-style comment
 		// before the closing '}' as it might break the code if there
 		// is no trailing ','
@@ -1034,6 +1064,10 @@ func (p *printer) expr1(expr ast.Expr, prec1, depth int) {
 		p.setPos(x.Rbrace)
 		p.print(token.RBRACE, mode)
 		p.level--
+		if paren {
+			p.exprLev--
+			p.print(token.RPAREN)
+		}
 
 	case *ast.Ellipsis:
 		p.print(token.ELLIPSIS)
@@ -1044,7 +1078,9 @@ func (p *printer) expr1(expr ast.Expr, prec1, depth int) {
 	case *ast.ArrayType:
 		p.print(token.LBRACK)
 		if x.Len != nil {
+			p.exprLev++
 			p.expr(x.Len)
+			p.exprLev--
 		}
 		p.print(token.RBRACK)
 		p.expr(x.Elt)
@@ -1157,7 +1193,7 @@ func (p *printer) possibleSelectorExpr(expr ast.Expr, prec1, depth int) bool {
 // selectorExpr handles an *ast.SelectorExpr node and reports whether x spans
 // multiple lines.
 func (p *printer) selectorExpr(x *ast.SelectorExpr, depth int, isMethod bool) bool {
-	p.expr1(x.X, token.HighestPrec, depth)
+	p.expr1(parenIfContinued(x.X, token.PERIOD), token.HighestPrec, depth)
 	p.print(token.PERIOD)
 	if line := p.lineFor(x.Sel.Pos()); p.pos.IsValid() && p.pos.Line < line {
 		p.print(indent, newline)
@@ -1171,6 +1207,59 @@ func (p *printer) selectorExpr(x *ast.SelectorExpr, depth int, isMethod bool) bo
 	p.setPos(x.Sel.Pos())
 	p.print(x.Sel)
 	return false
+}
+
+// parenIfContinued returns x wrapped in an *ast.ParenExpr if
+// continuesResult(x, tok), and x otherwise.
+func parenIfContinued(x ast.Expr, tok token.Token) ast.Expr {
+	if continuesResult(x, tok) {
+		return &ast.ParenExpr{X: x}
+	}
+	return x
+}
+
+// continuesResult reports whether tok after x would extend a function
+// result type that signature prints without parentheses.
+func continuesResult(x ast.Expr, tok token.Token) bool {
+	inResult := false
+	for {
+		switch t := x.(type) {
+		case *ast.Ident:
+			// func()(T).m => (func() T).m
+			return inResult && (tok == token.PERIOD || tok == token.LBRACK)
+		case *ast.SelectorExpr:
+			// Unlike T, p.T cannot be qualified any further.
+			return inResult && tok == token.LBRACK
+		case *ast.UnaryExpr:
+			x = t.X
+		case *ast.StarExpr:
+			x = t.X
+		case *ast.BinaryExpr:
+			x = t.Y
+		case *ast.ArrayType:
+			x = t.Elt
+		case *ast.MapType:
+			x = t.Value
+		case *ast.ChanType:
+			x = t.Value
+		case *ast.FuncType:
+			res := t.Results
+			switch n := res.NumFields(); {
+			case n == 0:
+				// func(...)()[x] => (func(...))[x], and likewise for (, * and <-.
+				// The parser accepts these, but most are not valid Go.
+				return tok == token.LBRACK || tok == token.LPAREN || tok == token.MUL || tok == token.ARROW
+			case n == 1 && res.List[0].Names == nil:
+				x = stripParensAlways(res.List[0].Type)
+				inResult = true
+			default:
+				// More than one result or a named result; parentheses are always printed.
+				return false
+			}
+		default:
+			return false
+		}
+	}
 }
 
 func (p *printer) expr0(x ast.Expr, depth int) {
@@ -1235,12 +1324,15 @@ func (p *printer) block(b *ast.BlockStmt, nindent int) {
 	p.print(token.RBRACE)
 }
 
+// isTypeName reports whether x has the form of a possibly qualified
+// and possibly instantiated type name. Like the parser, it doesn't
+// check the operands of selector and index expressions: the parser
+// accepts a composite literal such as f().T{} and leaves it to the
+// type checker to report the invalid type.
 func isTypeName(x ast.Expr) bool {
-	switch t := x.(type) {
-	case *ast.Ident:
+	switch x.(type) {
+	case *ast.BadExpr, *ast.Ident, *ast.SelectorExpr, *ast.IndexExpr, *ast.IndexListExpr:
 		return true
-	case *ast.SelectorExpr:
-		return isTypeName(t.X)
 	}
 	return false
 }
@@ -1279,6 +1371,9 @@ func stripParensAlways(x ast.Expr) ast.Expr {
 }
 
 func (p *printer) controlClause(isForStmt bool, init ast.Stmt, expr ast.Expr, post ast.Stmt) {
+	defer func(lev int) { p.exprLev = lev }(p.exprLev)
+	p.exprLev = -1
+
 	p.print(blank)
 	needsBlank := false
 	if init == nil && post == nil {
@@ -1312,13 +1407,29 @@ func (p *printer) controlClause(isForStmt bool, init ast.Stmt, expr ast.Expr, po
 	}
 }
 
+// isCompositeLitLike reports whether x is a composite literal or an expression
+// whose core is a composite literal (e.g. &T{...}), ignoring parentheses.
+func isCompositeLitLike(x ast.Expr) bool {
+	switch x := stripParensAlways(x).(type) {
+	case *ast.CompositeLit:
+		return true
+	case *ast.UnaryExpr:
+		_, ok := stripParensAlways(x.X).(*ast.CompositeLit)
+		return x.Op == token.AND && ok
+	}
+	return false
+}
+
 // indentList reports whether an expression list would look better if it
 // were indented wholesale (starting with the very first element, rather
 // than starting at the first line break).
+// Currently this function is only used to improve formatting of return
+// statements.
 func (p *printer) indentList(list []ast.Expr) bool {
 	// Heuristic: indentList reports whether there are more than one multi-
-	// line element in the list, or if there is any element that is not
-	// starting on the same line as the previous one ends.
+	// line element (such as a complex expression, but excluding composite
+	// literals) in the list, or if there is any element that is not starting
+	// on the same line as the previous one ends.
 	if len(list) >= 2 {
 		var b = p.lineFor(list[0].Pos())
 		var e = p.lineFor(list[len(list)-1].End())
@@ -1334,8 +1445,10 @@ func (p *printer) indentList(list []ast.Expr) bool {
 					// line as the previous one ended
 					return true
 				}
-				if xb < xe {
-					// x is a multi-line element
+				if xb < xe && !isCompositeLitLike(x) {
+					// x is a multi-line element but not a composite literal
+					// (composite literals have their own field indentation
+					// already, see go.dev/issue/7195)
 					n++
 				}
 				line = xe
@@ -1385,7 +1498,7 @@ func (p *printer) stmt(stmt ast.Stmt, nextIsRBrace bool) {
 
 	case *ast.SendStmt:
 		const depth = 1
-		p.expr0(s.Chan, depth)
+		p.expr0(parenIfContinued(s.Chan, token.ARROW), depth)
 		p.print(blank)
 		p.setPos(s.Arrow)
 		p.print(token.ARROW, blank)
@@ -1483,6 +1596,8 @@ func (p *printer) stmt(stmt ast.Stmt, nextIsRBrace bool) {
 
 	case *ast.TypeSwitchStmt:
 		p.print(token.SWITCH)
+		lev := p.exprLev
+		p.exprLev = -1
 		if s.Init != nil {
 			p.print(blank)
 			p.stmt(s.Init, false)
@@ -1490,6 +1605,7 @@ func (p *printer) stmt(stmt ast.Stmt, nextIsRBrace bool) {
 		}
 		p.print(blank)
 		p.stmt(s.Assign, false)
+		p.exprLev = lev
 		p.print(blank)
 		p.block(s.Body, 0)
 
@@ -1524,6 +1640,8 @@ func (p *printer) stmt(stmt ast.Stmt, nextIsRBrace bool) {
 
 	case *ast.RangeStmt:
 		p.print(token.FOR, blank)
+		lev := p.exprLev
+		p.exprLev = -1
 		if s.Key != nil {
 			p.expr(s.Key)
 			if s.Value != nil {
@@ -1539,6 +1657,7 @@ func (p *printer) stmt(stmt ast.Stmt, nextIsRBrace bool) {
 		}
 		p.print(token.RANGE, blank)
 		p.expr(stripParens(s.X))
+		p.exprLev = lev
 		p.print(blank)
 		p.block(s.Body, 1)
 

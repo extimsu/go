@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -286,7 +287,7 @@ func TestRegIndex(t *testing.T) {
 			have := regIndex(int16(reg))
 			want := index
 			if have != want {
-				regName := rconv(int(reg))
+				regName := rconv(reg)
 				t.Errorf("regIndex(%s):\nhave: %d\nwant: %d",
 					regName, have, want)
 			}
@@ -316,6 +317,13 @@ func TestPCALIGN(t *testing.T) {
 			name: "16-byte alignment",
 			code: "TEXT ·foo(SB),$0-0\nMOVQ $0, AX\nPCALIGN $16\nMOVQ $2, CX\nRET\n",
 			out:  `0x0010\s00016\s\(.*\)\tMOVQ\t\$2,\sCX`,
+		},
+		{
+			// Issue 81792: a forward jump to PCALIGN that must be
+			// widened to rel32 used to hang the assembler.
+			name: "long forward jump to PCALIGN",
+			code: "TEXT ·foo(SB),$0-0\nJMP skip\n" + strings.Repeat("BYTE $0xcc\n", 136) + "skip:\nPCALIGN $64\nRET\n",
+			out:  `0x0000\s00000\s\(.*\)\tJMP\t141`,
 		},
 	}
 

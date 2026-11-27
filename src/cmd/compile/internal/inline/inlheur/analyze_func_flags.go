@@ -134,7 +134,7 @@ func branchCombine(p1, p2 pstate) pstate {
 }
 
 // stateForList walks through a list of statements and computes the
-// state/diposition for the entire list as a whole, as well
+// state/disposition for the entire list as a whole, as well
 // as updating disposition of intermediate nodes.
 func (ffa *funcFlagsAnalyzer) stateForList(list ir.Nodes) pstate {
 	st := psTop
@@ -335,7 +335,7 @@ func (ffa *funcFlagsAnalyzer) nodeVisitPost(n ir.Node) {
 		ir.OPRINTLN, ir.OPRINT, ir.OLABEL, ir.OCALLINTER, ir.ODEFER,
 		ir.OSEND, ir.ORECV, ir.OSELRECV2, ir.OGO, ir.OAPPEND, ir.OAS2DOTTYPE,
 		ir.OAS2MAPR, ir.OGETG, ir.ODELETE, ir.OINLMARK, ir.OAS2RECV,
-		ir.OMIN, ir.OMAX, ir.OMAKE, ir.ORECOVERFP, ir.OGETCALLERSP:
+		ir.OMIN, ir.OMAX, ir.OMAKE, ir.OGETCALLERSP:
 		// these should all be benign/uninteresting
 	case ir.OTAILCALL, ir.OJUMPTABLE, ir.OTYPESW:
 		// don't expect to see these at all.

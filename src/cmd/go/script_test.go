@@ -13,7 +13,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	_ "embed"
 	"flag"
+	"fmt"
 	"internal/testenv"
 	"internal/txtar"
 	"net/url"
@@ -26,17 +28,25 @@ import (
 
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/gover"
-	"cmd/go/internal/script"
-	"cmd/go/internal/script/scripttest"
 	"cmd/go/internal/vcweb/vcstest"
+	"cmd/internal/script"
+	"cmd/internal/script/scripttest"
+
+	"golang.org/x/telemetry/counter/countertest"
 )
 
 var testSum = flag.String("testsum", "", `may be tidy, listm, or listall. If set, TestScript generates a go.sum file at the beginning of each test and updates test files if they pass.`)
 
 // TestScript runs the tests in testdata/script/*.txt.
 func TestScript(t *testing.T) {
+	t.Parallel()
+
 	testenv.MustHaveGoBuild(t)
 	testenv.SkipIfShortAndSlow(t)
+
+	if testing.Short() && runtime.GOOS == "plan9" {
+		t.Skipf("skipping test in -short mode on %s", runtime.GOOS)
+	}
 
 	srv, err := vcstest.NewServer()
 	if err != nil {
@@ -77,7 +87,8 @@ func TestScript(t *testing.T) {
 		timeout -= 2 * gracePeriod
 
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, timeout)
+		cause := fmt.Errorf("%s timeout %v: %w", t.Name(), timeout.Round(time.Second), context.DeadlineExceeded)
+		ctx, cancel = context.WithTimeoutCause(ctx, timeout, cause)
 		t.Cleanup(cancel)
 	}
 
@@ -86,12 +97,13 @@ func TestScript(t *testing.T) {
 		t.Fatal(err)
 	}
 	engine := &script.Engine{
-		Conds: scriptConditions(),
+		Conds: scriptConditions(t),
 		Cmds:  scriptCommands(quitSignal(), gracePeriod),
 		Quiet: !testing.Verbose(),
 	}
 
 	t.Run("README", func(t *testing.T) {
+		t.Parallel()
 		checkScriptReadme(t, engine, env)
 	})
 
@@ -100,7 +112,6 @@ func TestScript(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, file := range files {
-		file := file
 		name := strings.TrimSuffix(filepath.Base(file), ".txt")
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
@@ -124,7 +135,7 @@ func TestScript(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			initScriptDirs(t, s)
+			telemetryDir := initScriptDirs(t, s)
 			if err := s.ExtractFiles(a); err != nil {
 				t.Fatal(err)
 			}
@@ -154,6 +165,7 @@ func TestScript(t *testing.T) {
 			// will work better seeing the full path relative to cmd/go
 			// (where the "go test" command is usually run).
 			scripttest.Run(t, engine, s, file, bytes.NewReader(a.Comment))
+			checkCounters(t, telemetryDir)
 		})
 	}
 }
@@ -175,9 +187,9 @@ func tbFromContext(ctx context.Context) (testing.TB, bool) {
 	return t.(testing.TB), true
 }
 
-// initScriptState creates the initial directory structure in s for unpacking a
+// initScriptDirs creates the initial directory structure in s for unpacking a
 // cmd/go script.
-func initScriptDirs(t testing.TB, s *script.State) {
+func initScriptDirs(t testing.TB, s *script.State) (telemetryDir string) {
 	must := func(err error) {
 		if err != nil {
 			t.Helper()
@@ -188,6 +200,10 @@ func initScriptDirs(t testing.TB, s *script.State) {
 	work := s.Getwd()
 	must(s.Setenv("WORK", work))
 
+	telemetryDir = filepath.Join(work, "telemetry")
+	must(os.MkdirAll(telemetryDir, 0777))
+	must(s.Setenv("TEST_TELEMETRY_DIR", filepath.Join(work, "telemetry")))
+
 	must(os.MkdirAll(filepath.Join(work, "tmp"), 0777))
 	must(s.Setenv(tempEnvName(), filepath.Join(work, "tmp")))
 
@@ -196,6 +212,7 @@ func initScriptDirs(t testing.TB, s *script.State) {
 	gopathSrc := filepath.Join(gopath, "src")
 	must(os.MkdirAll(gopathSrc, 0777))
 	must(s.Chdir(gopathSrc))
+	return telemetryDir
 }
 
 func scriptEnv(srv *vcstest.Server, srvCertFile string) ([]string, error) {
@@ -218,12 +235,15 @@ func scriptEnv(srv *vcstest.Server, srvCertFile string) ([]string, error) {
 		"GODEBUG=" + os.Getenv("GODEBUG"),
 		"GOEXE=" + cfg.ExeSuffix,
 		"GOEXPERIMENT=" + os.Getenv("GOEXPERIMENT"),
+		// Cap per-subprocess GOMAXPROCS so concurrent TestScript subtests do not
+		// oversubscribe high-core-count machines with P*NumCPU threads.
+		fmt.Sprintf("GOMAXPROCS=%d", min(runtime.GOMAXPROCS(0), 4)),
 		"GOOS=" + runtime.GOOS,
 		"TESTGO_GOHOSTOS=" + goHostOS,
 		"GOPROXY=" + proxyURL,
 		"GOPRIVATE=",
+		"GORACE=atexit_sleep_ms=100", // saves ~10m on darwin race builder, ~1m on 32 core amd64 race builder
 		"GOROOT=" + testGOROOT,
-		"GOROOT_FINAL=" + testGOROOT_FINAL, // causes spurious rebuilds and breaks the "stale" built-in if not propagated
 		"GOTRACEBACK=system",
 		"TESTGONETWORK=panic", // allow only local connections by default; the [net] condition resets this
 		"TESTGO_GOROOT=" + testGOROOT,
@@ -233,6 +253,7 @@ func scriptEnv(srv *vcstest.Server, srvCertFile string) ([]string, error) {
 		"TESTGO_VCSTEST_CERT=" + srvCertFile,
 		"TESTGONETWORK=panic", // cleared by the [net] condition
 		"GOSUMDB=" + testSumDBVerifierKey,
+		"TESTGO_SUMDB=" + testSumDBName,
 		"GONOPROXY=",
 		"GONOSUMDB=",
 		"GOVCS=*:all",
@@ -252,13 +273,6 @@ func scriptEnv(srv *vcstest.Server, srvCertFile string) ([]string, error) {
 			"GIT_TRACE_CURL_NO_DATA=1",
 			"GIT_REDACT_COOKIES=o,SSO,GSSO_Uberproxy")
 	}
-	if testing.Short() {
-		// VCS commands are always somewhat slow: they either require access to external hosts,
-		// or they require our intercepted vcs-test.golang.org to regenerate the repository.
-		// Require all tests that use VCS commands to be skipped in short mode.
-		env = append(env, "TESTGOVCS=panic")
-	}
-
 	if os.Getenv("CGO_ENABLED") != "" || runtime.GOOS != goHostOS || runtime.GOARCH != goHostArch {
 		// If the actual CGO_ENABLED might not match the cmd/go default, set it
 		// explicitly in the environment. Otherwise, leave it unset so that we also
@@ -357,4 +371,40 @@ func updateSum(t testing.TB, e *script.Engine, s *script.State, archive *txtar.A
 		archive.Files[gosumIdx].Data = newGosumData
 	}
 	return rewrite
+}
+
+func readCounters(t *testing.T, telemetryDir string) map[string]uint64 {
+	localDir := filepath.Join(telemetryDir, "local")
+	dirents, err := os.ReadDir(localDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // The Go command didn't ever run so the local dir wasn't created
+		}
+		t.Fatalf("reading telemetry local dir: %v", err)
+	}
+	totals := map[string]uint64{}
+	for _, dirent := range dirents {
+		if dirent.IsDir() || !strings.HasSuffix(dirent.Name(), ".count") {
+			// not a counter file
+			continue
+		}
+		counters, _, err := countertest.ReadFile(filepath.Join(localDir, dirent.Name()))
+		if err != nil {
+			t.Fatalf("reading counter file: %v", err)
+		}
+		for k, v := range counters {
+			totals[k] += v
+		}
+	}
+
+	return totals
+}
+
+func checkCounters(t *testing.T, telemetryDir string) {
+	counters := readCounters(t, telemetryDir)
+	if _, ok := scriptGoInvoked.Load(testing.TB(t)); ok {
+		if countertest.SupportedPlatform && len(counters) == 0 {
+			t.Fatal("go was invoked but no counters were incremented")
+		}
+	}
 }

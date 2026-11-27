@@ -35,7 +35,7 @@ func NewFileTransport(fs FileSystem) RoundTripper {
 // NewFileTransportFS returns a new [RoundTripper], serving the provided
 // file system fsys. The returned RoundTripper ignores the URL host in its
 // incoming requests, as well as most other properties of the
-// request.
+// request. The files provided by fsys must implement [io.Seeker].
 //
 // The typical use case for NewFileTransportFS is to register the "file"
 // protocol with a [Transport], as in:
@@ -57,7 +57,7 @@ func (t fileTransport) RoundTrip(req *Request) (resp *Response, err error) {
 	// sends our *Response on, once the *Response itself has been
 	// populated (even if the body itself is still being
 	// written to the res.Body, a pipe)
-	rw, resc := newPopulateResponseWriter()
+	rw, resc := newPopulateResponseWriter(req)
 	go func() {
 		t.fh.ServeHTTP(rw, req)
 		rw.finish()
@@ -65,7 +65,7 @@ func (t fileTransport) RoundTrip(req *Request) (resp *Response, err error) {
 	return <-resc, nil
 }
 
-func newPopulateResponseWriter() (*populateResponse, <-chan *Response) {
+func newPopulateResponseWriter(req *Request) (*populateResponse, <-chan *Response) {
 	pr, pw := io.Pipe()
 	rw := &populateResponse{
 		ch: make(chan *Response),
@@ -76,6 +76,7 @@ func newPopulateResponseWriter() (*populateResponse, <-chan *Response) {
 			Header:     make(Header),
 			Close:      true,
 			Body:       pr,
+			Request:    req,
 		},
 	}
 	return rw, rw.ch

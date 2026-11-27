@@ -6,21 +6,36 @@ package rsa_test
 
 import (
 	"crypto"
-	"crypto/rand"
+	"crypto/internal/cryptotest"
 	"crypto/rsa"
 	"crypto/x509"
 	"testing"
 )
 
+func TestKeys(t *testing.T) {
+	t.Setenv("GODEBUG", "rsa1024min=0")
+
+	t.Run("PrivateKey", func(t *testing.T) {
+		cryptotest.TestPrivateKey(t, test512Key, test512KeyTwo,
+			x509.ParsePKCS1PrivateKey, x509.MarshalPKCS1PrivateKey)
+	})
+	t.Run("PublicKey", func(t *testing.T) {
+		cryptotest.TestPublicKey(t, &test512Key.PublicKey, &test512KeyTwo.PublicKey,
+			x509.ParsePKCS1PublicKey, x509.MarshalPKCS1PublicKey)
+	})
+}
+
 func TestEqual(t *testing.T) {
-	private, _ := rsa.GenerateKey(rand.Reader, 512)
+	t.Setenv("GODEBUG", "rsa1024min=0")
+
+	private := test512Key
 	public := &private.PublicKey
 
 	if !public.Equal(public) {
 		t.Errorf("public key is not equal to itself: %v", public)
 	}
 	if !public.Equal(crypto.Signer(private).Public().(*rsa.PublicKey)) {
-		t.Errorf("private.Public() is not Equal to public: %q", public)
+		t.Errorf("private.Public() is not Equal to public: %v", public)
 	}
 	if !private.Equal(private) {
 		t.Errorf("private key is not equal to itself: %v", private)
@@ -41,11 +56,9 @@ func TestEqual(t *testing.T) {
 		t.Errorf("private key is not equal to itself after decoding: %v", private)
 	}
 
-	other, _ := rsa.GenerateKey(rand.Reader, 512)
-	if public.Equal(other.Public()) {
-		t.Errorf("different public keys are Equal")
-	}
-	if private.Equal(other) {
-		t.Errorf("different private keys are Equal")
+	noPrecomp := *private
+	noPrecomp.Precomputed = rsa.PrecomputedValues{}
+	if !private.Equal(&noPrecomp) {
+		t.Errorf("private key with no precomputation is not equal to itself: %v", private)
 	}
 }

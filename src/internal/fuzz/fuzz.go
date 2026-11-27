@@ -126,10 +126,14 @@ func CoordinateFuzzing(ctx context.Context, opts CoordinateFuzzingOpts) (err err
 			}
 		}
 
-		if err == fuzzCtx.Err() || isInterruptError(err) {
+		if err == ctx.Err() || err == fuzzCtx.Err() || isInterruptError(err) {
 			// Suppress cancellation errors and terminations due to SIGINT.
 			// The messages are not helpful since either the user triggered the error
 			// (with ^C) or another more helpful message will be printed (a crasher).
+			//
+			// Also check ctx.Err() because when ctx's deadline expires, there
+			// is a window where ctx.Err() is set but fuzzCtx (a child) has
+			// not yet been canceled. See go.dev/issue/75804.
 			err = nil
 		}
 		if err != nil && (fuzzErr == nil || fuzzErr == ctx.Err()) {
@@ -196,7 +200,7 @@ func CoordinateFuzzing(ctx context.Context, opts CoordinateFuzzingOpts) (err err
 
 	// Main event loop.
 	// Do not return until all workers have terminated. We avoid a deadlock by
-	// receiving messages from workers even after ctx is cancelled.
+	// receiving messages from workers even after ctx is canceled.
 	activeWorkers := len(workers)
 	statTicker := time.NewTicker(3 * time.Second)
 	defer statTicker.Stop()
@@ -223,8 +227,8 @@ func CoordinateFuzzing(ctx context.Context, opts CoordinateFuzzingOpts) (err err
 
 		select {
 		case <-doneC:
-			// Interrupted, cancelled, or timed out.
-			// stop sets doneC to nil so we don't busy wait here.
+			// Interrupted, canceled, or timed out.
+			// stop sets doneC to nil, so we don't busy wait here.
 			stop(ctx.Err())
 
 		case err := <-errC:
@@ -653,7 +657,7 @@ type coordinator struct {
 }
 
 func newCoordinator(opts CoordinateFuzzingOpts) (*coordinator, error) {
-	// Make sure all of the seed corpus has marshalled data.
+	// Make sure all the seed corpus has marshaled data.
 	for i := range opts.Seed {
 		if opts.Seed[i].Data == nil && opts.Seed[i].Values != nil {
 			opts.Seed[i].Data = marshalCorpusFile(opts.Seed[i].Values...)

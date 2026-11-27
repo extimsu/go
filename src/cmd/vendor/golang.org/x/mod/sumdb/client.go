@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"path"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -143,6 +142,14 @@ func (c *Client) initWork() {
 	c.verifiers = note.VerifierList(verifier)
 	c.name = verifier.Name()
 
+	if c.latest.N == 0 {
+		c.latest.Hash, err = tlog.TreeHash(0, nil)
+		if err != nil {
+			c.initErr = err
+			return
+		}
+	}
+
 	data, err := c.ops.ReadConfig(c.name + "/latest")
 	if err != nil {
 		c.initErr = err
@@ -193,51 +200,7 @@ func (c *Client) SetGONOSUMDB(list string) {
 var ErrGONOSUMDB = errors.New("skipped (listed in GONOSUMDB)")
 
 func (c *Client) skip(target string) bool {
-	return globsMatchPath(c.nosumdb, target)
-}
-
-// globsMatchPath reports whether any path prefix of target
-// matches one of the glob patterns (as defined by path.Match)
-// in the comma-separated globs list.
-// It ignores any empty or malformed patterns in the list.
-func globsMatchPath(globs, target string) bool {
-	for globs != "" {
-		// Extract next non-empty glob in comma-separated list.
-		var glob string
-		if i := strings.Index(globs, ","); i >= 0 {
-			glob, globs = globs[:i], globs[i+1:]
-		} else {
-			glob, globs = globs, ""
-		}
-		if glob == "" {
-			continue
-		}
-
-		// A glob with N+1 path elements (N slashes) needs to be matched
-		// against the first N+1 path elements of target,
-		// which end just before the N+1'th slash.
-		n := strings.Count(glob, "/")
-		prefix := target
-		// Walk target, counting slashes, truncating at the N+1'th slash.
-		for i := 0; i < len(target); i++ {
-			if target[i] == '/' {
-				if n == 0 {
-					prefix = target[:i]
-					break
-				}
-				n--
-			}
-		}
-		if n > 0 {
-			// Not enough prefix elements.
-			continue
-		}
-		matched, _ := path.Match(glob, prefix)
-		if matched {
-			return true
-		}
-	}
-	return false
+	return module.MatchPrefixPatterns(c.nosumdb, target)
 }
 
 // Lookup returns the go.sum lines for the given module path and version.
@@ -261,11 +224,14 @@ func (c *Client) Lookup(path, vers string) (lines []string, err error) {
 	}
 
 	// Prepare encoded cache filename / URL.
+	// Lookups for vers and vers/go.mod share one record,
+	// which is filed under the module version modVers.
+	modVers := strings.TrimSuffix(vers, "/go.mod")
 	epath, err := module.EscapePath(path)
 	if err != nil {
 		return nil, err
 	}
-	evers, err := module.EscapeVersion(strings.TrimSuffix(vers, "/go.mod"))
+	evers, err := module.EscapeVersion(modVers)
 	if err != nil {
 		return nil, err
 	}
@@ -281,7 +247,7 @@ func (c *Client) Lookup(path, vers string) (lines []string, err error) {
 		data []byte
 		err  error
 	}
-	result := c.record.Do(file, func() interface{} {
+	result := c.record.Do(file, func() any {
 		// Try the on-disk cache, or else get from web.
 		writeCache := false
 		data, err := c.ops.ReadCache(file)
@@ -304,6 +270,21 @@ func (c *Client) Lookup(path, vers string) (lines []string, err error) {
 		if err := c.checkRecord(id, text); err != nil {
 			return cached{nil, err}
 		}
+		if err := checkRecordLines(path, modVers, text); err != nil {
+			// The record is authenticated, so a bad line is proof
+			// that the checksum database logged a bad record, or that
+			// whoever answered the lookup (the checksum database or
+			// a proxy for it) served the wrong record.
+			// The report does not blame either one.
+			var buf bytes.Buffer
+			fmt.Fprintf(&buf, "SECURITY ERROR\n")
+			fmt.Fprintf(&buf, "go.sum database record does not match lookup!\n\n")
+			fmt.Fprintf(&buf, "lookup %s@%s returned record %d:\n", path, modVers, id)
+			fmt.Fprintf(&buf, "\t%s\n", bytes.ReplaceAll(bytes.TrimSuffix(text, []byte("\n")), []byte("\n"), []byte("\n\t")))
+			fmt.Fprintf(&buf, "%v\n", err)
+			c.ops.SecurityError(buf.String())
+			return cached{nil, ErrSecurity}
+		}
 
 		// Now that we've validated the record,
 		// save it to the on-disk cache (unless that's where it came from).
@@ -311,7 +292,7 @@ func (c *Client) Lookup(path, vers string) (lines []string, err error) {
 			c.ops.WriteCache(file, data)
 		}
 
-		return cached{data, nil}
+		return cached{text, nil}
 	}).(cached)
 	if result.err != nil {
 		return nil, result.err
@@ -321,7 +302,7 @@ func (c *Client) Lookup(path, vers string) (lines []string, err error) {
 	// (with or without /go.mod).
 	prefix := path + " " + vers + " "
 	var hashes []string
-	for _, line := range strings.Split(string(result.data), "\n") {
+	for line := range strings.SplitSeq(string(result.data), "\n") {
 		if strings.HasPrefix(line, prefix) {
 			hashes = append(hashes, line)
 		}
@@ -497,7 +478,7 @@ func (c *Client) checkTrees(older tlog.Tree, olderNote []byte, newer tlog.Tree, 
 	// on the continued availability of the misbehaving server.
 	// Preparing this data only reuses the tiled hashes needed for
 	// tlog.TreeHash(older.N, thr) above, so assuming thr is caching tiles,
-	// there are no new access to the server here, and these operations cannot fail.
+	// there are no new accesses to the server here, and these operations cannot fail.
 	fmt.Fprintf(&buf, "proof of misbehavior:\n\t%v", h)
 	if p, err := tlog.ProveTree(newer.N, older.N, thr); err != nil {
 		fmt.Fprintf(&buf, "\tinternal error: %v\n", err)
@@ -529,6 +510,38 @@ func (c *Client) checkRecord(id int64, data []byte) error {
 		return nil
 	}
 	return fmt.Errorf("cannot authenticate record data in server response")
+}
+
+// checkRecordLines checks that every line in the record text
+// for the module version path@vers has the form
+//
+//	<path> <vers>[/<file>] <hash>
+//
+// path and vers are verbatim, not escaped with [module.EscapePath]
+// or [module.EscapeVersion], because that is how they appear in records.
+//
+// Today <file> is only "go.mod", but any file name and any hash format
+// are allowed so that the checksum database can add more lines later.
+// A record must not hold lines for any other module version.
+// Otherwise a server could answer a lookup for one module version
+// with a logged record that was filed under another one.
+func checkRecordLines(path, vers string, text []byte) error {
+	prefix := path + " " + vers
+	for line := range strings.SplitSeq(strings.TrimSuffix(string(text), "\n"), "\n") {
+		rest, ok := strings.CutPrefix(line, prefix)
+		// file is "" for the module hash, or "/<file>" for a file hash.
+		file, hash, _ := strings.Cut(rest, " ")
+		if !ok || !validRecordFile(file) || hash == "" || strings.Contains(hash, " ") {
+			return fmt.Errorf("unexpected line in record for %s@%s: %q", path, vers, line)
+		}
+	}
+	return nil
+}
+
+// validRecordFile reports whether file, the text between the version
+// and the hash in a record line, is empty or a "/" followed by a name.
+func validRecordFile(file string) bool {
+	return file == "" || len(file) > 1 && file[0] == '/'
 }
 
 // tileReader is a *Client wrapper that implements tlog.TileReader.
@@ -589,7 +602,7 @@ func (c *Client) readTile(tile tlog.Tile) ([]byte, error) {
 		err  error
 	}
 
-	result := c.tileCache.Do(tile, func() interface{} {
+	result := c.tileCache.Do(tile, func() any {
 		// Try the requested tile in on-disk cache.
 		data, err := c.ops.ReadCache(c.tileCacheKey(tile))
 		if err == nil {

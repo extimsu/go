@@ -16,9 +16,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"reflect"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -343,6 +343,24 @@ func TestRedirect(t *testing.T) {
 	}
 }
 
+func TestProtocolRelativeRedirect(t *testing.T) {
+	testenv.MustHaveExec(t)
+	h := &Handler{
+		Path: os.Args[0],
+		Root: "/test.cgi",
+		PathLocationHandler: http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+			t.Errorf("PathLocationHandler unexpectedly called")
+		}),
+	}
+	rec := runCgiTest(t, h, "GET /test.cgi?loc=//foo.com/ HTTP/1.0\nHost: example.com\n\n", nil)
+	if e, g := 302, rec.Code; e != g {
+		t.Errorf("expected status code %d; got %d", e, g)
+	}
+	if e, g := "//foo.com/", rec.Header().Get("Location"); e != g {
+		t.Errorf("expected Location header of %q; got %q", e, g)
+	}
+}
+
 func TestInternalRedirect(t *testing.T) {
 	testenv.MustHaveExec(t)
 	baseHandler := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
@@ -385,12 +403,11 @@ func TestCopyError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-
 	res, err := http.ReadResponse(bufio.NewReader(conn), req)
 	if err != nil {
 		t.Fatalf("ReadResponse: %v", err)
 	}
-
+	defer res.Body.Close()
 	var buf [5000]byte
 	n, err := io.ReadFull(res.Body, buf[:])
 	if err != nil {
@@ -511,7 +528,7 @@ func TestRemoveLeadingDuplicates(t *testing.T) {
 	}
 	for _, tt := range tests {
 		got := removeLeadingDuplicates(tt.env)
-		if !reflect.DeepEqual(got, tt.want) {
+		if !slices.Equal(got, tt.want) {
 			t.Errorf("removeLeadingDuplicates(%q) = %q; want %q", tt.env, got, tt.want)
 		}
 	}

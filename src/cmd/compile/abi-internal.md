@@ -643,8 +643,6 @@ Registers R20 - R21, R23 – R28, R30 - R31, F16 – F31 are permanent scratch r
 
 Register R2 is reserved and never used.
 
-Register R20, R21 is Used by runtime.duffcopy, runtime.duffzero.
-
 Special-purpose registers used within Go generated code and Go assembly code
 are as follows:
 
@@ -653,7 +651,6 @@ are as follows:
 | R0 | Zero value | Same | Same |
 | R1 | Link register | Link register | Scratch |
 | R3 | Stack pointer | Same | Same |
-| R20,R21 | Scratch | Scratch | Used by duffcopy, duffzero |
 | R22 | Current goroutine | Same | Same |
 | R29 | Closure context pointer | Same | Same |
 | R30, R31 | used by the assembler | Same | Same |
@@ -738,6 +735,14 @@ implementation of reflection so that float32 arguments are passed correctly.
 
 Registers R18 - R29 and F13 - F31 are considered scratch registers.
 
+The floating-point registers F0 - F31 alias the lower VSX registers VS0 - VS31,
+and the vector registers V0 - V31 (the VMX/Altivec registers) alias the upper VSX
+registers VS32 - VS63. Together they form the 64-entry VSX register file used for
+SIMD operations. Currently ppc64 doesn't yet expose SIMD types (so vector args
+don't arise today). This is future work and when they do they'll follow the FP-arg
+convention (F1–F12 = low VSX bank VS1–VS12). None of V0 - V31 are preserved across
+a call; like F0 - F31 they are all caller-saved.
+
 #### Stack layout
 
 The stack pointer, R1, grows down and is aligned to 8 bytes in Go, but changed
@@ -799,17 +804,15 @@ assembly code are as follows:
 | X2  | Stack pointer | Same | Same |
 | X3  | Global pointer | Same | Used by dynamic linker |
 | X4  | TLS (thread pointer) | TLS | Scratch |
-| X24,X25 | Scratch | Scratch | Used by duffcopy, duffzero |
 | X26 | Closure context pointer | Scratch | Scratch |
 | X27 | Current goroutine | Same | Same |
 | X31 | Scratch | Scratch | Scratch |
 
 *Rationale*: These register meanings are compatible with Go’s
-stack-based calling convention. Context register X20 will change to X26,
-duffcopy, duffzero register will change to X24, X25 before this register ABI been adopted.
+stack-based calling convention.
 X10 – X17, X8, X9, X18 – X23, is the same order as A0 – A7, S0 – S7 in platform ABI.
 F10 – F17, F8, F9, F18 – F23, is the same order as FA0 – FA7, FS0 – FS7 in platform ABI.
-X8 – X23, F8 – F15 are used for compressed instruction (RVC) which will benefit code size in the future.
+X8 – X23, F8 – F15 are used for compressed instruction (RVC) which benefits code size.
 
 #### Stack layout
 
@@ -832,6 +835,67 @@ riscv64 `CALL` operation.
 The riscv64 has Zicsr extension for control and status register (CSR) and
 treated as scratch register.
 All bits in CSR are system flags and are not modified by Go.
+
+### s390x architecture
+
+The s390x architecture uses R2 – R9 for integer arguments and integer results.
+
+It uses F0 – F15 for floating-point arguments and results.
+
+Special-purpose registers used within Go generated code and Go assembly code
+are as follows:
+
+| Register | Call meaning | Return meaning | Body meaning |
+| --- | --- | --- | --- |
+| R0 | Zero value | Same | Same |
+| R1 | Scratch | Scratch | Scratch |
+| R10, R11 | used by the assembler | Same | Same |
+| R12 | Closure context pointer | Same | Same |
+| R13 | Current goroutine | Same | Same |
+| R14 | Link register | Link register | Scratch |
+| R15 | Stack pointer | Same | Same |
+
+*Rationale*: These register meanings are compatible with Go’s stack-based
+calling convention.
+
+#### Stack layout
+
+The stack pointer, R15, grows down and is aligned to 8 bytes.
+
+A function's stack frame, after the frame is created, is laid out as
+follows:
+
+    +------------------------------+
+    | ... locals ...               |
+    | ... outgoing arguments ...   |
+    | return PC                    | ← R15 points to
+    +------------------------------+ ↓ lower addresses
+
+This stack layout is used by both register-based (ABIInternal) and
+stack-based (ABI0) calling conventions.
+
+The "return PC" is loaded to the link register R14, as part of the
+s390x `BL` operation.
+
+#### Flags
+The s390x architecture maintains a single condition code (CC) field in the Program Status Word (PSW).
+Go-generated code sets and tests this condition code to control conditional branches.
+
+### wasm32 architecture
+
+The wasm32 architecture has 32-bit pointers and `int` values. It uses
+the WebAssembly backend with 64-bit integer locals. Its register size,
+stack alignment, and `int64` alignment are 8 bytes. Arguments and
+results are passed on the stack. The result sequence starts at a
+pointer-aligned offset, as specified by the general assignment algorithm.
+
+WebAssembly has no native program counter or link register. A wasm32
+function value stores a non-zero `call_indirect` table index in its
+code word. The runtime identifies resume points with 32-bit logical
+PCs. An 8-byte return-PC slot stores the logical PC in its low word
+and the function handle in its high word. The runtime uses both words
+to resume a suspended function. Keeping the handle separate avoids
+reserving a fixed high-address region for PCs.
 
 ## Future directions
 

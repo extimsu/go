@@ -8,16 +8,16 @@ import (
 	"flag"
 	"fmt"
 	"go/build"
+	"internal/goexperiment"
 	"internal/testenv"
 	"os"
 	"path/filepath"
-	"sort"
+	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 )
-
-var flagCheck = flag.Bool("check", false, "run API checks")
 
 func TestMain(m *testing.M) {
 	flag.Parse()
@@ -34,11 +34,6 @@ var (
 )
 
 func TestGolden(t *testing.T) {
-	if *flagCheck {
-		// slow, not worth repeating in -check
-		t.Skip("skipping with -check set")
-	}
-
 	testenv.MustHaveGoBuild(t)
 
 	td, err := os.Open("testdata/src/pkg")
@@ -57,7 +52,10 @@ func TestGolden(t *testing.T) {
 		// TODO(gri) remove extra pkg directory eventually
 		goldenFile := filepath.Join("testdata", "src", "pkg", fi.Name(), "golden.txt")
 		w := NewWalker(nil, "testdata/src/pkg")
-		pkg, _ := w.import_(fi.Name())
+		pkg, err := w.import_(fi.Name())
+		if err != nil {
+			t.Fatalf("import %s: %v", fi.Name(), err)
+		}
 		w.export(pkg)
 
 		if *updateGolden {
@@ -77,7 +75,7 @@ func TestGolden(t *testing.T) {
 			t.Fatalf("opening golden.txt for package %q: %v", fi.Name(), err)
 		}
 		wanted := strings.Split(string(bs), "\n")
-		sort.Strings(wanted)
+		slices.Sort(wanted)
 		for _, feature := range wanted {
 			if feature == "" {
 				continue
@@ -201,7 +199,13 @@ func BenchmarkAll(b *testing.B) {
 		for _, context := range contexts {
 			w := NewWalker(context, filepath.Join(testenv.GOROOT(b), "src"))
 			for _, name := range w.stdPackages {
-				pkg, _ := w.import_(name)
+				pkg, err := w.import_(name)
+				if _, nogo := err.(*build.NoGoError); nogo {
+					continue
+				}
+				if err != nil {
+					b.Fatalf("import %s (%s-%s): %v", name, context.GOOS, context.GOARCH, err)
+				}
 				w.export(pkg)
 			}
 			w.Features()
@@ -213,7 +217,6 @@ var warmupCache = sync.OnceFunc(func() {
 	// Warm up the import cache in parallel.
 	var wg sync.WaitGroup
 	for _, context := range contexts {
-		context := context
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -227,10 +230,6 @@ func TestIssue21181(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping with -short")
 	}
-	if *flagCheck {
-		// slow, not worth repeating in -check
-		t.Skip("skipping with -check set")
-	}
 	testenv.MustHaveGoBuild(t)
 
 	warmupCache()
@@ -239,8 +238,7 @@ func TestIssue21181(t *testing.T) {
 		w := NewWalker(context, "testdata/src/issue21181")
 		pkg, err := w.import_("p")
 		if err != nil {
-			t.Fatalf("%s: (%s-%s) %s %v", err, context.GOOS, context.GOARCH,
-				pkg.Name(), w.imported)
+			t.Fatalf("import %s (%s-%s): %v", "p", context.GOOS, context.GOARCH, err)
 		}
 		w.export(pkg)
 	}
@@ -249,10 +247,6 @@ func TestIssue21181(t *testing.T) {
 func TestIssue29837(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping with -short")
-	}
-	if *flagCheck {
-		// slow, not worth repeating in -check
-		t.Skip("skipping with -check set")
 	}
 	testenv.MustHaveGoBuild(t)
 
@@ -268,10 +262,6 @@ func TestIssue29837(t *testing.T) {
 }
 
 func TestIssue41358(t *testing.T) {
-	if *flagCheck {
-		// slow, not worth repeating in -check
-		t.Skip("skipping with -check set")
-	}
 	testenv.MustHaveGoBuild(t)
 	context := new(build.Context)
 	*context = build.Default
@@ -286,14 +276,16 @@ func TestIssue41358(t *testing.T) {
 }
 
 func TestIssue64958(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping with -short")
+	}
+	testenv.MustHaveGoBuild(t)
+
 	defer func() {
 		if x := recover(); x != nil {
 			t.Errorf("expected no panic; recovered %v", x)
 		}
 	}()
-
-	testenv.MustHaveGoBuild(t)
-
 	for _, context := range contexts {
 		w := NewWalker(context, "testdata/src/issue64958")
 		pkg, err := w.importFrom("p", "", 0)
@@ -305,9 +297,91 @@ func TestIssue64958(t *testing.T) {
 }
 
 func TestCheck(t *testing.T) {
-	if !*flagCheck {
-		t.Skip("-check not specified")
+	// On the builders we really only need to run this on one platform because it
+	// tests all platforms, so (arbitrarily) only run it on linux/amd64.
+	//
+	// TODO: remove the exclusion of goexperiment simd right before dev.simd branch is merged to master.
+	if goexperiment.SIMD {
+		t.Skip("skipping on SIMD")
+	}
+	if os.Getenv("GO_BUILDER_NAME") != "" && (runtime.GOOS != "linux" || runtime.GOARCH != "amd64") {
+		t.Skip("skipping on non-linux/amd64 builder")
 	}
 	testenv.MustHaveGoBuild(t)
 	Check(t)
+}
+
+func TestQualifyFeature(t *testing.T) {
+	ctxts := []*build.Context{
+		{GOOS: "linux", GOARCH: "amd64", CgoEnabled: true},
+		{GOOS: "linux", GOARCH: "amd64"},
+		{GOOS: "windows", GOARCH: "amd64"},
+		{GOOS: "darwin", GOARCH: "arm64"},
+		{GOOS: "linux", GOARCH: "arm64"},
+		{GOOS: "js", GOARCH: "wasm"},
+	}
+	const f = "pkg p, func F()"
+	for _, test := range []struct {
+		name     string
+		present  []string
+		byGOARCH bool
+		want     []string
+	}{
+		{
+			name:     "all contexts",
+			present:  []string{"linux-amd64-cgo", "linux-amd64", "windows-amd64", "darwin-arm64", "linux-arm64", "js-wasm"},
+			byGOARCH: true,
+			want:     []string{"pkg p, func F()"},
+		},
+		{
+			name:     "whole GOARCH",
+			present:  []string{"linux-amd64-cgo", "linux-amd64", "windows-amd64"},
+			byGOARCH: true,
+			want:     []string{"pkg p (GOARCH=amd64), func F()"},
+		},
+		{
+			name:     "whole GOARCHes",
+			present:  []string{"darwin-arm64", "linux-arm64", "js-wasm"},
+			byGOARCH: true,
+			want:     []string{"pkg p (GOARCH=arm64), func F()", "pkg p (GOARCH=wasm), func F()"},
+		},
+		{
+			name:     "partial GOARCH",
+			present:  []string{"linux-amd64-cgo", "linux-amd64", "linux-arm64"},
+			byGOARCH: true,
+			want:     []string{"pkg p (linux-amd64-cgo), func F()", "pkg p (linux-amd64), func F()", "pkg p (linux-arm64), func F()"},
+		},
+		{
+			name:     "whole and partial GOARCH",
+			present:  []string{"linux-amd64-cgo", "linux-amd64", "windows-amd64", "darwin-arm64"},
+			byGOARCH: true,
+			want:     []string{"pkg p (GOARCH=amd64), func F()", "pkg p (darwin-arm64), func F()"},
+		},
+		{
+			name:    "not by GOARCH",
+			present: []string{"linux-amd64-cgo", "linux-amd64", "windows-amd64"},
+			want:    []string{"pkg p (linux-amd64-cgo), func F()", "pkg p (linux-amd64), func F()", "pkg p (windows-amd64), func F()"},
+		},
+		{
+			name:    "not by GOARCH, all contexts",
+			present: []string{"linux-amd64-cgo", "linux-amd64", "windows-amd64", "darwin-arm64", "linux-arm64", "js-wasm"},
+			want:    []string{"pkg p, func F()"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			present := make(map[string]bool)
+			for _, name := range test.present {
+				present[name] = true
+			}
+			got := qualifyFeature(f, present, ctxts, test.byGOARCH)
+			if !slices.Equal(got, test.want) {
+				t.Errorf("got %q, want %q", got, test.want)
+			}
+			for _, line := range got {
+				if featureWithoutContext(line) != f {
+					t.Errorf("featureWithoutContext(%q) = %q, want %q", line, featureWithoutContext(line), f)
+				}
+			}
+		})
+	}
 }

@@ -92,6 +92,43 @@ func TestEncoderBuffering(t *testing.T) {
 	}
 }
 
+func TestDecoderBufferingWithPadding(t *testing.T) {
+	for bs := 0; bs <= 12; bs++ {
+		for _, s := range pairs {
+			decoder := NewDecoder(StdEncoding, strings.NewReader(s.encoded))
+			buf := make([]byte, len(s.decoded)+bs)
+
+			var n int
+			var err error
+			n, err = decoder.Read(buf)
+
+			if err != nil && err != io.EOF {
+				t.Errorf("Read from %q at pos %d = %d, unexpected error %v", s.encoded, len(s.decoded), n, err)
+			}
+			testEqual(t, "Decoding/%d of %q = %q, want %q\n", bs, s.encoded, string(buf[:n]), s.decoded)
+		}
+	}
+}
+
+func TestDecoderBufferingWithoutPadding(t *testing.T) {
+	for bs := 0; bs <= 12; bs++ {
+		for _, s := range pairs {
+			encoded := strings.TrimRight(s.encoded, "=")
+			decoder := NewDecoder(StdEncoding.WithPadding(NoPadding), strings.NewReader(encoded))
+			buf := make([]byte, len(s.decoded)+bs)
+
+			var n int
+			var err error
+			n, err = decoder.Read(buf)
+
+			if err != nil && err != io.EOF {
+				t.Errorf("Read from %q at pos %d = %d, unexpected error %v", encoded, len(s.decoded), n, err)
+			}
+			testEqual(t, "Decoding/%d of %q = %q, want %q\n", bs, encoded, string(buf[:n]), s.decoded)
+		}
+	}
+}
+
 func TestDecode(t *testing.T) {
 	for _, p := range pairs {
 		dbuf := make([]byte, StdEncoding.DecodedLen(len(p.encoded)))
@@ -356,6 +393,20 @@ func TestDecodeCorrupt(t *testing.T) {
 	}
 }
 
+// TestDecodeCorruptOffset puts a bad byte at each position of a long input.
+func TestDecodeCorruptOffset(t *testing.T) {
+	valid := strings.Repeat("MZXW6YTB", 5)
+	for i := range len(valid) {
+		input := []byte(valid)
+		input[i] = '!'
+		dbuf := make([]byte, StdEncoding.DecodedLen(len(input)))
+		n, err := StdEncoding.Decode(dbuf, input)
+		if n != i/8*5 || err != CorruptInputError(i) {
+			t.Errorf("Decode(%q) = %d, %v; want %d, %v", input, n, err, i/8*5, CorruptInputError(i))
+		}
+	}
+}
+
 func TestBig(t *testing.T) {
 	n := 3*1000 + 1
 	raw := make([]byte, n)
@@ -423,6 +474,15 @@ func TestNewLineCharacters(t *testing.T) {
 		"MZXW6YTBOI=\r\n=====",
 	}
 	testStringEncoding(t, "foobar", examples)
+
+	// A newline at any position of a longer input should be ignored.
+	examples = nil
+	for i := range len(bigtest.encoded) + 1 {
+		for _, nl := range []string{"\r", "\n", "\r\n"} {
+			examples = append(examples, bigtest.encoded[:i]+nl+bigtest.encoded[i:])
+		}
+	}
+	testStringEncoding(t, bigtest.decoded, examples)
 }
 
 func TestDecoderIssue4779(t *testing.T) {
@@ -475,19 +535,27 @@ func BenchmarkEncodeToString(b *testing.B) {
 }
 
 func BenchmarkDecode(b *testing.B) {
-	data := make([]byte, StdEncoding.EncodedLen(8192))
-	StdEncoding.Encode(data, make([]byte, 8192))
-	buf := make([]byte, 8192)
-	b.SetBytes(int64(len(data)))
-	for i := 0; i < b.N; i++ {
-		StdEncoding.Decode(buf, data)
+	for _, size := range []int{8, 16, 64, 256, 1024, 4096, 16384} {
+		data := StdEncoding.AppendEncode(nil, bytes.Repeat([]byte{2, 3, 5, 7, 9, 11, 13, 17}, size/8))
+		buf := make([]byte, size)
+		b.Run(strconv.Itoa(size), func(b *testing.B) {
+			b.SetBytes(int64(len(data)))
+			for b.Loop() {
+				StdEncoding.Decode(buf, data)
+			}
+		})
 	}
 }
+
 func BenchmarkDecodeString(b *testing.B) {
-	data := StdEncoding.EncodeToString(make([]byte, 8192))
-	b.SetBytes(int64(len(data)))
-	for i := 0; i < b.N; i++ {
-		StdEncoding.DecodeString(data)
+	for _, size := range []int{8, 16, 64, 256, 1024, 4096, 16384} {
+		data := StdEncoding.EncodeToString(bytes.Repeat([]byte{2, 3, 5, 7, 9, 11, 13, 17}, size/8))
+		b.Run(strconv.Itoa(size), func(b *testing.B) {
+			b.SetBytes(int64(len(data)))
+			for b.Loop() {
+				StdEncoding.DecodeString(data)
+			}
+		})
 	}
 }
 
@@ -672,7 +740,6 @@ func TestBufferedDecodingPadding(t *testing.T) {
 	}
 
 	for _, testcase := range testcases {
-		testcase := testcase
 		pr, pw := io.Pipe()
 		go func() {
 			for _, chunk := range testcase.chunks {
@@ -729,10 +796,30 @@ func TestEncodedLen(t *testing.T) {
 		tests = append(tests, test{rawStdEncoding, (math.MaxInt-4)/8 + 1, 1844674407370955162})
 		tests = append(tests, test{rawStdEncoding, math.MaxInt/8*5 + 4, math.MaxInt})
 	}
+	tests = append(tests, test{StdEncoding, math.MaxInt / 8 * 5, math.MaxInt - 7})
 	for _, tt := range tests {
 		if got := tt.enc.EncodedLen(tt.n); int64(got) != tt.want {
 			t.Errorf("EncodedLen(%d): got %d, want %d", tt.n, got, tt.want)
 		}
+	}
+}
+
+func TestEncodedLenOverflow(t *testing.T) {
+	for _, tt := range []struct {
+		enc *Encoding
+		n   int
+	}{
+		{StdEncoding, math.MaxInt/8*5 + 1},
+		{StdEncoding.WithPadding(NoPadding), math.MaxInt/8*5 + 5},
+	} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("EncodedLen(%d) did not panic", tt.n)
+				}
+			}()
+			tt.enc.EncodedLen(tt.n)
+		}()
 	}
 }
 

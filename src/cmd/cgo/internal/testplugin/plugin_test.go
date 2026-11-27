@@ -7,9 +7,9 @@ package plugin_test
 import (
 	"bytes"
 	"cmd/cgo/internal/cgotest"
-	"context"
 	"flag"
 	"fmt"
+	"internal/buildcfg"
 	"internal/platform"
 	"internal/testenv"
 	"log"
@@ -19,7 +19,6 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 )
 
 var globalSkip = func(t *testing.T) {}
@@ -37,7 +36,7 @@ func TestMain(m *testing.M) {
 var tmpDir string
 
 // prettyPrintf prints lines with tmpDir sanitized.
-func prettyPrintf(format string, args ...interface{}) {
+func prettyPrintf(format string, args ...any) {
 	s := fmt.Sprintf(format, args...)
 	if tmpDir != "" {
 		s = strings.ReplaceAll(s, tmpDir, "$TMPDIR")
@@ -46,7 +45,7 @@ func prettyPrintf(format string, args ...interface{}) {
 }
 
 func testMain(m *testing.M) int {
-	if testing.Short() && os.Getenv("GO_BUILDER_NAME") == "" {
+	if testing.Short() && testenv.Builder() == "" {
 		globalSkip = func(t *testing.T) { t.Skip("short mode and $GO_BUILDER_NAME not set") }
 		return m.Run()
 	}
@@ -74,6 +73,7 @@ func testMain(m *testing.M) int {
 	}
 	defer os.RemoveAll(GOPATH)
 	tmpDir = GOPATH
+	fmt.Printf("TMPDIR=%s\n", tmpDir)
 
 	modRoot := filepath.Join(GOPATH, "src", "testplugin")
 	altRoot := filepath.Join(GOPATH, "alt", "src", "testplugin")
@@ -144,8 +144,8 @@ func goCmd(t *testing.T, op string, args ...string) string {
 
 // escape converts a string to something suitable for a shell command line.
 func escape(s string) string {
-	s = strings.Replace(s, "\\", "\\\\", -1)
-	s = strings.Replace(s, "'", "\\'", -1)
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "'", "\\'")
 	// Conservative guess at characters that will force quoting
 	if s == "" || strings.ContainsAny(s, "\\ ;#*&$~?!|[]()<>{}`") {
 		s = "'" + s + "'"
@@ -193,10 +193,10 @@ func run(t *testing.T, bin string, args ...string) string {
 	out, err := cmd.Output()
 	if err != nil {
 		if t == nil {
-			log.Panicf("%s: %v\n%s", strings.Join(cmd.Args, " "), err, cmd.Stderr)
+			log.Panicf("%#q: %v\n%s", cmd, err, cmd.Stderr)
 		} else {
 			t.Helper()
-			t.Fatalf("%s: %v\n%s", strings.Join(cmd.Args, " "), err, cmd.Stderr)
+			t.Fatalf("%#q: %v\n%s", cmd, err, cmd.Stderr)
 		}
 	}
 
@@ -234,17 +234,15 @@ func TestUniqueTypesAndItabs(t *testing.T) {
 
 func TestIssue18676(t *testing.T) {
 	// make sure we don't add the same itab twice.
-	// The buggy code hangs forever, so use a timeout to check for that.
+	// The buggy code hangs forever, so time out based on a test deadline via testenv.Command.
 	globalSkip(t)
 	goCmd(t, "build", "-buildmode=plugin", "-o", "plugin.so", "./issue18676/plugin.go")
 	goCmd(t, "build", "-o", "issue18676.exe", "./issue18676/main.go")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "./issue18676.exe")
+	cmd := testenv.Command(t, "./issue18676.exe")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("%s: %v\n%s", strings.Join(cmd.Args, " "), err, out)
+		t.Fatalf("%#q: %v\n%s", cmd, err, out)
 	}
 }
 
@@ -394,4 +392,65 @@ func TestIssue62430(t *testing.T) {
 	goCmd(t, "build", "-buildmode=plugin", "-o", "issue62430.so", "./issue62430/plugin.go")
 	goCmd(t, "build", "-o", "issue62430.exe", "./issue62430/main.go")
 	run(t, "./issue62430.exe")
+}
+
+func TestTextSectionSplit(t *testing.T) {
+	globalSkip(t)
+	if runtime.GOOS != "darwin" || runtime.GOARCH != "arm64" {
+		t.Skipf("text section splitting is not done in %s/%s", runtime.GOOS, runtime.GOARCH)
+	}
+
+	// Use -ldflags=-debugtextsize=262144 to let the linker split text section
+	// at a smaller size threshold, so it actually splits for the test binary.
+	goCmd(nil, "build", "-ldflags=-debugtextsize=262144", "-o", "host-split.exe", "./host")
+	run(t, "./host-split.exe")
+
+	// Check that we did split text sections.
+	syms := goCmd(nil, "tool", "nm", "host-split.exe")
+	if !strings.Contains(syms, "runtime.text.1") {
+		t.Errorf("runtime.text.1 not found, text section not split?")
+	}
+}
+
+func TestIssue67976(t *testing.T) {
+	// Issue 67976: build failure with loading a dynimport variable (the runtime/pprof
+	// package does this on darwin) in a plugin on darwin/amd64.
+	// The test program uses runtime/pprof in a plugin.
+	globalSkip(t)
+	goCmd(t, "build", "-buildmode=plugin", "-o", "issue67976.so", "./issue67976/plugin.go")
+}
+
+func TestIssue75102(t *testing.T) {
+	globalSkip(t)
+	// add gcflags different from the executable file to trigger plugin open failed.
+	goCmd(t, "build", "-gcflags=all=-N -l", "-buildmode=plugin", "-o", "issue75102.so", "./issue75102/plugin.go")
+	goCmd(t, "build", "-o", "issue75102.exe", "./issue75102/main.go")
+	run(t, "./issue75102.exe")
+}
+
+func TestIssue81303(t *testing.T) {
+	// Issue 81303: the itab copies of a plugin must not hide the itabs
+	// of the host for the same interface/type pairs.
+	globalSkip(t)
+	goCmd(t, "build", "-buildmode=plugin", "-o", "issue81303p1.so", "./issue81303/plugin1.go")
+	goCmd(t, "build", "-buildmode=plugin", "-o", "issue81303p2.so", "./issue81303/plugin2.go")
+	goCmd(t, "build", "-buildmode=plugin", "-o", "issue81303p3.so", "./issue81303/plugin3.go")
+	goCmd(t, "build", "-o", "issue81303.exe", "./issue81303/main.go")
+	run(t, "./issue81303.exe")
+}
+
+func TestSIMD(t *testing.T) {
+	// A plugin that uses package simd must load, and the host must be
+	// able to call its exported functions. The compiler makes a copy of
+	// each function that uses simd for each vector size, and the plugin
+	// must not try to export those copies. It doesn't compile the
+	// original of a function or variable that has a SIMD type, so the
+	// plugin must not try to export those either.
+	globalSkip(t)
+	if !buildcfg.Experiment.SIMDStable {
+		t.Skip("requires GOEXPERIMENT=simdstable")
+	}
+	goCmd(t, "build", "-buildmode=plugin", "-o", "simd.so", "./simd/plugin.go")
+	goCmd(t, "build", "-o", "simd.exe", "./simd/main.go")
+	run(t, "./simd.exe")
 }

@@ -14,32 +14,32 @@
 //
 // Experiments are exposed to the build in the following ways:
 //
-// - Build tag goexperiment.x is set if experiment x (lower case) is
-// enabled.
+//   - Build tag goexperiment.x is set if experiment x (lower case) is
+//     enabled.
 //
-// - For each experiment x (in camel case), this package contains a
-// boolean constant x and an integer constant xInt.
+//   - For each experiment x (in camel case), this package contains a
+//     boolean constant x and an integer constant xInt.
 //
-// - In runtime assembly, the macro GOEXPERIMENT_x is defined if
-// experiment x (lower case) is enabled.
+//   - In runtime assembly, the macro GOEXPERIMENT_x is defined if
+//     experiment x (lower case) is enabled.
 //
 // In the toolchain, the set of experiments enabled for the current
 // build should be accessed via objabi.Experiment.
 //
-// The set of experiments is included in the output of runtime.Version()
+// The set of experiments is included in the output of [runtime.Version]()
 // and "go version <binary>" if it differs from the default experiments.
 //
 // For the set of experiments supported by the current toolchain, see
 // "go doc goexperiment.Flags".
 //
-// Note that this package defines the set of experiments (in Flags)
+// Note that this package defines the set of experiments (in [Flags])
 // and records the experiments that were enabled when the package
 // was compiled (as boolean and integer constants).
 //
 // Note especially that this package does not itself change behavior
 // at run time based on the GOEXPERIMENT variable.
 // The code used in builds to interpret the GOEXPERIMENT variable
-// is in the separate package internal/buildcfg.
+// is in the separate package [internal/buildcfg].
 package goexperiment
 
 //go:generate go run mkconsts.go
@@ -51,7 +51,7 @@ package goexperiment
 // tags, experiments use the strings.ToLower of their field name.
 //
 // For the baseline experimental configuration, see
-// objabi.experimentBaseline.
+// [internal/buildcfg.Experiment].
 //
 // If you change this struct definition, run "go generate".
 type Flags struct {
@@ -83,19 +83,9 @@ type Flags struct {
 	// by default.
 	HeapMinimum512KiB bool
 
-	// CoverageRedesign enables the new compiler-based code coverage
-	// tooling.
-	CoverageRedesign bool
-
 	// Arenas causes the "arena" standard library package to be visible
 	// to the outside world.
 	Arenas bool
-
-	// PageTrace enables GODEBUG=pagetrace=/path/to/result. This feature
-	// is a GOEXPERIMENT due to a security risk with setuid binaries:
-	// this compels the Go runtime to write to some arbitrary file, which
-	// may be exploited.
-	PageTrace bool
 
 	// CgoCheck2 enables an expensive cgo rule checker.
 	// When this experiment is enabled, cgo rule checks occur regardless
@@ -106,25 +96,61 @@ type Flags struct {
 	// copy of the iteration variable.
 	LoopVar bool
 
-	// CacheProg adds support to cmd/go to use a child process to implement
-	// the build cache; see https://github.com/golang/go/issues/59719.
-	CacheProg bool
-
 	// NewInliner enables a new+improved version of the function
 	// inlining phase within the Go compiler.
 	NewInliner bool
 
-	// RangeFunc enables range over func.
-	RangeFunc bool
+	// Dwarf5 enables DWARF version 5 debug info generation.
+	Dwarf5 bool
 
-	// Range enables range over int and func.
-	Range bool
+	// JSONv2 enables the json/v2 package.
+	JSONv2 bool
 
-	// AllocHeaders enables a different, more efficient way for the GC to
-	// manage heap metadata.
-	AllocHeaders bool
+	// GreenTeaGC enables the Green Tea GC implementation.
+	GreenTeaGC bool
 
-	// ExecTracer2 controls whether to use the new execution trace
-	// implementation.
-	ExecTracer2 bool
+	// RandomizedHeapBase enables heap base address randomization on 64-bit
+	// platforms.
+	RandomizedHeapBase64 bool
+
+	// RuntimeFreegc enables the runtime to free and reuse memory more eagerly in some circumstances with compiler help.
+	RuntimeFreegc bool
+
+	// SIMD enables the simd package and the compiler's handling
+	// of SIMD intrinsics. This includes APIs that are not yet
+	// slated for general availability. SIMD implies SIMDStable.
+	SIMD bool
+
+	// SIMDStable enables the subset of the simd and simd/archsimd
+	// packages that is covered by the Go 1 compatibility promise,
+	// and the compiler support for it. It is enabled by default;
+	// GOEXPERIMENT=nosimdstable disables it.
+	SIMDStable bool
+
+	// RuntimeSecret enables the runtime/secret package.
+	RuntimeSecret bool
+
+	// MapSplitGroup changes the internal representation of map groups
+	// from interleaved key/elem slots (KVKVKVKV) to split key and elem
+	// arrays (KKKKVVVV).
+	MapSplitGroup bool
+
+	// GoListExportNewFormat enables the new format for go list -export.
+	GoListExportNewFormat bool
+
+	// CgoBindings enables specifying cgo bindings using the go types they bind to.
+	// Requires RuntimeCgoPurego
+	CgoBindings bool
+
+	// VetFiles causes go test to execute, in addition to the
+	// usual cmd/vet suite, analyzers defined by go.vet files in
+	// the workspace; see https://go.dev/issue/82464.
+	VetFiles bool
+
+	// RuntimeCgoPurego enables the pure Go and assembly implementation of runtime/cgo.
+	RuntimeCgoPurego bool
+
+	// TrimBuildCache enables automatic sized-based trimming of the cmd/go build cache.
+	// See https://go.dev/issue/29561.
+	TrimBuildCache bool
 }

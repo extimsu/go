@@ -486,6 +486,14 @@ func (a *Archive) AddEntry(typ EntryType, name string, mtime int64, uid, gid int
 // then pads the result with spaces to be exactly 16 bytes.
 // Fmt uses runes for its width calculation, but we need bytes in the entry header.
 func exactly16Bytes(s string) string {
+	if len(s) > 16 && strings.HasSuffix(s, ".syso") {
+		s = s[:len(s)-len(".syso")]
+		for len(s) > 16-len(".syso") {
+			_, wid := utf8.DecodeLastRuneInString(s)
+			s = s[:len(s)-wid]
+		}
+		s += ".syso"
+	}
 	for len(s) > 16 {
 		_, wid := utf8.DecodeLastRuneInString(s)
 		s = s[:len(s)-wid]
@@ -497,20 +505,6 @@ func exactly16Bytes(s string) string {
 
 // architecture-independent object file output
 const HeaderSize = 60
-
-func ReadHeader(b *bufio.Reader, name string) int {
-	var buf [HeaderSize]byte
-	if _, err := io.ReadFull(b, buf[:]); err != nil {
-		return -1
-	}
-	aname := strings.Trim(string(buf[0:16]), " ")
-	if !strings.HasPrefix(aname, name) {
-		return -1
-	}
-	asize := strings.Trim(string(buf[48:58]), " ")
-	i, _ := strconv.Atoi(asize)
-	return i
-}
 
 func FormatHeader(arhdr []byte, name string, size int64) {
 	copy(arhdr[:], fmt.Sprintf("%-16s%-12d%-6d%-6d%-8o%-10d`\n", name, 0, 0, 0, 0644, size))

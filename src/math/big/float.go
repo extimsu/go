@@ -48,10 +48,10 @@ const debugFloat = false // enable for debugging
 //
 // By setting the desired precision to 24 or 53 and using matching rounding
 // mode (typically [ToNearestEven]), Float operations produce the same results
-// as the corresponding float32 or float64 IEEE-754 arithmetic for operands
+// as the corresponding float32 or float64 IEEE 754 arithmetic for operands
 // that correspond to normal (i.e., not denormal) float32 or float64 numbers.
 // Exponent underflow and overflow lead to a 0 or an Infinity for different
-// values than IEEE-754 because Float exponents have a much larger range.
+// values than IEEE 754 because Float exponents have a much larger range.
 //
 // The zero (uninitialized) value for a Float is ready to use and represents
 // the number +0.0 exactly, with precision 0 and rounding mode [ToNearestEven].
@@ -73,10 +73,12 @@ type Float struct {
 }
 
 // An ErrNaN panic is raised by a [Float] operation that would lead to
-// a NaN under IEEE-754 rules. An ErrNaN implements the error interface.
+// a NaN under IEEE 754 rules. An ErrNaN implements the error interface.
 type ErrNaN struct {
 	msg string
 }
+
+var _ error = ErrNaN{}
 
 func (err ErrNaN) Error() string {
 	return err.msg
@@ -232,10 +234,9 @@ func (x *Float) Acc() Accuracy {
 }
 
 // Sign returns:
-//
-//	-1 if x <   0
-//	 0 if x is ±0
-//	+1 if x >   0
+//   - -1 if x < 0;
+//   - 0 if x is ±0;
+//   - +1 if x > 0.
 func (x *Float) Sign() int {
 	if debugFloat {
 		x.validate()
@@ -393,7 +394,7 @@ func (x *Float) validate0() string {
 // have before calling round. z's mantissa must be normalized (with the msb set)
 // or empty.
 //
-// CAUTION: The rounding modes ToNegativeInf, ToPositiveInf are affected by the
+// CAUTION: The rounding modes [ToNegativeInf], [ToPositiveInf] are affected by the
 // sign of z. For correct rounding, the sign of z must be set correctly before
 // calling round.
 func (z *Float) round(sbit uint) {
@@ -489,7 +490,7 @@ func (z *Float) round(sbit uint) {
 				}
 				z.exp++
 				// adjust mantissa: divide by 2 to compensate for exponent adjustment
-				shrVU(z.mant, z.mant, 1)
+				rshVU(z.mant, z.mant, 1)
 				// set msb == carry == 1 from the mantissa overflow above
 				const msb = 1 << (_W - 1)
 				z.mant[n-1] |= msb
@@ -518,7 +519,7 @@ func (z *Float) setBits64(neg bool, x uint64) *Float {
 	// x != 0
 	z.form = finite
 	s := bits.LeadingZeros64(x)
-	z.mant = z.mant.setUint64(x << uint(s))
+	z.mant = z.mant.setUint64(x << s)
 	z.exp = int32(64 - s) // always fits
 	if z.prec < 64 {
 		z.round(0)
@@ -586,9 +587,9 @@ func fnorm(m nat) int64 {
 	}
 	s := nlz(m[len(m)-1])
 	if s > 0 {
-		c := shlVU(m, m, s)
+		c := lshVU(m, m, s)
 		if debugFloat && c != 0 {
-			panic("nlz or shlVU incorrect")
+			panic("nlz or lshVU incorrect")
 		}
 	}
 	return int64(s)
@@ -603,7 +604,7 @@ func (z *Float) SetInt(x *Int) *Float {
 	// are many trailing 0's.
 	bits := uint32(x.BitLen())
 	if z.prec == 0 {
-		z.prec = umax32(bits, 64)
+		z.prec = max(bits, 64)
 	}
 	z.acc = Exact
 	z.neg = x.neg
@@ -629,7 +630,7 @@ func (z *Float) SetRat(x *Rat) *Float {
 	a.SetInt(x.Num())
 	b.SetInt(x.Denom())
 	if z.prec == 0 {
-		z.prec = umax32(a.prec, b.prec)
+		z.prec = max(a.prec, b.prec)
 	}
 	return z.Quo(&a, &b)
 }
@@ -652,13 +653,20 @@ func (z *Float) SetInf(signbit bool) *Float {
 // mode; and z's accuracy reports the result error relative to the
 // exact (not rounded) result.
 func (z *Float) Set(x *Float) *Float {
+	return z.set(x, x.neg)
+}
+
+// set sets z to the (possibly rounded) value of x with sign neg and
+// returns z. The sign is set before rounding so that the rounding mode
+// applies to the result.
+func (z *Float) set(x *Float, neg bool) *Float {
 	if debugFloat {
 		x.validate()
 	}
 	z.acc = Exact
+	z.neg = neg
 	if z != x {
 		z.form = x.form
-		z.neg = x.neg
 		if x.form == finite {
 			z.exp = x.exp
 			z.mant = z.mant.set(x.mant)
@@ -672,9 +680,8 @@ func (z *Float) Set(x *Float) *Float {
 	return z
 }
 
-// Copy sets z to x, with the same precision, rounding mode, and
-// accuracy as x, and returns z. x is not changed even if z and
-// x are the same.
+// Copy sets z to x, with the same precision, rounding mode, and accuracy as x.
+// Copy returns z. If x and z are identical, Copy is a no-op.
 func (z *Float) Copy(x *Float) *Float {
 	if debugFloat {
 		x.validate()
@@ -734,7 +741,7 @@ func msb64(x nat) uint64 {
 }
 
 // Uint64 returns the unsigned integer resulting from truncating x
-// towards zero. If 0 <= x <= math.MaxUint64, the result is [Exact]
+// towards zero. If 0 <= x <= [math.MaxUint64], the result is [Exact]
 // if x is an integer and [Below] otherwise.
 // The result is (0, [Above]) for x < 0, and ([math.MaxUint64], [Below])
 // for x > [math.MaxUint64].
@@ -756,8 +763,8 @@ func (x *Float) Uint64() (uint64, Accuracy) {
 		// 1 <= x < Inf
 		if x.exp <= 64 {
 			// u = trunc(x) fits into a uint64
-			u := msb64(x.mant) >> (64 - uint32(x.exp))
-			if x.MinPrec() <= 64 {
+			u := msb64(x.mant) >> (64 - x.exp)
+			if x.MinPrec() <= uint(x.exp) {
 				return u, Exact
 			}
 			return u, Below // x truncated
@@ -801,7 +808,7 @@ func (x *Float) Int64() (int64, Accuracy) {
 		// 1 <= |x| < +Inf
 		if x.exp <= 63 {
 			// i = trunc(x) fits into an int64 (excluding math.MinInt64)
-			i := int64(msb64(x.mant) >> (64 - uint32(x.exp)))
+			i := int64(msb64(x.mant) >> (64 - x.exp))
 			if x.neg {
 				i = -i
 			}
@@ -858,7 +865,7 @@ func (x *Float) Float32() (float32, Accuracy) {
 		)
 
 		// Float mantissa m is 0.5 <= m < 1.0; compute exponent e for float32 mantissa.
-		e := x.exp - 1 // exponent for normal mantissa m with 1.0 <= m < 2.0
+		e := int64(x.exp) - 1 // exponent for normal mantissa m with 1.0 <= m < 2.0 (use int64 to avoid overflow).
 
 		// Compute precision p for float32 mantissa.
 		// If the exponent is too small, we have a denormal number before
@@ -899,7 +906,7 @@ func (x *Float) Float32() (float32, Accuracy) {
 		var r Float
 		r.prec = uint32(p)
 		r.Set(x)
-		e = r.exp - 1
+		e = int64(r.exp) - 1
 
 		// Rounding may have caused r to overflow to ±Inf
 		// (rounding never causes underflows to 0).
@@ -927,7 +934,7 @@ func (x *Float) Float32() (float32, Accuracy) {
 			// and we have eliminated p <= 0 early, we know p > 0.
 			// bexp == 0 for denormals
 			p = mbits + 1 - emin + int(e)
-			mant = msb32(r.mant) >> uint(fbits-p)
+			mant = msb32(r.mant) >> (fbits - p)
 		} else {
 			// normal number: emin <= e <= emax
 			bexp = uint32(e+bias) << mbits
@@ -978,7 +985,7 @@ func (x *Float) Float64() (float64, Accuracy) {
 		)
 
 		// Float mantissa m is 0.5 <= m < 1.0; compute exponent e for float64 mantissa.
-		e := x.exp - 1 // exponent for normal mantissa m with 1.0 <= m < 2.0
+		e := int64(x.exp) - 1 // exponent for normal mantissa m with 1.0 <= m < 2.0; (use int64 to avoid overflow).
 
 		// Compute precision p for float64 mantissa.
 		// If the exponent is too small, we have a denormal number before
@@ -1019,7 +1026,7 @@ func (x *Float) Float64() (float64, Accuracy) {
 		var r Float
 		r.prec = uint32(p)
 		r.Set(x)
-		e = r.exp - 1
+		e = int64(r.exp) - 1
 
 		// Rounding may have caused r to overflow to ±Inf
 		// (rounding never causes underflows to 0).
@@ -1047,7 +1054,7 @@ func (x *Float) Float64() (float64, Accuracy) {
 			// and we have eliminated p <= 0 early, we know p > 0.
 			// bexp == 0 for denormals
 			p = mbits + 1 - emin + int(e)
-			mant = msb64(r.mant) >> uint(fbits-p)
+			mant = msb64(r.mant) >> (fbits - p)
 		} else {
 			// normal number: emin <= e <= emax
 			bexp = uint64(e+bias) << mbits
@@ -1112,11 +1119,11 @@ func (x *Float) Int(z *Int) (*Int, Accuracy) {
 		z.neg = x.neg
 		switch {
 		case exp > allBits:
-			z.abs = z.abs.shl(x.mant, exp-allBits)
+			z.abs = z.abs.lsh(x.mant, exp-allBits)
 		default:
 			z.abs = z.abs.set(x.mant)
 		case exp < allBits:
-			z.abs = z.abs.shr(x.mant, allBits-exp)
+			z.abs = z.abs.rsh(x.mant, allBits-exp)
 		}
 		return z, acc
 
@@ -1152,7 +1159,7 @@ func (x *Float) Rat(z *Rat) (*Rat, Accuracy) {
 		z.a.neg = x.neg
 		switch {
 		case x.exp > allBits:
-			z.a.abs = z.a.abs.shl(x.mant, uint(x.exp-allBits))
+			z.a.abs = z.a.abs.lsh(x.mant, uint(x.exp-allBits))
 			z.b.abs = z.b.abs[:0] // == 1 (see Rat)
 			// z already in normal form
 		default:
@@ -1162,7 +1169,7 @@ func (x *Float) Rat(z *Rat) (*Rat, Accuracy) {
 		case x.exp < allBits:
 			z.a.abs = z.a.abs.set(x.mant)
 			t := z.b.abs.setUint64(1)
-			z.b.abs = t.shl(t, uint(allBits-x.exp))
+			z.b.abs = t.lsh(t, uint(allBits-x.exp))
 			z.norm()
 		}
 		return z, Exact
@@ -1180,17 +1187,13 @@ func (x *Float) Rat(z *Rat) (*Rat, Accuracy) {
 // Abs sets z to the (possibly rounded) value |x| (the absolute value of x)
 // and returns z.
 func (z *Float) Abs(x *Float) *Float {
-	z.Set(x)
-	z.neg = false
-	return z
+	return z.set(x, false)
 }
 
 // Neg sets z to the (possibly rounded) value of x with its sign negated,
 // and returns z.
 func (z *Float) Neg(x *Float) *Float {
-	z.Set(x)
-	z.neg = !z.neg
-	return z
+	return z.set(x, !x.neg)
 }
 
 func validateBinaryOperands(x, y *Float) {
@@ -1236,10 +1239,10 @@ func (z *Float) uadd(x, y *Float) {
 	switch {
 	case ex < ey:
 		if al {
-			t := nat(nil).shl(y.mant, uint(ey-ex))
+			t := nat(nil).lsh(y.mant, uint(ey-ex))
 			z.mant = z.mant.add(x.mant, t)
 		} else {
-			z.mant = z.mant.shl(y.mant, uint(ey-ex))
+			z.mant = z.mant.lsh(y.mant, uint(ey-ex))
 			z.mant = z.mant.add(x.mant, z.mant)
 		}
 	default:
@@ -1247,10 +1250,10 @@ func (z *Float) uadd(x, y *Float) {
 		z.mant = z.mant.add(x.mant, y.mant)
 	case ex > ey:
 		if al {
-			t := nat(nil).shl(x.mant, uint(ex-ey))
+			t := nat(nil).lsh(x.mant, uint(ex-ey))
 			z.mant = z.mant.add(t, y.mant)
 		} else {
-			z.mant = z.mant.shl(x.mant, uint(ex-ey))
+			z.mant = z.mant.lsh(x.mant, uint(ex-ey))
 			z.mant = z.mant.add(z.mant, y.mant)
 		}
 		ex = ey
@@ -1281,10 +1284,10 @@ func (z *Float) usub(x, y *Float) {
 	switch {
 	case ex < ey:
 		if al {
-			t := nat(nil).shl(y.mant, uint(ey-ex))
+			t := nat(nil).lsh(y.mant, uint(ey-ex))
 			z.mant = t.sub(x.mant, t)
 		} else {
-			z.mant = z.mant.shl(y.mant, uint(ey-ex))
+			z.mant = z.mant.lsh(y.mant, uint(ey-ex))
 			z.mant = z.mant.sub(x.mant, z.mant)
 		}
 	default:
@@ -1292,10 +1295,10 @@ func (z *Float) usub(x, y *Float) {
 		z.mant = z.mant.sub(x.mant, y.mant)
 	case ex > ey:
 		if al {
-			t := nat(nil).shl(x.mant, uint(ex-ey))
+			t := nat(nil).lsh(x.mant, uint(ex-ey))
 			z.mant = t.sub(t, y.mant)
 		} else {
-			z.mant = z.mant.shl(x.mant, uint(ex-ey))
+			z.mant = z.mant.lsh(x.mant, uint(ex-ey))
 			z.mant = z.mant.sub(z.mant, y.mant)
 		}
 		ex = ey
@@ -1329,9 +1332,9 @@ func (z *Float) umul(x, y *Float) {
 
 	e := int64(x.exp) + int64(y.exp)
 	if x == y {
-		z.mant = z.mant.sqr(x.mant)
+		z.mant = z.mant.sqr(nil, x.mant)
 	} else {
-		z.mant = z.mant.mul(x.mant, y.mant)
+		z.mant = z.mant.mul(nil, x.mant, y.mant)
 	}
 	z.setExpAndRound(e-fnorm(z.mant), 0)
 }
@@ -1365,8 +1368,10 @@ func (z *Float) uquo(x, y *Float) {
 	d := len(xadj) - len(y.mant)
 
 	// divide
+	stk := getStack()
+	defer stk.free()
 	var r nat
-	z.mant, r = z.mant.div(nil, xadj, y.mant)
+	z.mant, r = z.mant.div(stk, nil, xadj, y.mant)
 	e := int64(x.exp) - int64(y.exp) - int64(d-len(z.mant))*_W
 
 	// The result is long enough to include (at least) the rounding bit.
@@ -1453,7 +1458,7 @@ func (z *Float) Add(x, y *Float) *Float {
 	}
 
 	if z.prec == 0 {
-		z.prec = umax32(x.prec, y.prec)
+		z.prec = max(x.prec, y.prec)
 	}
 
 	if x.form == finite && y.form == finite {
@@ -1527,7 +1532,7 @@ func (z *Float) Sub(x, y *Float) *Float {
 	}
 
 	if z.prec == 0 {
-		z.prec = umax32(x.prec, y.prec)
+		z.prec = max(x.prec, y.prec)
 	}
 
 	if x.form == finite && y.form == finite {
@@ -1594,7 +1599,7 @@ func (z *Float) Mul(x, y *Float) *Float {
 	}
 
 	if z.prec == 0 {
-		z.prec = umax32(x.prec, y.prec)
+		z.prec = max(x.prec, y.prec)
 	}
 
 	z.neg = x.neg != y.neg
@@ -1639,7 +1644,7 @@ func (z *Float) Quo(x, y *Float) *Float {
 	}
 
 	if z.prec == 0 {
-		z.prec = umax32(x.prec, y.prec)
+		z.prec = max(x.prec, y.prec)
 	}
 
 	z.neg = x.neg != y.neg
@@ -1674,10 +1679,9 @@ func (z *Float) Quo(x, y *Float) *Float {
 }
 
 // Cmp compares x and y and returns:
-//
-//	-1 if x <  y
-//	 0 if x == y (incl. -0 == 0, -Inf == -Inf, and +Inf == +Inf)
-//	+1 if x >  y
+//   - -1 if x < y;
+//   - 0 if x == y (incl. -0 == 0, -Inf == -Inf, and +Inf == +Inf);
+//   - +1 if x > y.
 func (x *Float) Cmp(y *Float) int {
 	if debugFloat {
 		x.validate()
@@ -1726,11 +1730,4 @@ func (x *Float) ord() int {
 		m = -m
 	}
 	return m
-}
-
-func umax32(x, y uint32) uint32 {
-	if x > y {
-		return x
-	}
-	return y
 }

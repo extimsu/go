@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"runtime"
 	"syscall"
+	_ "unsafe" // for linkname
 )
 
 // probe probes IPv4, IPv6 and IPv4-mapped IPv6 communication
@@ -69,7 +70,13 @@ func (p *ipStackCapabilities) probe() {
 			continue
 		}
 		if err := syscall.Bind(s, sa); err != nil {
-			continue
+			// If the bind was denied by a security policy (BPF, seccomp,
+			// SELinux, etc.), the kernel still supports IPv6 — the socket
+			// was created and setsockopt succeeded. Only treat errors like
+			// EADDRNOTAVAIL as lack of support. See go.dev/issue/77430.
+			if err != syscall.EPERM && err != syscall.EACCES {
+				continue
+			}
 		}
 		if i == 0 {
 			p.ipv6Enabled = true
@@ -118,6 +125,18 @@ func (p *ipStackCapabilities) probe() {
 // Note that the latest DragonFly BSD and OpenBSD kernels allow
 // neither "net.inet6.ip6.v6only=1" change nor IPPROTO_IPV6 level
 // IPV6_V6ONLY socket option setting.
+//
+// favoriteAddrFamily should be an internal detail,
+// but widely used packages access it using linkname.
+// Notable members of the hall of shame include:
+//   - github.com/database64128/tfo-go/v2
+//   - github.com/metacubex/tfo-go
+//   - github.com/sagernet/tfo-go
+//
+// Do not remove or change the type signature.
+// See go.dev/issue/67401.
+//
+//go:linkname favoriteAddrFamily
 func favoriteAddrFamily(network string, laddr, raddr sockaddr, mode string) (family int, ipv6only bool) {
 	switch network[len(network)-1] {
 	case '4':
@@ -145,7 +164,7 @@ func favoriteAddrFamily(network string, laddr, raddr sockaddr, mode string) (fam
 
 func internetSocket(ctx context.Context, net string, laddr, raddr sockaddr, sotype, proto int, mode string, ctrlCtxFn func(context.Context, string, string, syscall.RawConn) error) (fd *netFD, err error) {
 	switch runtime.GOOS {
-	case "aix", "windows", "openbsd", "js", "wasip1":
+	case "aix", "freebsd", "windows", "openbsd", "js", "wasip1":
 		if mode == "dial" && raddr.isWildcard() {
 			raddr = raddr.toLocal(net)
 		}
@@ -192,6 +211,17 @@ func ipToSockaddrInet6(ip IP, port int, zone string) (syscall.SockaddrInet6, err
 	return sa, nil
 }
 
+// ipToSockaddr should be an internal detail,
+// but widely used packages access it using linkname.
+// Notable members of the hall of shame include:
+//   - github.com/database64128/tfo-go/v2
+//   - github.com/metacubex/tfo-go
+//   - github.com/sagernet/tfo-go
+//
+// Do not remove or change the type signature.
+// See go.dev/issue/67401.
+//
+//go:linkname ipToSockaddr
 func ipToSockaddr(family int, ip IP, port int, zone string) (syscall.Sockaddr, error) {
 	switch family {
 	case syscall.AF_INET:
@@ -213,8 +243,12 @@ func ipToSockaddr(family int, ip IP, port int, zone string) (syscall.Sockaddr, e
 func addrPortToSockaddrInet4(ap netip.AddrPort) (syscall.SockaddrInet4, error) {
 	// ipToSockaddrInet4 has special handling here for zero length slices.
 	// We do not, because netip has no concept of a generic zero IP address.
+	//
+	// addr is allowed to be an IPv4-mapped IPv6 address.
+	// As4 will unmap it to an IPv4 address.
+	// The error message is kept consistent with ipToSockaddrInet4.
 	addr := ap.Addr()
-	if !addr.Is4() {
+	if !addr.Is4() && !addr.Is4In6() {
 		return syscall.SockaddrInet4{}, &AddrError{Err: "non-IPv4 address", Addr: addr.String()}
 	}
 	sa := syscall.SockaddrInet4{
@@ -224,21 +258,17 @@ func addrPortToSockaddrInet4(ap netip.AddrPort) (syscall.SockaddrInet4, error) {
 	return sa, nil
 }
 
-func addrPortToSockaddrInet6(ap netip.AddrPort) (syscall.SockaddrInet6, error) {
+func addrPortToSockaddrInet6(ap netip.AddrPort) syscall.SockaddrInet6 {
 	// ipToSockaddrInet6 has special handling here for zero length slices.
 	// We do not, because netip has no concept of a generic zero IP address.
 	//
 	// addr is allowed to be an IPv4 address, because As16 will convert it
 	// to an IPv4-mapped IPv6 address.
-	// The error message is kept consistent with ipToSockaddrInet6.
 	addr := ap.Addr()
-	if !addr.IsValid() {
-		return syscall.SockaddrInet6{}, &AddrError{Err: "non-IPv6 address", Addr: addr.String()}
-	}
 	sa := syscall.SockaddrInet6{
 		Addr:   addr.As16(),
 		Port:   int(ap.Port()),
 		ZoneId: uint32(zoneCache.index(addr.Zone())),
 	}
-	return sa, nil
+	return sa
 }

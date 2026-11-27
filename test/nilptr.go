@@ -7,12 +7,15 @@
 // Test that the implementation catches nil ptr indirection
 // in a large address space.
 
-// Address space starts at 1<<32 on AIX and on darwin/arm64 and on windows/arm64, so dummy is too far.
-//go:build !aix && (!darwin || !arm64) && (!windows || !arm64)
+// Address space starts at 1<<32 on AIX and on darwin/arm64 and on windows/[amd64/arm64], so dummy is too far.
+//go:build !aix && (!darwin || !arm64) && (!windows || (!amd64 && !arm64))
 
 package main
 
-import "unsafe"
+import (
+	"runtime"
+	"unsafe"
+)
 
 // Having a big address space means that indexing
 // at a 256 MB offset from a nil pointer might not
@@ -28,6 +31,13 @@ func main() {
 	// at the address that might be accidentally
 	// dereferenced below.
 	if uintptr(unsafe.Pointer(&dummy)) > 256<<20 {
+		if runtime.GOOS == "darwin" && runtime.GOARCH == "amd64" {
+			// darwin/amd64 binaries are always PIE, and the
+			// kernel slides the image by up to 256 MB, so
+			// dummy is sometimes too far out. Skip the test
+			// in that case.
+			return
+		}
 		panic("dummy too far out")
 	}
 

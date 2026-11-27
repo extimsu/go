@@ -45,13 +45,7 @@ func TestChown(t *testing.T) {
 	}
 	t.Parallel()
 
-	// Use TempDir() to make sure we're on a local file system,
-	// so that the group ids returned by Getgroups will be allowed
-	// on the file. On NFS, the Getgroups groups are
-	// basically useless.
-	f := newFile("TestChown", t)
-	defer Remove(f.Name())
-	defer f.Close()
+	f := newFile(t)
 	dir, err := f.Stat()
 	if err != nil {
 		t.Fatalf("stat %s: %s", f.Name(), err)
@@ -70,7 +64,7 @@ func TestChown(t *testing.T) {
 	// Then try all the auxiliary groups.
 	groups, err := Getgroups()
 	if err != nil {
-		t.Fatalf("getgroups: %s", err)
+		t.Fatal(err)
 	}
 	t.Log("groups: ", groups)
 	for _, g := range groups {
@@ -99,13 +93,7 @@ func TestFileChown(t *testing.T) {
 	}
 	t.Parallel()
 
-	// Use TempDir() to make sure we're on a local file system,
-	// so that the group ids returned by Getgroups will be allowed
-	// on the file. On NFS, the Getgroups groups are
-	// basically useless.
-	f := newFile("TestFileChown", t)
-	defer Remove(f.Name())
-	defer f.Close()
+	f := newFile(t)
 	dir, err := f.Stat()
 	if err != nil {
 		t.Fatalf("stat %s: %s", f.Name(), err)
@@ -124,7 +112,7 @@ func TestFileChown(t *testing.T) {
 	// Then try all the auxiliary groups.
 	groups, err := Getgroups()
 	if err != nil {
-		t.Fatalf("getgroups: %s", err)
+		t.Fatal(err)
 	}
 	t.Log("groups: ", groups)
 	for _, g := range groups {
@@ -151,13 +139,7 @@ func TestLchown(t *testing.T) {
 	testenv.MustHaveSymlink(t)
 	t.Parallel()
 
-	// Use TempDir() to make sure we're on a local file system,
-	// so that the group ids returned by Getgroups will be allowed
-	// on the file. On NFS, the Getgroups groups are
-	// basically useless.
-	f := newFile("TestLchown", t)
-	defer Remove(f.Name())
-	defer f.Close()
+	f := newFile(t)
 	dir, err := f.Stat()
 	if err != nil {
 		t.Fatalf("stat %s: %s", f.Name(), err)
@@ -188,7 +170,7 @@ func TestLchown(t *testing.T) {
 	// Then try all the auxiliary groups.
 	groups, err := Getgroups()
 	if err != nil {
-		t.Fatalf("getgroups: %s", err)
+		t.Fatal(err)
 	}
 	t.Log("groups: ", groups)
 	for _, g := range groups {
@@ -214,17 +196,14 @@ func TestLchown(t *testing.T) {
 
 // Issue 16919: Readdir must return a non-empty slice or an error.
 func TestReaddirRemoveRace(t *testing.T) {
-	oldStat := *LstatP
-	defer func() { *LstatP = oldStat }()
-	*LstatP = func(name string) (FileInfo, error) {
+	SetStatHook(t, func(f *File, name string) (FileInfo, error) {
 		if strings.HasSuffix(name, "some-file") {
 			// Act like it's been deleted.
 			return nil, ErrNotExist
 		}
-		return oldStat(name)
-	}
-	dir := newDir("TestReaddirRemoveRace", t)
-	defer RemoveAll(dir)
+		return nil, nil
+	})
+	dir := t.TempDir()
 	if err := WriteFile(filepath.Join(dir, "some-file"), []byte("hello"), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -252,11 +231,12 @@ func TestMkdirStickyUmask(t *testing.T) {
 	if runtime.GOOS == "wasip1" {
 		t.Skip("file permissions not supported on " + runtime.GOOS)
 	}
-	t.Parallel()
+	// Issue #69788: This test temporarily changes the umask for testing purposes,
+	// so it shouldn't be run in parallel with other test cases
+	// to avoid other tests (e.g., TestCopyFS) creating files with an unintended umask.
 
 	const umask = 0077
-	dir := newDir("TestMkdirStickyUmask", t)
-	defer RemoveAll(dir)
+	dir := t.TempDir()
 
 	oldUmask := syscall.Umask(umask)
 	defer syscall.Umask(oldUmask)
@@ -392,18 +372,24 @@ func TestSplitPath(t *testing.T) {
 //
 // Regression test for go.dev/issue/60181
 func TestIssue60181(t *testing.T) {
-	defer chtmpdir(t)()
+	if runtime.GOOS == "wasip1" {
+		// A bug in the Linux kernel of the builder container image breaks
+		// Wasmtime's O_APPEND writes.
+		// TODO(go.dev/issue/82862): remove when the infrastructure is upgraded.
+		t.Skip("skipping on wasip1; see go.dev/issue/82862")
+	}
+	t.Chdir(t.TempDir())
 
 	want := "hello gopher"
 
-	a, err := CreateTemp("", "a")
+	a, err := CreateTemp(".", "a")
 	if err != nil {
 		t.Fatal(err)
 	}
 	a.WriteString(want[:5])
 	a.Close()
 
-	b, err := CreateTemp("", "b")
+	b, err := CreateTemp(".", "b")
 	if err != nil {
 		t.Fatal(err)
 	}

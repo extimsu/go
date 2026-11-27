@@ -8,10 +8,13 @@ package runtime_test
 
 import (
 	"bytes"
+	"internal/asan"
+	"internal/goarch"
 	"internal/testenv"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -19,6 +22,10 @@ import (
 // TestUsingVDSO tests that we are actually using the VDSO to fetch
 // the time.
 func TestUsingVDSO(t *testing.T) {
+	if asan.Enabled {
+		t.Skip("test fails with ASAN because the ASAN leak checker won't run under strace")
+	}
+
 	const calls = 100
 
 	if os.Getenv("GO_WANT_HELPER_PROCESS") == "1" {
@@ -47,8 +54,17 @@ func TestUsingVDSO(t *testing.T) {
 		t.Skipf("skipping because Executable failed: %v", err)
 	}
 
-	t.Logf("GO_WANT_HELPER_PROCESS=1 %s -f -e clock_gettime %s -test.run=^TestUsingVDSO$", strace, exe)
-	cmd := testenv.Command(t, strace, "-f", "-e", "clock_gettime", exe, "-test.run=^TestUsingVDSO$")
+	traceFilter := "clock_gettime"
+
+	if goarch.PtrSize == 4 {
+		// Trace both clock_gettime and clock_gettime64: 32-bit Linux glibc uses
+		// the y2038-safe clock_gettime64 syscall, and strace's -e filter is an
+		// exact match, not a prefix.
+		traceFilter += ",clock_gettime64"
+	}
+
+	t.Logf("GO_WANT_HELPER_PROCESS=1 %s -f -e %s %s -test.run=^TestUsingVDSO$", strace, traceFilter, exe)
+	cmd := testenv.Command(t, strace, "-f", "-e", traceFilter, exe, "-test.run=^TestUsingVDSO$")
 	cmd = testenv.CleanCmdEnv(cmd)
 	cmd.Env = append(cmd.Env, "GO_WANT_HELPER_PROCESS=1")
 	out, err := cmd.CombinedOutput()
@@ -56,6 +72,16 @@ func TestUsingVDSO(t *testing.T) {
 		t.Logf("%s", out)
 	}
 	if err != nil {
+		if err, ok := err.(*exec.ExitError); ok && err.Sys().(syscall.WaitStatus).Signaled() {
+			if !bytes.Contains(out, []byte("+++ killed by")) {
+				// strace itself occasionally crashes.
+				// Here, it exited with a signal, but
+				// the strace log didn't report any
+				// signal from the child process.
+				t.Log(err)
+				testenv.SkipFlaky(t, 63734)
+			}
+		}
 		t.Fatal(err)
 	}
 
@@ -91,8 +117,8 @@ func TestUsingVDSO(t *testing.T) {
 			t.Skipf("can't verify VDSO status, C compiled failed: %v", err)
 		}
 
-		t.Logf("%s -f -e clock_gettime %s", strace, cexe)
-		cmd = testenv.Command(t, strace, "-f", "-e", "clock_gettime", cexe)
+		t.Logf("%s -f -e %s %s", strace, traceFilter, cexe)
+		cmd = testenv.Command(t, strace, "-f", "-e", traceFilter, cexe)
 		cmd = testenv.CleanCmdEnv(cmd)
 		out, err = cmd.CombinedOutput()
 		if len(out) > 0 {

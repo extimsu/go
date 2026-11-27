@@ -18,10 +18,6 @@ type T2[P any] struct {
 
 type List[P any] []P
 
-// Alias type declarations cannot have type parameters.
-// Issue #46477 proposes to change that.
-type A1[P any] = /* ERROR "cannot be alias" */ struct{}
-
 // Pending clarification of #46477 we disallow aliases
 // of generic types.
 type A2 = List // ERROR "cannot use generic type"
@@ -58,5 +54,5 @@ var _ T3[int] = T3[int](List[int]{1, 2, 3})
 
 // Self-recursive generic types are not permitted
 
-type self1[P any] self1 /* ERROR "invalid recursive type" */ [P]
+type self1 /* ERROR "invalid recursive type" */ [P any] self1[P]
 type self2[P any] *self2[P] // this is ok

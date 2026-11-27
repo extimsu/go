@@ -5,90 +5,8 @@
 #include "go_asm.h"
 #include "go_tls.h"
 #include "textflag.h"
-#include "time_windows.h"
+#include "funcdata.h"
 #include "cgo/abi_amd64.h"
-
-// Offsets into Thread Environment Block (pointer in GS)
-#define TEB_TlsSlots 0x1480
-#define TEB_ArbitraryPtr 0x28
-
-TEXT runtime·asmstdcall_trampoline<ABIInternal>(SB),NOSPLIT,$0
-	MOVQ	AX, CX
-	JMP	runtime·asmstdcall(SB)
-
-// void runtime·asmstdcall(void *c);
-TEXT runtime·asmstdcall(SB),NOSPLIT,$16
-	MOVQ	SP, AX
-	ANDQ	$~15, SP	// alignment as per Windows requirement
-	MOVQ	AX, 8(SP)
-	MOVQ	CX, 0(SP)	// asmcgocall will put first argument into CX.
-
-	MOVQ	libcall_fn(CX), AX
-	MOVQ	libcall_args(CX), SI
-	MOVQ	libcall_n(CX), CX
-
-	// SetLastError(0).
-	MOVQ	0x30(GS), DI
-	MOVL	$0, 0x68(DI)
-
-	SUBQ	$(const_maxArgs*8), SP	// room for args
-
-	// Fast version, do not store args on the stack nor
-	// load them into registers.
-	CMPL	CX, $0
-	JE	docall
-
-	// Fast version, do not store args on the stack.
-	CMPL	CX, $4
-	JLE	loadregs
-
-	// Check we have enough room for args.
-	CMPL	CX, $const_maxArgs
-	JLE	2(PC)
-	INT	$3			// not enough room -> crash
-
-	// Copy args to the stack.
-	MOVQ	SP, DI
-	CLD
-	REP; MOVSQ
-	MOVQ	SP, SI
-
-loadregs:
-	// Load first 4 args into correspondent registers.
-	MOVQ	0(SI), CX
-	MOVQ	8(SI), DX
-	MOVQ	16(SI), R8
-	MOVQ	24(SI), R9
-	// Floating point arguments are passed in the XMM
-	// registers. Set them here in case any of the arguments
-	// are floating point values. For details see
-	//	https://learn.microsoft.com/en-us/cpp/build/x64-calling-convention?view=msvc-170
-	MOVQ	CX, X0
-	MOVQ	DX, X1
-	MOVQ	R8, X2
-	MOVQ	R9, X3
-
-docall:
-	// Call stdcall function.
-	CALL	AX
-
-	ADDQ	$(const_maxArgs*8), SP
-
-	// Return result.
-	MOVQ	0(SP), CX
-	MOVQ	8(SP), SP
-	MOVQ	AX, libcall_r1(CX)
-	// Floating point return values are returned in XMM0. Setting r2 to this
-	// value in case this call returned a floating point value. For details,
-	// see https://docs.microsoft.com/en-us/cpp/build/x64-calling-convention
-	MOVQ    X0, libcall_r2(CX)
-
-	// GetLastError().
-	MOVQ	0x30(GS), DI
-	MOVL	0x68(DI), AX
-	MOVQ	AX, libcall_err(CX)
-
-	RET
 
 // faster get/set last error
 TEXT runtime·getlasterror(SB),NOSPLIT,$0
@@ -110,6 +28,13 @@ TEXT sigtramp<>(SB),NOSPLIT,$0-0
 	// R14 is cleared in case there's a non-zero value in there
 	// if called from a non-go thread.
 	XORPS	X15, X15
+#ifndef GOAMD64_v3
+#ifndef GOAMD64_v4
+	CMPB	internal∕cpu·X86+const_offsetX86HasAVX(SB), $1
+	JNE	2(PC)
+#endif
+#endif
+	VXORPS	X15, X15, X15
 	XORQ	R14, R14
 
 	get_tls(AX)
@@ -256,10 +181,9 @@ TEXT runtime·tstart_stdcall(SB),NOSPLIT|NOFRAME,$0
 	MOVQ	AX, g_stackguard1(DX)
 
 	// Set up tls.
-	LEAQ	m_tls(CX), DI
 	MOVQ	CX, g_m(DX)
-	MOVQ	DX, g(DI)
-	CALL	runtime·settls(SB) // clobbers CX
+	get_tls(AX)
+	MOVQ	DX, g(AX)
 
 	CALL	runtime·stackcheck(SB)	// clobbers AX,CX
 	CALL	runtime·mstart(SB)
@@ -268,58 +192,21 @@ TEXT runtime·tstart_stdcall(SB),NOSPLIT|NOFRAME,$0
 
 	XORL	AX, AX			// return 0 == success
 	RET
-
-// set tls base to DI
-TEXT runtime·settls(SB),NOSPLIT,$0
-	MOVQ	runtime·tls_g(SB), CX
-	MOVQ	DI, 0(CX)(GS)
-	RET
-
-TEXT runtime·nanotime1(SB),NOSPLIT,$0-8
-	MOVQ	$_INTERRUPT_TIME, DI
-	MOVQ	time_lo(DI), AX
+TEXT runtime·nanotime2<ABIInternal>(SB),NOSPLIT,$32-0
+	NO_LOCAL_POINTERS
+	// asmcgocall supplies the Windows ABI's argument register and shadow space.
+	// Save LastError outside the call's argument and result slots.
+	MOVQ	0x30(GS), AX
+	MOVL	0x68(AX), DX
+	MOVL	DX, 20(SP)
+	MOVQ	runtime·_QueryInterruptTimePrecise(SB), AX
+	MOVQ	AX, 0(SP)
+	LEAQ	24(SP), AX
+	MOVQ	AX, 8(SP)
+	CALL	runtime·asmcgocall(SB)
+	MOVQ	0x30(GS), AX
+	MOVL	20(SP), DX
+	MOVL	DX, 0x68(AX)
+	MOVQ	24(SP), AX
 	IMULQ	$100, AX
-	MOVQ	AX, ret+0(FP)
-	RET
-
-// func osSetupTLS(mp *m)
-// Setup TLS. for use by needm on Windows.
-TEXT runtime·osSetupTLS(SB),NOSPLIT,$0-8
-	MOVQ	mp+0(FP), AX
-	LEAQ	m_tls(AX), DI
-	CALL	runtime·settls(SB)
-	RET
-
-// This is called from rt0_go, which runs on the system stack
-// using the initial stack allocated by the OS.
-TEXT runtime·wintls(SB),NOSPLIT,$0
-	// Allocate a TLS slot to hold g across calls to external code
-	MOVQ	SP, AX
-	ANDQ	$~15, SP	// alignment as per Windows requirement
-	SUBQ	$48, SP	// room for SP and 4 args as per Windows requirement
-			// plus one extra word to keep stack 16 bytes aligned
-	MOVQ	AX, 32(SP)
-	MOVQ	runtime·_TlsAlloc(SB), AX
-	CALL	AX
-	MOVQ	32(SP), SP
-
-	MOVQ	AX, CX	// TLS index
-
-	// Assert that slot is less than 64 so we can use _TEB->TlsSlots
-	CMPQ	CX, $64
-	JB	ok
-
-	// Fallback to the TEB arbitrary pointer.
-	// TODO: don't use the arbitrary pointer (see go.dev/issue/59824)
-	MOVQ	$TEB_ArbitraryPtr, CX
-	JMP	settls
-ok:
-	// Convert the TLS index at CX into
-	// an offset from TEB_TlsSlots.
-	SHLQ	$3, CX
-
-	// Save offset from TLS into tls_g.
-	ADDQ	$TEB_TlsSlots, CX
-settls:
-	MOVQ	CX, runtime·tls_g(SB)
 	RET

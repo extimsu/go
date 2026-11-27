@@ -2,9 +2,9 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build 386 || arm || mips || mipsle || wasm
+//go:build 386 || arm || mips || mipsle || wasm || wasm32 || (gccgo && (ppc || s390))
 
-// wasm is a treated as a 32-bit architecture for the purposes of the page
+// GOARCH=wasm is treated as a 32-bit architecture for the purposes of the page
 // allocator, even though it has 64-bit pointers. This is because any wasm
 // pointer always has its top 32 bits as zero, so the effective heap address
 // space is only 2^32 bytes in size (see heapAddrBits).
@@ -71,12 +71,12 @@ func (p *pageAlloc) sysInit(test bool) {
 	totalSize = alignUp(totalSize, physPageSize)
 
 	// Reserve memory for all levels in one go. There shouldn't be much for 32-bit.
-	reservation := sysReserve(nil, totalSize)
+	reservation := sysReserve(nil, totalSize, "page summary")
 	if reservation == nil {
 		throw("failed to reserve page summary memory")
 	}
 	// There isn't much. Just map it and mark it as used immediately.
-	sysMap(reservation, totalSize, p.sysStat)
+	sysMap(reservation, totalSize, p.sysStat, "page summary")
 	sysUsed(reservation, totalSize, totalSize)
 	p.summaryMappedReady += totalSize
 
@@ -123,7 +123,7 @@ func (s *scavengeIndex) sysInit(test bool, sysStat *sysMemStat) (mappedReady uin
 	if test {
 		// Set up the scavenge index via sysAlloc so the test can free it later.
 		scavIndexSize := uintptr(len(scavengeIndexArray)) * unsafe.Sizeof(atomicScavChunkData{})
-		s.chunks = ((*[(1 << heapAddrBits) / pallocChunkBytes]atomicScavChunkData)(sysAlloc(scavIndexSize, sysStat)))[:]
+		s.chunks = ((*[(1 << heapAddrBits) / pallocChunkBytes]atomicScavChunkData)(sysAlloc(scavIndexSize, sysStat, vmaNamePageAllocIndex)))[:]
 		mappedReady = scavIndexSize
 	} else {
 		// Set up the scavenge index.

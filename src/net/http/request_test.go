@@ -10,6 +10,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +23,7 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -68,22 +70,22 @@ func TestParseFormQuery(t *testing.T) {
 	if bz := req.PostFormValue("z"); bz != "post" {
 		t.Errorf(`req.PostFormValue("z") = %q, want "post"`, bz)
 	}
-	if qs := req.Form["q"]; !reflect.DeepEqual(qs, []string{"foo", "bar"}) {
+	if qs := req.Form["q"]; !slices.Equal(qs, []string{"foo", "bar"}) {
 		t.Errorf(`req.Form["q"] = %q, want ["foo", "bar"]`, qs)
 	}
-	if both := req.Form["both"]; !reflect.DeepEqual(both, []string{"y", "x"}) {
+	if both := req.Form["both"]; !slices.Equal(both, []string{"y", "x"}) {
 		t.Errorf(`req.Form["both"] = %q, want ["y", "x"]`, both)
 	}
 	if prio := req.FormValue("prio"); prio != "2" {
 		t.Errorf(`req.FormValue("prio") = %q, want "2" (from body)`, prio)
 	}
-	if orphan := req.Form["orphan"]; !reflect.DeepEqual(orphan, []string{"", "nope"}) {
+	if orphan := req.Form["orphan"]; !slices.Equal(orphan, []string{"", "nope"}) {
 		t.Errorf(`req.FormValue("orphan") = %q, want "" (from body)`, orphan)
 	}
-	if empty := req.Form["empty"]; !reflect.DeepEqual(empty, []string{"", "not"}) {
+	if empty := req.Form["empty"]; !slices.Equal(empty, []string{"", "not"}) {
 		t.Errorf(`req.FormValue("empty") = %q, want "" (from body)`, empty)
 	}
-	if nokey := req.Form[""]; !reflect.DeepEqual(nokey, []string{"nokey"}) {
+	if nokey := req.Form[""]; !slices.Equal(nokey, []string{"nokey"}) {
 		t.Errorf(`req.FormValue("nokey") = %q, want "nokey" (from body)`, nokey)
 	}
 }
@@ -291,7 +293,7 @@ Content-Type: text/plain
 // the payload size and the internal leeway buffer size of 10MiB overflows, that we
 // correctly return an error.
 func TestMaxInt64ForMultipartFormMaxMemoryOverflow(t *testing.T) {
-	run(t, testMaxInt64ForMultipartFormMaxMemoryOverflow)
+	runSynctest(t, testMaxInt64ForMultipartFormMaxMemoryOverflow)
 }
 func testMaxInt64ForMultipartFormMaxMemoryOverflow(t *testing.T, mode testMode) {
 	payloadSize := 1 << 10
@@ -331,7 +333,7 @@ func testMaxInt64ForMultipartFormMaxMemoryOverflow(t *testing.T, mode testMode) 
 	}
 }
 
-func TestRequestRedirect(t *testing.T) { run(t, testRequestRedirect) }
+func TestRequestRedirect(t *testing.T) { runSynctest(t, testRequestRedirect) }
 func testRequestRedirect(t *testing.T, mode testMode) {
 	cst := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {
 		switch r.URL.Path {
@@ -764,8 +766,25 @@ func TestRequestWriteBufferedWriter(t *testing.T) {
 		"User-Agent: " + DefaultUserAgent + "\r\n",
 		"\r\n",
 	}
-	if !reflect.DeepEqual(got, want) {
+	if !slices.Equal(got, want) {
 		t.Errorf("Writes = %q\n  Want = %q", got, want)
+	}
+}
+
+func TestRequestWriteRejectsProtocolHeader(t *testing.T) {
+	req, err := NewRequest(MethodConnect, "http://example.com/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(":protocol", "websocket")
+
+	var got bytes.Buffer
+	err = req.Write(&got)
+	if err == nil || !strings.Contains(err.Error(), ":protocol pseudo-header is not allowed in HTTP/1.x") {
+		t.Fatalf("Request.Write() error = %v, want :protocol HTTP/1.x error", err)
+	}
+	if got.Len() != 0 {
+		t.Fatalf("Request.Write() wrote %q before returning an error", got.String())
 	}
 }
 
@@ -784,7 +803,7 @@ func TestRequestBadHostHeader(t *testing.T) {
 		"User-Agent: " + DefaultUserAgent + "\r\n",
 		"\r\n",
 	}
-	if !reflect.DeepEqual(got, want) {
+	if !slices.Equal(got, want) {
 		t.Errorf("Writes = %q\n  Want = %q", got, want)
 	}
 }
@@ -803,7 +822,7 @@ func TestRequestBadUserAgent(t *testing.T) {
 		"User-Agent: evil  X-Evil: evil\r\n",
 		"\r\n",
 	}
-	if !reflect.DeepEqual(got, want) {
+	if !slices.Equal(got, want) {
 		t.Errorf("Writes = %q\n  Want = %q", got, want)
 	}
 }
@@ -1081,7 +1100,7 @@ func TestRequestClonePathValue(t *testing.T) {
 }
 
 // Issue 34878: verify we don't panic when including basic auth (Go 1.13 regression)
-func TestNoPanicOnRoundTripWithBasicAuth(t *testing.T) { run(t, testNoPanicWithBasicAuth) }
+func TestNoPanicOnRoundTripWithBasicAuth(t *testing.T) { runSynctest(t, testNoPanicWithBasicAuth) }
 func testNoPanicWithBasicAuth(t *testing.T, mode testMode) {
 	cst := newClientServerTest(t, mode, HandlerFunc(func(w ResponseWriter, r *Request) {}))
 
@@ -1094,9 +1113,11 @@ func testNoPanicWithBasicAuth(t *testing.T, mode testMode) {
 		URL:    u,
 		Method: "GET",
 	}
-	if _, err := cst.c.Do(req); err != nil {
+	resp, err := cst.c.Do(req)
+	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
+	resp.Body.Close()
 }
 
 // verify that NewRequest sets Request.GetBody and that it works
@@ -1256,6 +1277,76 @@ func TestRequestCookie(t *testing.T) {
 	}
 }
 
+func TestRequestCookiesByName(t *testing.T) {
+	tests := []struct {
+		in     []*Cookie
+		filter string
+		want   []*Cookie
+	}{
+		{
+			in: []*Cookie{
+				{Name: "foo", Value: "foo-1"},
+				{Name: "bar", Value: "bar"},
+			},
+			filter: "foo",
+			want:   []*Cookie{{Name: "foo", Value: "foo-1"}},
+		},
+		{
+			in: []*Cookie{
+				{Name: "foo", Value: "foo-1"},
+				{Name: "foo", Value: "foo-2"},
+				{Name: "bar", Value: "bar"},
+			},
+			filter: "foo",
+			want: []*Cookie{
+				{Name: "foo", Value: "foo-1"},
+				{Name: "foo", Value: "foo-2"},
+			},
+		},
+		{
+			in: []*Cookie{
+				{Name: "bar", Value: "bar"},
+			},
+			filter: "foo",
+			want:   []*Cookie{},
+		},
+		{
+			in: []*Cookie{
+				{Name: "bar", Value: "bar"},
+			},
+			filter: "",
+			want:   []*Cookie{},
+		},
+		{
+			in:     []*Cookie{},
+			filter: "foo",
+			want:   []*Cookie{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.filter, func(t *testing.T) {
+			req, err := NewRequest("GET", "http://example.com/", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, c := range tt.in {
+				req.AddCookie(c)
+			}
+
+			got := req.CookiesNamed(tt.filter)
+
+			if !reflect.DeepEqual(got, tt.want) {
+				asStr := func(v any) string {
+					blob, _ := json.MarshalIndent(v, "", "  ")
+					return string(blob)
+				}
+				t.Fatalf("Result mismatch\n\tGot: %s\n\tWant: %s", asStr(got), asStr(tt.want))
+			}
+		})
+	}
+}
+
 const (
 	fileaContents = "This is a test file."
 	filebContents = "Another test file."
@@ -1391,7 +1482,7 @@ func benchmarkFileAndServer(b *testing.B, n int64) {
 		b.Fatalf("Failed to copy %d bytes: %v", n, err)
 	}
 
-	run(b, func(b *testing.B, mode testMode) {
+	runNoSynctest(b, func(b *testing.B, mode testMode) {
 		runFileAndServerBenchmarks(b, mode, f, n)
 	}, []testMode{http1Mode, https1Mode, http2Mode})
 }
@@ -1456,7 +1547,7 @@ func TestPathValueNoMatch(t *testing.T) {
 	}
 }
 
-func TestPathValue(t *testing.T) {
+func TestPathValueAndPattern(t *testing.T) {
 	for _, test := range []struct {
 		pattern string
 		url     string
@@ -1488,6 +1579,14 @@ func TestPathValue(t *testing.T) {
 				"other": "there/is//more",
 			},
 		},
+		{
+			"/names/{name}/{other...}",
+			"/names/n/*",
+			map[string]string{
+				"name":  "n",
+				"other": "*",
+			},
+		},
 	} {
 		mux := NewServeMux()
 		mux.HandleFunc(test.pattern, func(w ResponseWriter, r *Request) {
@@ -1496,6 +1595,9 @@ func TestPathValue(t *testing.T) {
 				if got != want {
 					t.Errorf("%q, %q: got %q, want %q", test.pattern, name, got, want)
 				}
+			}
+			if r.Pattern != test.pattern {
+				t.Errorf("pattern: got %s, want %s", r.Pattern, test.pattern)
 			}
 		})
 		server := httptest.NewServer(mux)

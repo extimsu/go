@@ -34,8 +34,9 @@ package types2
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -67,6 +68,7 @@ const (
 // corresponding types inferred for each type parameter.
 // A unifier is created by calling newUnifier.
 type unifier struct {
+	check *Checker
 	// handles maps each type parameter to its inferred type through
 	// an indirection *Type called (inferred type) "handle".
 	// Initially, each type parameter has its own, separate handle,
@@ -85,7 +87,7 @@ type unifier struct {
 // and corresponding type argument lists. The type argument list may be shorter
 // than the type parameter list, and it may contain nil types. Matching type
 // parameters and arguments must have the same index.
-func newUnifier(tparams []*TypeParam, targs []Type, enableInterfaceInference bool) *unifier {
+func newUnifier(check *Checker, tparams []*TypeParam, targs []Type, enableInterfaceInference bool) *unifier {
 	assert(len(tparams) >= len(targs))
 	handles := make(map[*TypeParam]*Type, len(tparams))
 	// Allocate all handles up-front: in a correct program, all type parameters
@@ -99,7 +101,7 @@ func newUnifier(tparams []*TypeParam, targs []Type, enableInterfaceInference boo
 		}
 		handles[x] = &t
 	}
-	return &unifier{handles, 0, enableInterfaceInference}
+	return &unifier{check, handles, 0, enableInterfaceInference}
 }
 
 // unifyMode controls the behavior of the unifier.
@@ -141,7 +143,8 @@ func (u *unifier) unify(x, y Type, mode unifyMode) bool {
 	return u.nify(x, y, mode, nil)
 }
 
-func (u *unifier) tracef(format string, args ...interface{}) {
+func (u *unifier) tracef(format string, args ...any) {
+	// TODO(gri) consider adjusting this to use Checker.trace
 	fmt.Println(strings.Repeat(".  ", u.depth) + sprintf(nil, true, format, args...))
 }
 
@@ -149,13 +152,15 @@ func (u *unifier) tracef(format string, args ...interface{}) {
 // from type parameters to types.
 func (u *unifier) String() string {
 	// sort type parameters for reproducible strings
-	tparams := make(typeParamsById, len(u.handles))
+	tparams := make([]*TypeParam, len(u.handles))
 	i := 0
 	for tpar := range u.handles {
 		tparams[i] = tpar
 		i++
 	}
-	sort.Sort(tparams)
+	slices.SortFunc(tparams, func(a, b *TypeParam) int {
+		return cmp.Compare(a.id, b.id)
+	})
 
 	var buf bytes.Buffer
 	w := newTypeWriter(&buf, nil)
@@ -171,12 +176,6 @@ func (u *unifier) String() string {
 	w.byte(']')
 	return buf.String()
 }
-
-type typeParamsById []*TypeParam
-
-func (s typeParamsById) Len() int           { return len(s) }
-func (s typeParamsById) Less(i, j int) bool { return s[i].id < s[j].id }
-func (s typeParamsById) Swap(i, j int)      { s[i], s[j] = s[j], s[i] }
 
 // join unifies the given type parameters x and y.
 // If both type parameters already have a type associated with them
@@ -205,10 +204,10 @@ func (u *unifier) join(x, y *TypeParam) bool {
 	return true
 }
 
-// asTypeParam returns x.(*TypeParam) if x is a type parameter recorded with u.
+// asBoundTypeParam returns x.(*TypeParam) if x is a type parameter recorded with u.
 // Otherwise, the result is nil.
-func (u *unifier) asTypeParam(x Type) *TypeParam {
-	if x, _ := x.(*TypeParam); x != nil {
+func (u *unifier) asBoundTypeParam(x Type) *TypeParam {
+	if x, _ := Unalias(x).(*TypeParam); x != nil {
 		if _, found := u.handles[x]; found {
 			return x
 		}
@@ -269,8 +268,8 @@ func (u *unifier) inferred(tparams []*TypeParam) []Type {
 // asInterface returns the underlying type of x as an interface if
 // it is a non-type parameter interface. Otherwise it returns nil.
 func asInterface(x Type) (i *Interface) {
-	if _, ok := x.(*TypeParam); !ok {
-		i, _ = under(x).(*Interface)
+	if _, ok := Unalias(x).(*TypeParam); !ok {
+		i, _ = x.Underlying().(*Interface)
 	}
 	return i
 }
@@ -291,11 +290,11 @@ func (u *unifier) nify(x, y Type, mode unifyMode, p *ifacePair) (result bool) {
 		u.depth--
 	}()
 
-	x = Unalias(x)
-	y = Unalias(y)
+	// don't hide bugs
+	assert(x != nil && y != nil)
 
 	// nothing to do if x == y
-	if x == y {
+	if x == y || Unalias(x) == Unalias(y) {
 		return true
 	}
 
@@ -314,7 +313,7 @@ func (u *unifier) nify(x, y Type, mode unifyMode, p *ifacePair) (result bool) {
 	// Ensure that if we have at least one
 	// - defined type, make sure one is in y
 	// - type parameter recorded with u, make sure one is in x
-	if asNamed(x) != nil || u.asTypeParam(y) != nil {
+	if asNamed(x) != nil || u.asBoundTypeParam(y) != nil {
 		if traceInference {
 			u.tracef("%s ≡ %s\t// swap", y, x)
 		}
@@ -342,12 +341,12 @@ func (u *unifier) nify(x, y Type, mode unifyMode, p *ifacePair) (result bool) {
 		if traceInference {
 			u.tracef("%s ≡ under %s", x, ny)
 		}
-		y = ny.under()
+		y = ny.Underlying()
 		// Per the spec, a defined type cannot have an underlying type
 		// that is a type parameter.
 		assert(!isTypeParam(y))
 		// x and y may be identical now
-		if x == y {
+		if x == y || Unalias(x) == Unalias(y) {
 			return true
 		}
 	}
@@ -358,7 +357,7 @@ func (u *unifier) nify(x, y Type, mode unifyMode, p *ifacePair) (result bool) {
 	// isTypeLit(x) is false and y was not changed above. In other
 	// words, if y was a defined type, it is still a defined type
 	// (relevant for the logic below).
-	switch px, py := u.asTypeParam(x), u.asTypeParam(y); {
+	switch px, py := u.asBoundTypeParam(x), u.asBoundTypeParam(y); {
 	case px != nil && py != nil:
 		// both x and y are type parameters
 		if u.join(px, py) {
@@ -433,7 +432,7 @@ func (u *unifier) nify(x, y Type, mode unifyMode, p *ifacePair) (result bool) {
 						u.set(px, y)
 					default:
 						// Neither x nor y are defined types.
-						if yc, _ := under(y).(*Chan); yc != nil && yc.dir != SendRecv {
+						if yc, _ := y.Underlying().(*Chan); yc != nil && yc.dir != SendRecv {
 							// y is a directed channel type: select y.
 							u.set(px, y)
 						}
@@ -449,7 +448,7 @@ func (u *unifier) nify(x, y Type, mode unifyMode, p *ifacePair) (result bool) {
 	}
 
 	// x != y if we get here
-	assert(x != y)
+	assert(x != y && Unalias(x) != Unalias(y))
 
 	// If u.EnableInterfaceInference is set and we don't require exact unification,
 	// if both types are interfaces, one interface must have a subset of the
@@ -537,10 +536,17 @@ func (u *unifier) nify(x, y Type, mode unifyMode, p *ifacePair) (result bool) {
 		// the non-interface type, otherwise unification fails.
 		if xi != nil {
 			// All xi methods must exist in y and corresponding signatures must unify.
+			// A generic method never satisfies an interface method, so fail rather
+			// than unify ym's own type parameter into an inference variable.
 			xmethods := xi.typeSet().methods
 			for _, xm := range xmethods {
 				obj, _, _ := LookupFieldOrMethod(y, false, xm.pkg, xm.name)
-				if ym, _ := obj.(*Func); ym == nil || !u.nify(xm.typ, ym.typ, exact, p) {
+				ym, _ := obj.(*Func)
+				if ym == nil {
+					return false
+				}
+				u.check.objDecl(ym) // ensure fully set-up signature
+				if ym.Signature().TypeParams() != nil || !u.nify(xm.typ, ym.typ, exact, p) {
 					return false
 				}
 			}
@@ -572,6 +578,10 @@ func (u *unifier) nify(x, y Type, mode unifyMode, p *ifacePair) (result bool) {
 	if mode&assign != 0 {
 		emode |= exact
 	}
+
+	// Continue with unaliased types but don't lose original alias names, if any (go.dev/issue/67628).
+	xorig, x := x, Unalias(x)
+	yorig, y := y, Unalias(y)
 
 	switch x := x.(type) {
 	case *Basic:
@@ -608,7 +618,7 @@ func (u *unifier) nify(x, y Type, mode unifyMode, p *ifacePair) (result bool) {
 					g := y.fields[i]
 					if f.embedded != g.embedded ||
 						x.Tag(i) != y.Tag(i) ||
-						!f.sameId(g.pkg, g.name) ||
+						!f.sameId(g.pkg, g.name, false) ||
 						!u.nify(f.typ, g.typ, emode, p) {
 						return false
 					}
@@ -751,7 +761,7 @@ func (u *unifier) nify(x, y Type, mode unifyMode, p *ifacePair) (result bool) {
 	case *TypeParam:
 		// x must be an unbound type parameter (see comment above).
 		if debug {
-			assert(u.asTypeParam(x) == nil)
+			assert(u.asBoundTypeParam(x) == nil)
 		}
 		// By definition, a valid type argument must be in the type set of
 		// the respective type constraint. Therefore, the type argument's
@@ -772,24 +782,21 @@ func (u *unifier) nify(x, y Type, mode unifyMode, p *ifacePair) (result bool) {
 			// If y is also an unbound type parameter, we will end
 			// up here again with x and y swapped, so we don't
 			// need to take care of that case separately.
-			if cx := coreType(x); cx != nil {
+			if cx := CommonUnderlying(x); cx != nil {
 				if traceInference {
-					u.tracef("core %s ≡ %s", x, y)
+					u.tracef("core %s ≡ %s", xorig, yorig)
 				}
 				// If y is a defined type, it may not match against cx which
 				// is an underlying type (incl. int, string, etc.). Use assign
-				// mode here so that the unifier automatically takes under(y)
+				// mode here so that the unifier automatically uses y.Underlying()
 				// if necessary.
-				return u.nify(cx, y, assign, p)
+				return u.nify(cx, yorig, assign, p)
 			}
 		}
 		// x != y and there's nothing to do
 
-	case nil:
-		// avoid a crash in case of nil type
-
 	default:
-		panic(sprintf(nil, true, "u.nify(%s, %s, %d)", x, y, mode))
+		panic(sprintf(nil, true, "u.nify(%s, %s, %d)", xorig, yorig, mode))
 	}
 
 	return false

@@ -7,6 +7,7 @@
 package poll
 
 import (
+	"internal/strconv"
 	"internal/syscall/unix"
 	"io"
 	"sync/atomic"
@@ -69,6 +70,10 @@ func (fd *FD) Init(net string, pollable bool) error {
 		fd.isBlocking = 1
 	}
 	return err
+}
+
+func (fd *FD) ensureInit() error {
+	return nil
 }
 
 // Destroy closes the file descriptor. This is called when there are
@@ -147,7 +152,12 @@ func (fd *FD) Read(p []byte) (int, error) {
 		// without trying (but after acquiring the readLock).
 		// Otherwise syscall.Read returns 0, nil which looks like
 		// io.EOF.
-		// TODO(bradfitz): make it wait for readability? (Issue 15735)
+		//
+		// Waiting for readability instead was proposed in
+		// go.dev/cl/22031 and abandoned. Blocking would change
+		// the behavior of existing callers, and the netpoller's
+		// edge-triggered notifications alone cannot detect data
+		// that is already buffered. See go.dev/issue/15735.
 		return 0, nil
 	}
 	if err := fd.pd.prepareRead(fd.isFile); err != nil {
@@ -182,16 +192,9 @@ func (fd *FD) Pread(p []byte, off int64) (int, error) {
 	if fd.IsStream && len(p) > maxRW {
 		p = p[:maxRW]
 	}
-	var (
-		n   int
-		err error
-	)
-	for {
-		n, err = syscall.Pread(fd.Sysfd, p, off)
-		if err != syscall.EINTR {
-			break
-		}
-	}
+	n, err := ignoringEINTR2(func() (int, error) {
+		return syscall.Pread(fd.Sysfd, p, off)
+	})
 	if err != nil {
 		n = 0
 	}
@@ -296,12 +299,12 @@ func (fd *FD) ReadMsg(p []byte, oob []byte, flags int) (int, int, int, syscall.S
 			if err == syscall.EINTR {
 				continue
 			}
-			// TODO(dfc) should n and oobn be set to 0
 			if err == syscall.EAGAIN && fd.pd.pollable() {
 				if err = fd.pd.waitRead(fd.isFile); err == nil {
 					continue
 				}
 			}
+			n = 0
 		}
 		err = fd.eofError(n, err)
 		return n, oobn, sysflags, sa, err
@@ -323,12 +326,12 @@ func (fd *FD) ReadMsgInet4(p []byte, oob []byte, flags int, sa4 *syscall.Sockadd
 			if err == syscall.EINTR {
 				continue
 			}
-			// TODO(dfc) should n and oobn be set to 0
 			if err == syscall.EAGAIN && fd.pd.pollable() {
 				if err = fd.pd.waitRead(fd.isFile); err == nil {
 					continue
 				}
 			}
+			n = 0
 		}
 		err = fd.eofError(n, err)
 		return n, oobn, sysflags, err
@@ -350,12 +353,12 @@ func (fd *FD) ReadMsgInet6(p []byte, oob []byte, flags int, sa6 *syscall.Sockadd
 			if err == syscall.EINTR {
 				continue
 			}
-			// TODO(dfc) should n and oobn be set to 0
 			if err == syscall.EAGAIN && fd.pd.pollable() {
 				if err = fd.pd.waitRead(fd.isFile); err == nil {
 					continue
 				}
 			}
+			n = 0
 		}
 		err = fd.eofError(n, err)
 		return n, oobn, sysflags, err
@@ -379,6 +382,14 @@ func (fd *FD) Write(p []byte) (int, error) {
 		}
 		n, err := ignoringEINTRIO(syscall.Write, fd.Sysfd, p[nn:max])
 		if n > 0 {
+			if n > max-nn {
+				// This can reportedly happen when using
+				// some VPN software. Issue #61060.
+				// If we don't check this we will panic
+				// with slice bounds out of range.
+				// Use a more informative panic.
+				panic("invalid return from write: got " + strconv.Itoa(n) + " from a write of " + strconv.Itoa(max-nn))
+			}
 			nn += n
 		}
 		if nn == len(p) {
@@ -678,7 +689,7 @@ func (fd *FD) Dup() (int, string, error) {
 
 // On Unix variants only, expose the IO event for the net code.
 
-// WaitWrite waits until data can be read from fd.
+// WaitWrite waits until data can be written to fd.
 func (fd *FD) WaitWrite() error {
 	return fd.pd.waitWrite(fd.isFile)
 }

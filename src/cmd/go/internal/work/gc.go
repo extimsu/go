@@ -7,30 +7,33 @@ package work
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
+	"internal/buildcfg"
 	"internal/platform"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
+	"sync"
 
 	"cmd/go/internal/base"
+	"cmd/go/internal/build"
 	"cmd/go/internal/cfg"
+	"cmd/go/internal/fips140"
 	"cmd/go/internal/fsys"
 	"cmd/go/internal/gover"
 	"cmd/go/internal/load"
 	"cmd/go/internal/str"
+	"cmd/internal/pathcache"
 	"cmd/internal/quoted"
 	"crypto/sha1"
 )
 
 // Tests can override this by setting $TESTGO_TOOLCHAIN_VERSION.
 var ToolchainVersion = runtime.Version()
-
-// The 'path' used for GOROOT_FINAL when -trimpath is specified
-const trimPathGoRootFinal string = "$GOROOT"
 
 // The Go toolchain.
 
@@ -55,28 +58,37 @@ func pkgPath(a *Action) string {
 	return ppath
 }
 
-func (gcToolchain) gc(b *Builder, a *Action, archive string, importcfg, embedcfg []byte, symabis string, asmhdr bool, gofiles []string) (ofile string, output []byte, err error) {
+func (gcToolchain) gc(b *Builder, a *Action, export string, importcfg, embedcfg []byte, symabis string, asmhdr bool, pgoProfile, coverCfg string, gofiles []string) (ofile string, output []byte, compile *shellCmd, err error) {
 	p := a.Package
 	sh := b.Shell(a)
 	objdir := a.Objdir
-	if archive != "" {
-		ofile = archive
-	} else {
-		out := "_go_.o"
-		ofile = objdir + out
+
+	// earlyExport indicates we will create a named pipe and pass the -exportpipe flag to
+	// the compiler for it to signal when it is done writing the export data. The compiler
+	// writes the same output files independent of this.
+	// TODO(matloob,thepudds): Give a more precise description of exactly what earlyExport controls.
+	// TODO(matloob): Support early export with -toolexec, -x, and possibly other flags.
+	hasObjectAction := slices.ContainsFunc(a.triggers, func(t *Action) bool { return t.Mode == "build" && t.Package == a.Package })
+	earlyExport := export != "" && hasObjectAction && earlyExportSupported && !(cfg.BuildN || cfg.BuildX || len(cfg.BuildToolexec) > 0)
+	if export == "" {
+		export = objdir + "_go_.x"
 	}
+	ofile = objdir + "_go_.o"
 
 	pkgpath := pkgPath(a)
 	defaultGcFlags := []string{"-p", pkgpath}
+	vers := gover.Local()
 	if p.Module != nil {
 		v := p.Module.GoVersion
 		if v == "" {
 			v = gover.DefaultGoModVersion
 		}
+		// TODO(samthanawalla): Investigate when allowedVersion is not true.
 		if allowedVersion(v) {
-			defaultGcFlags = append(defaultGcFlags, "-lang=go"+gover.Lang(v))
+			vers = v
 		}
 	}
+	defaultGcFlags = append(defaultGcFlags, "-lang=go"+gover.Lang(vers))
 	if p.Standard {
 		defaultGcFlags = append(defaultGcFlags, "-std")
 	}
@@ -111,11 +123,11 @@ func (gcToolchain) gc(b *Builder, a *Action, archive string, importcfg, embedcfg
 	if strings.HasPrefix(ToolchainVersion, "go1") && !strings.Contains(os.Args[0], "go_bootstrap") {
 		defaultGcFlags = append(defaultGcFlags, "-goversion", ToolchainVersion)
 	}
-	if p.Internal.Cover.Cfg != "" {
-		defaultGcFlags = append(defaultGcFlags, "-coveragecfg="+p.Internal.Cover.Cfg)
+	if coverCfg != "" {
+		defaultGcFlags = append(defaultGcFlags, "-coveragecfg="+coverCfg)
 	}
-	if p.Internal.PGOProfile != "" {
-		defaultGcFlags = append(defaultGcFlags, "-pgoprofile="+p.Internal.PGOProfile)
+	if pgoProfile != "" {
+		defaultGcFlags = append(defaultGcFlags, "-pgoprofile="+pgoProfile)
 	}
 	if symabis != "" {
 		defaultGcFlags = append(defaultGcFlags, "-symabis", symabis)
@@ -125,43 +137,60 @@ func (gcToolchain) gc(b *Builder, a *Action, archive string, importcfg, embedcfg
 	if p.Internal.FuzzInstrument {
 		gcflags = append(gcflags, fuzzInstrumentFlags()...)
 	}
+	if importcfg != nil {
+		if err := sh.writeFile(objdir+"importcfg", importcfg); err != nil {
+			return "", nil, nil, err
+		}
+	}
+	if embedcfg != nil {
+		if err := sh.writeFile(objdir+"embedcfg", embedcfg); err != nil {
+			return "", nil, nil, err
+		}
+	}
+	var ep *exportPipe
+	if earlyExport {
+		var perr error
+		ep, perr = newExportPipe(objdir)
+		if perr != nil {
+			// Fall back to waiting for the full compile if creating
+			// the named pipe fails (for example, on a filesystem
+			// that does not support FIFOs).
+			earlyExport = false
+		}
+	}
+
 	// Add -c=N to use concurrent backend compilation, if possible.
-	if c := gcBackendConcurrency(gcflags); c > 1 {
+	c, release := compilerConcurrency()
+	if c > 1 {
 		defaultGcFlags = append(defaultGcFlags, fmt.Sprintf("-c=%d", c))
 	}
 
-	args := []any{cfg.BuildToolexec, base.Tool("compile"), "-o", ofile, "-trimpath", a.trimpath(), defaultGcFlags, gcflags}
+	args := []any{cfg.BuildToolexec, base.Tool("compile"), "-o", export, "-linkobj", ofile, "-trimpath", a.trimpath(), defaultGcFlags, gcflags}
 	if p.Internal.LocalPrefix == "" {
 		args = append(args, "-nolocalimports")
 	} else {
 		args = append(args, "-D", p.Internal.LocalPrefix)
 	}
 	if importcfg != nil {
-		if err := sh.writeFile(objdir+"importcfg", importcfg); err != nil {
-			return "", nil, err
-		}
 		args = append(args, "-importcfg", objdir+"importcfg")
 	}
 	if embedcfg != nil {
-		if err := sh.writeFile(objdir+"embedcfg", embedcfg); err != nil {
-			return "", nil, err
-		}
 		args = append(args, "-embedcfg", objdir+"embedcfg")
-	}
-	if ofile == archive {
-		args = append(args, "-pack")
 	}
 	if asmhdr {
 		args = append(args, "-asmhdr", objdir+"go_asm.h")
+	}
+	if earlyExport {
+		args = append(args, "-exportpipe="+ep.name())
 	}
 
 	for _, f := range gofiles {
 		f := mkAbs(p.Dir, f)
 
-		// Handle overlays. Convert path names using OverlayPath
+		// Handle overlays. Convert path names using fsys.Actual
 		// so these paths can be handed directly to tools.
 		// Deleted files won't show up in when scanning directories earlier,
-		// so OverlayPath will never return "" (meaning a deleted file) here.
+		// so Actual will never return "" (meaning a deleted file) here.
 		// TODO(#39958): Handle cases where the package directory
 		// doesn't exist on disk (this can happen when all the package's
 		// files are in an overlay): the code expects the package directory
@@ -170,40 +199,35 @@ func (gcToolchain) gc(b *Builder, a *Action, archive string, importcfg, embedcfg
 		// gofiles, cgofiles, cfiles, sfiles, and cxxfiles variables are
 		// created in (*Builder).build. Doing that requires rewriting the
 		// code that uses those values to expect absolute paths.
-		f, _ = fsys.OverlayPath(f)
-
-		args = append(args, f)
+		args = append(args, fsys.Actual(f))
 	}
-
-	output, err = sh.runOut(base.Cwd(), nil, args...)
-	return ofile, output, err
+	if !earlyExport {
+		defer release()
+		output, err = sh.runOut(base.Cwd(), cfgChangedEnv, args...)
+		return ofile, output, nil, err
+	}
+	done := func() {
+		ep.close()
+		release()
+	}
+	sc, err := sh.startOut(base.Cwd(), cfgChangedEnv, done, args...)
+	if err != nil || sc == nil {
+		done()
+		return ofile, nil, nil, err
+	}
+	if err := ep.wait(); err != nil {
+		output, werr := sc.wait()
+		if werr != nil || errors.Is(err, io.EOF) {
+			return ofile, output, nil, werr
+		}
+		return ofile, output, nil, err
+	}
+	return ofile, nil, sc, nil
 }
 
-// gcBackendConcurrency returns the backend compiler concurrency level for a package compilation.
-func gcBackendConcurrency(gcflags []string) int {
-	// First, check whether we can use -c at all for this compilation.
-	canDashC := concurrentGCBackendCompilationEnabledByDefault
-
-	switch e := os.Getenv("GO19CONCURRENTCOMPILATION"); e {
-	case "0":
-		canDashC = false
-	case "1":
-		canDashC = true
-	case "":
-		// Not set. Use default.
-	default:
-		log.Fatalf("GO19CONCURRENTCOMPILATION must be 0, 1, or unset, got %q", e)
-	}
-
-	// TODO: Test and delete these conditions.
-	if cfg.ExperimentErr != nil || cfg.Experiment.FieldTrack || cfg.Experiment.PreemptibleLoops {
-		canDashC = false
-	}
-
-	if !canDashC {
-		return 1
-	}
-
+// compilerConcurrency returns the compiler concurrency level for a package compilation.
+// The returned function must be called after the compile finishes.
+func compilerConcurrency() (int, func()) {
 	// Decide how many concurrent backend compilations to allow.
 	//
 	// If we allow too many, in theory we might end up with p concurrent processes,
@@ -214,29 +238,66 @@ func gcBackendConcurrency(gcflags []string) int {
 	// of the overall compiler execution, so c==1 for much of the build.
 	// So don't worry too much about that interaction for now.
 	//
-	// However, in practice, setting c above 4 tends not to help very much.
-	// See the analysis in CL 41192.
+	// But to keep things reasonable, we maintain a cap on the total number of
+	// concurrent backend compiles. (If we gave each compile action the full GOMAXPROCS, we could
+	// potentially have GOMAXPROCS^2 running compile goroutines) In the past, we'd limit
+	// the number of concurrent backend compiles per process to 4, which would result in a worst-case number
+	// of backend compiles of 4*cfg.BuildP. Because some compile processes benefit from having
+	// a larger number of compiles, especially when the compile action is the only
+	// action running, we'll allow the max value to be larger, but ensure that the
+	// total number of backend compiles never exceeds that previous worst-case number.
+	// This is implemented using a pool of tokens that are given out. We'll set aside enough
+	// tokens to make sure we don't run out, and then give half of the remaining tokens (up to
+	// GOMAXPROCS) to each compile action that requests it.
 	//
-	// TODO(josharian): attempt to detect whether this particular compilation
-	// is likely to be a bottleneck, e.g. when:
-	//   - it has no successor packages to compile (usually package main)
-	//   - all paths through the build graph pass through it
-	//   - critical path scheduling says it is high priority
-	// and in such a case, set c to runtime.GOMAXPROCS(0).
-	// By default this is the same as runtime.NumCPU.
-	// We do this now when p==1.
-	// To limit parallelism, set GOMAXPROCS below numCPU; this may be useful
+	// As a user, to limit parallelism, set GOMAXPROCS below numCPU; this may be useful
 	// on a low-memory builder, or if a deterministic build order is required.
-	c := runtime.GOMAXPROCS(0)
 	if cfg.BuildP == 1 {
 		// No process parallelism, do not cap compiler parallelism.
-		return c
+		return maxCompilerConcurrency, func() {}
 	}
-	// Some process parallelism. Set c to min(4, maxprocs).
-	if c > 4 {
-		c = 4
+
+	// Cap compiler parallelism using the pool.
+	tokensMu.Lock()
+	defer tokensMu.Unlock()
+	concurrentProcesses++
+	// Set aside tokens so that we don't run out if we were running cfg.BuildP concurrent compiles.
+	// We'll set aside one token for each of the action goroutines that aren't currently running a compile.
+	setAside := (cfg.BuildP - concurrentProcesses) * minTokens
+	availableTokens := tokens - setAside
+	// Grab half the remaining tokens: but with a floor of at least minTokens token, and
+	// a ceiling of the max backend concurrency.
+	c := max(min(availableTokens/2, maxCompilerConcurrency), minTokens)
+	tokens -= c
+	// Successfully grabbed the tokens.
+	return c, func() {
+		tokensMu.Lock()
+		defer tokensMu.Unlock()
+		concurrentProcesses--
+		tokens += c
 	}
-	return c
+}
+
+var maxCompilerConcurrency = runtime.GOMAXPROCS(0) // max value we will use for -c
+
+var (
+	tokensMu            sync.Mutex
+	totalTokens         int // total number of tokens: this is used for checking that we get them all back in the end
+	tokens              int // number of available tokens
+	concurrentProcesses int // number of currently running compiles
+	minTokens           int // minimum number of tokens to give out
+)
+
+// initCompilerConcurrencyPool sets the number of tokens in the pool. It needs
+// to be run after init, so that it can use the value of cfg.BuildP.
+func initCompilerConcurrencyPool() {
+	// Size the pool to allow 2*maxCompilerConcurrency extra tokens to
+	// be distributed amongst the compile actions in addition to the minimum
+	// of min(4,GOMAXPROCS) tokens for each of the potentially cfg.BuildP
+	// concurrently running compile actions.
+	minTokens = min(4, maxCompilerConcurrency)
+	tokens = 2*maxCompilerConcurrency + minTokens*cfg.BuildP
+	totalTokens = tokens
 }
 
 // trimpath returns the -trimpath argument to use
@@ -246,15 +307,32 @@ func (a *Action) trimpath() string {
 	// The trimmed paths are a little different, but we need to trim in the
 	// same situations.
 
-	// Strip the object directory entirely.
-	objdir := a.Objdir
-	if len(objdir) > 1 && objdir[len(objdir)-1] == filepath.Separator {
-		objdir = objdir[:len(objdir)-1]
+	// Strip the object directories of this action and any cover or cgo actions
+	// that generate source files compiled or assembled here.
+	objdir := strings.TrimSuffix(a.Objdir, string(filepath.Separator))
+	objdirs := []string{objdir}
+	deps := a.Deps
+	if a.Mode == "build" && len(a.Deps) > 0 {
+		deps = a.Deps[0].Deps
+	}
+	for _, dep := range deps {
+		switch dep.Mode {
+		case "cover", "cgo run", "collect cgo":
+			if dep.Objdir != "" && dep.Objdir != a.Objdir {
+				d := strings.TrimSuffix(dep.Objdir, string(filepath.Separator))
+				if !slices.Contains(objdirs, d) {
+					objdirs = append(objdirs, d)
+				}
+			}
+		}
 	}
 	rewrite := ""
 
 	rewriteDir := a.Package.Dir
-	if cfg.BuildTrimpath {
+	if trimpathInvariant(a.Package) {
+		// The compiler does this by itself, except for overlaid files.
+		rewriteDir = filepath.Join("$GOROOT", "src", a.Package.Internal.OrigImportPath)
+	} else if cfg.BuildTrimpath {
 		importPath := a.Package.Internal.OrigImportPath
 		if m := a.Package.Module; m != nil && m.Version != "" {
 			rewriteDir = m.Path + "@" + m.Version + strings.TrimPrefix(importPath, m.Path)
@@ -288,17 +366,19 @@ func (a *Action) trimpath() string {
 			base := filepath.Base(path)
 			isGo := strings.HasSuffix(filename, ".go") || strings.HasSuffix(filename, ".s")
 			isCgo := cgoFiles[filename] || !isGo
-			overlayPath, isOverlay := fsys.OverlayPath(path)
-			if isCgo && isOverlay {
-				hasCgoOverlay = true
-			}
-			if !isCgo && isOverlay {
-				rewrite += overlayPath + "=>" + filepath.Join(rewriteDir, base) + ";"
+			if fsys.Replaced(path) {
+				if isCgo {
+					hasCgoOverlay = true
+				} else {
+					rewrite += fsys.Actual(path) + "=>" + filepath.Join(rewriteDir, base) + ";"
+				}
 			} else if isCgo {
 				// Generate rewrites for non-Go files copied to files in objdir.
 				if filepath.Dir(path) == a.Package.Dir {
 					// This is a file copied to objdir.
-					overlayNonGoRewrites += filepath.Join(objdir, base) + "=>" + filepath.Join(rewriteDir, base) + ";"
+					for _, d := range objdirs {
+						overlayNonGoRewrites += filepath.Join(d, base) + "=>" + filepath.Join(rewriteDir, base) + ";"
+					}
 				}
 			} else {
 				// Non-overlay Go files are covered by the a.Package.Dir rewrite rule above.
@@ -308,7 +388,12 @@ func (a *Action) trimpath() string {
 	if hasCgoOverlay {
 		rewrite += overlayNonGoRewrites
 	}
-	rewrite += objdir + "=>"
+	for i, d := range objdirs {
+		if i > 0 {
+			rewrite += ";"
+		}
+		rewrite += d + "=>"
+	}
 
 	return rewrite
 }
@@ -324,6 +409,10 @@ func asmArgs(a *Action, p *load.Package) []any {
 				args = append(args, "-D=GOBUILDMODE_shared=1")
 			}
 		}
+	}
+
+	if p.Standard {
+		args = append(args, "-std")
 	}
 
 	if cfg.Goarch == "386" {
@@ -361,17 +450,30 @@ func asmArgs(a *Action, p *load.Package) []any {
 		}
 	}
 
+	if cfg.Goarch == "riscv64" {
+		// Define GORISCV64_value from cfg.GORISCV64.
+		args = append(args, "-D", "GORISCV64_"+cfg.GORISCV64)
+	}
+
 	if cfg.Goarch == "arm" {
-		// Define GOARM_value from cfg.GOARM.
-		switch cfg.GOARM {
-		case "7":
+		// Define GOARM_value from cfg.GOARM, which can be either a version
+		// like "6", or a version and a FP mode, like "7,hardfloat".
+		switch {
+		case strings.Contains(cfg.GOARM, "7"):
 			args = append(args, "-D", "GOARM_7")
 			fallthrough
-		case "6":
+		case strings.Contains(cfg.GOARM, "6"):
 			args = append(args, "-D", "GOARM_6")
 			fallthrough
 		default:
 			args = append(args, "-D", "GOARM_5")
+		}
+	}
+
+	if cfg.Goarch == "arm64" {
+		g, err := buildcfg.ParseGoarm64(cfg.GOARM64)
+		if err == nil && g.LSE {
+			args = append(args, "-D", "GOARM64_LSE")
 		}
 	}
 
@@ -384,11 +486,10 @@ func (gcToolchain) asm(b *Builder, a *Action, sfiles []string) ([]string, error)
 
 	var ofiles []string
 	for _, sfile := range sfiles {
-		overlayPath, _ := fsys.OverlayPath(mkAbs(p.Dir, sfile))
-		ofile := a.Objdir + sfile[:len(sfile)-len(".s")] + ".o"
+		ofile := a.Objdir + strings.TrimSuffix(filepath.Base(sfile), ".s") + ".o"
 		ofiles = append(ofiles, ofile)
-		args1 := append(args, "-o", ofile, overlayPath)
-		if err := b.Shell(a).run(p.Dir, p.ImportPath, nil, args1...); err != nil {
+		args1 := append(args, "-o", ofile, fsys.Actual(mkAbs(p.Dir, sfile)))
+		if err := b.Shell(a).run(p.Dir, p.ImportPath, cfgChangedEnv, args1...); err != nil {
 			return nil, err
 		}
 	}
@@ -405,8 +506,7 @@ func (gcToolchain) symabis(b *Builder, a *Action, sfiles []string) (string, erro
 			if p.ImportPath == "runtime/cgo" && strings.HasPrefix(sfile, "gcc_") {
 				continue
 			}
-			op, _ := fsys.OverlayPath(mkAbs(p.Dir, sfile))
-			args = append(args, op)
+			args = append(args, fsys.Actual(mkAbs(p.Dir, sfile)))
 		}
 
 		// Supply an empty go_asm.h as if the compiler had been run.
@@ -416,7 +516,7 @@ func (gcToolchain) symabis(b *Builder, a *Action, sfiles []string) (string, erro
 			return err
 		}
 
-		return sh.run(p.Dir, p.ImportPath, nil, args...)
+		return sh.run(p.Dir, p.ImportPath, cfgChangedEnv, args...)
 	}
 
 	var symabis string // Only set if we actually create the file
@@ -431,34 +531,8 @@ func (gcToolchain) symabis(b *Builder, a *Action, sfiles []string) (string, erro
 	return symabis, nil
 }
 
-// toolVerify checks that the command line args writes the same output file
-// if run using newTool instead.
-// Unused now but kept around for future use.
-func toolVerify(a *Action, b *Builder, p *load.Package, newTool string, ofile string, args []any) error {
-	newArgs := make([]any, len(args))
-	copy(newArgs, args)
-	newArgs[1] = base.Tool(newTool)
-	newArgs[3] = ofile + ".new" // x.6 becomes x.6.new
-	if err := b.Shell(a).run(p.Dir, p.ImportPath, nil, newArgs...); err != nil {
-		return err
-	}
-	data1, err := os.ReadFile(ofile)
-	if err != nil {
-		return err
-	}
-	data2, err := os.ReadFile(ofile + ".new")
-	if err != nil {
-		return err
-	}
-	if !bytes.Equal(data1, data2) {
-		return fmt.Errorf("%s and %s produced different output files:\n%s\n%s", filepath.Base(args[1].(string)), newTool, strings.Join(str.StringList(args...), " "), strings.Join(str.StringList(newArgs...), " "))
-	}
-	os.Remove(ofile + ".new")
-	return nil
-}
-
 func (gcToolchain) pack(b *Builder, a *Action, afile string, ofiles []string) error {
-	var absOfiles []string
+	absOfiles := make([]string, 0, len(ofiles))
 	for _, f := range ofiles {
 		absOfiles = append(absOfiles, mkAbs(a.Objdir, f))
 	}
@@ -475,7 +549,7 @@ func (gcToolchain) pack(b *Builder, a *Action, afile string, ofiles []string) er
 	p := a.Package
 	sh := b.Shell(a)
 	if cfg.BuildN || cfg.BuildX {
-		cmdline := str.StringList(base.Tool("pack"), "r", absAfile, absOfiles)
+		cmdline := str.StringList("go", "tool", "pack", "r", absAfile, absOfiles)
 		sh.ShowCmd(p.Dir, "%s # internal", joinUnambiguously(cmdline))
 	}
 	if cfg.BuildN {
@@ -505,11 +579,31 @@ func packInternal(afile string, ofiles []string) error {
 			src.Close()
 			return err
 		}
+		if filepath.Base(ofile) == "_go_.o" {
+			header := []byte("!<arch>\n")
+			b := make([]byte, len(header))
+			// If this is an archive, copy the inner entries over.
+			if _, err := io.ReadFull(src, b[:]); err == nil && bytes.Equal(header, b) {
+				_, err := io.Copy(w, src)
+				src.Close()
+				if err != nil {
+					return fmt.Errorf("copying %s to %s: %v", ofile, afile, err)
+				}
+				continue
+			}
+			// Otherwise, seek back to the beginning and continue to add
+			// the full file to the archive.
+			src.Seek(0, 0)
+		}
 		// Note: Not using %-16.16s format because we care
 		// about bytes, not runes.
 		name := fi.Name()
 		if len(name) > 16 {
-			name = name[:16]
+			if strings.HasSuffix(name, ".syso") {
+				name = name[:16-len(".syso")] + ".syso"
+			} else {
+				name = name[:16]
+			}
 		} else {
 			name += strings.Repeat(" ", 16-len(name))
 		}
@@ -570,14 +664,14 @@ func pluginPath(a *Action) string {
 		// For linking, use the main package's build ID instead of
 		// the binary's build ID, so it is the same hash used in
 		// compiling and linking.
-		// When compiling, we use actionID/actionID (instead of
-		// actionID/contentID) as a temporary build ID to compute
+		// When compiling, we use actionID/actionID/actionID, instead of
+		// actionID/contentID(export)/contentID(object), as a temporary build ID to compute
 		// the hash. Do the same here. (See buildid.go:useCache)
 		// The build ID matters because it affects the overall hash
 		// in the plugin's pseudo-import path returned below.
 		// We need to use the same import path when compiling and linking.
 		id := strings.Split(buildID, buildIDSeparator)
-		buildID = id[1] + buildIDSeparator + id[1]
+		buildID = id[1] + buildIDSeparator + id[1] + buildIDSeparator + id[1]
 	}
 	fmt.Fprintf(h, "build ID: %s\n", buildID)
 	for _, file := range str.StringList(p.GoFiles, p.CgoFiles, p.SFiles) {
@@ -606,6 +700,9 @@ func (gcToolchain) ld(b *Builder, root *Action, targetPath, importcfg, mainpkg s
 	}
 	if cfg.BuildBuildmode == "plugin" {
 		ldflags = append(ldflags, "-pluginpath", pluginPath(root))
+	}
+	if fips140.Enabled() {
+		ldflags = append(ldflags, "-fipso", filepath.Join(root.Objdir, "fips.o"))
 	}
 
 	// Store BuildID inside toolchain binaries as a unique identifier of the
@@ -641,6 +738,9 @@ func (gcToolchain) ld(b *Builder, root *Action, targetPath, importcfg, mainpkg s
 	}
 	ldflags = append(ldflags, forcedLdflags...)
 	ldflags = append(ldflags, root.Package.Internal.Ldflags...)
+	if err := checkBindingExternalLinker(root, ldBuildmode, cxx, compiler, ldflags); err != nil {
+		return err
+	}
 	ldflags, err := setextld(ldflags, compiler)
 	if err != nil {
 		return err
@@ -662,11 +762,96 @@ func (gcToolchain) ld(b *Builder, root *Action, targetPath, importcfg, mainpkg s
 		dir, targetPath = filepath.Split(targetPath)
 	}
 
-	env := []string{}
-	if cfg.BuildTrimpath {
-		env = append(env, "GOROOT_FINAL="+trimPathGoRootFinal)
+	return b.Shell(root).run(dir, root.Package.ImportPath, linkEnv(), cfg.BuildToolexec, base.Tool("link"), "-o", targetPath, "-importcfg", importcfg, ldflags, mainpkg)
+}
+
+// linkEnv returns the environment for the linker.
+func linkEnv() []string {
+	env := append(slices.Clip(cfgChangedEnv), "GOROOT="+linkGOROOT())
+	if cfg.RestrictedBuild() {
+		env = append(env, "GORESTRICTEDBUILD=1")
+	} else {
+		env = append(env, "GORESTRICTEDBUILD=0")
 	}
-	return b.Shell(root).run(dir, root.Package.ImportPath, env, cfg.BuildToolexec, base.Tool("link"), "-o", targetPath, "-importcfg", importcfg, ldflags, mainpkg)
+	return env
+}
+
+// linkGOROOT returns the GOROOT that the linker expands "$GOROOT" to.
+// It is empty with -trimpath, to trim those paths instead.
+func linkGOROOT() string {
+	if cfg.BuildTrimpath {
+		return ""
+	}
+	return cfg.GOROOT
+}
+
+// checkBindingExternalLinker reports an error if a program built with
+// CGO_ENABLED=bindings must be linked externally on the target platform
+// but no C toolchain for the target is available. Without this check,
+// cross-compiling for such a target would silently invoke the host's C
+// compiler as the external linker (for example, when building for
+// android/amd64 on linux/amd64 with CC unset).
+func checkBindingExternalLinker(root *Action, ldBuildmode string, cxx bool, compiler, ldflags []string) error {
+	if cfg.BuildContext.CgoEnabled != build.CgoBindings || cfg.BuildN {
+		return nil
+	}
+	if !bindingNeedsExternalLink(ldBuildmode) {
+		return nil
+	}
+	// The link action depends on all packages in the program.
+	if !slices.ContainsFunc(root.Deps, func(a *Action) bool { return a.Package != nil && a.Package.ImportPath == "runtime/cgo" }) {
+		return nil
+	}
+	if cfg.RestrictedBuild() {
+		return fmt.Errorf("cgo bindings on %s/%s require external linking, which is not allowed when GORESTRICTEDBUILD=1", cfg.Goos, cfg.Goarch)
+	}
+	if slices.ContainsFunc(ldflags, func(f string) bool {
+		return f == "-extld" || f == "--extld" || strings.HasPrefix(f, "-extld=") || strings.HasPrefix(f, "--extld=")
+	}) {
+		return nil
+	}
+	envName, defaultCC := "CC", cfg.DefaultCC
+	if cxx {
+		envName, defaultCC = "CXX", cfg.DefaultCXX
+	}
+	// cmd/go sets CC and CXX in its own environment (see cfg.CmdEnv),
+	// so check whether the user changed them rather than whether they
+	// are set. Also treat the built-in generic defaults ("gcc", "clang",
+	// "g++", "clang++") as unset for a cross-compile, since DefaultCC
+	// returns "clang" on darwin/ios/freebsd/openbsd and "gcc" elsewhere
+	// even when no target-specific cross-compiler was configured.
+	ccChanged := slices.ContainsFunc(cfg.CmdEnv, func(e cfg.EnvVar) bool { return e.Name == envName && e.Changed })
+	def := defaultCC(cfg.Goos, cfg.Goarch)
+	crossWithoutCC := (cfg.Goos != runtime.GOOS || cfg.Goarch != runtime.GOARCH) && !ccChanged &&
+		(def == defaultCC(runtime.GOOS, runtime.GOARCH) || def == "gcc" || def == "clang" || def == "g++" || def == "clang++")
+	missingCC := len(compiler) == 0
+	if !missingCC {
+		_, err := pathcache.LookPath(compiler[0])
+		missingCC = err != nil
+	}
+	if !crossWithoutCC && !missingCC {
+		return nil
+	}
+	return fmt.Errorf("cgo bindings on %s/%s require an external linker (C toolchain); set %s or use CGO_ENABLED=0 (or pass -ldflags=-extld=<linker>)", cfg.Goos, cfg.Goarch, envName)
+}
+
+// bindingNeedsExternalLink reports whether cmd/link must use the external
+// linker for a program using cgo bindings built with the given link
+// buildmode. It mirrors mustLinkExternal in cmd/link/internal/ld.
+func bindingNeedsExternalLink(ldBuildmode string) bool {
+	// Programs using cgo bindings have no C host objects.
+	if platform.MustLinkExternalWithoutHostObj(cfg.Goos, cfg.Goarch) {
+		return true
+	}
+	switch ldBuildmode {
+	case "c-shared", "plugin", "shared":
+		// c-archive is not listed: the external linker for a c-archive
+		// is the host archiver, not the C compiler.
+		return cfg.Goarch != "wasm"
+	case "pie":
+		return !platform.InternalLinkPIESupported(cfg.Goos, cfg.Goarch)
+	}
+	return false
 }
 
 func (gcToolchain) ldShared(b *Builder, root *Action, toplevelactions []*Action, targetPath, importcfg string, allactions []*Action) error {
@@ -700,7 +885,21 @@ func (gcToolchain) ldShared(b *Builder, root *Action, toplevelactions []*Action,
 		}
 		ldflags = append(ldflags, d.Package.ImportPath+"="+d.Target)
 	}
-	return b.Shell(root).run(".", targetPath, nil, cfg.BuildToolexec, base.Tool("link"), "-o", targetPath, "-importcfg", importcfg, ldflags)
+
+	// On OS X when using external linking to build a shared library,
+	// the argument passed here to -o ends up recorded in the final
+	// shared library in the LC_ID_DYLIB load command.
+	// To avoid putting the temporary output directory name there
+	// (and making the resulting shared library useless),
+	// run the link in the output directory so that -o can name
+	// just the final path element.
+	// On Windows, DLL file name is recorded in PE file
+	// export section, so do like on OS X.
+	// On Linux, for a shared object, at least with the Gold linker,
+	// the output file path is recorded in the .gnu.version_d section.
+	dir, targetPath := filepath.Split(targetPath)
+
+	return b.Shell(root).run(dir, targetPath, linkEnv(), cfg.BuildToolexec, base.Tool("link"), "-o", targetPath, "-importcfg", importcfg, ldflags)
 }
 
 func (gcToolchain) cc(b *Builder, a *Action, ofile, cfile string) error {

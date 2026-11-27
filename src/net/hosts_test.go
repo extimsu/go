@@ -5,9 +5,12 @@
 package net
 
 import (
-	"reflect"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 type staticHostEntry struct {
@@ -73,7 +76,7 @@ func testStaticHost(t *testing.T, hostsPath string, ent staticHostEntry) {
 	ins := []string{ent.in, absDomainName(ent.in), strings.ToLower(ent.in), strings.ToUpper(ent.in)}
 	for _, in := range ins {
 		addrs, _ := lookupStaticHost(in)
-		if !reflect.DeepEqual(addrs, ent.out) {
+		if !slices.Equal(addrs, ent.out) {
 			t.Errorf("%s, lookupStaticHost(%s) = %v; want %v", hostsPath, in, addrs, ent.out)
 		}
 	}
@@ -143,7 +146,7 @@ func testStaticAddr(t *testing.T, hostsPath string, ent staticHostEntry) {
 	for i := range ent.out {
 		ent.out[i] = absDomainName(ent.out[i])
 	}
-	if !reflect.DeepEqual(hosts, ent.out) {
+	if !slices.Equal(hosts, ent.out) {
 		t.Errorf("%s, lookupStaticAddr(%s) = %v; want %v", hostsPath, ent.in, hosts, ent.out)
 	}
 }
@@ -211,4 +214,37 @@ func testLookupStaticHostAliases(t *testing.T, lookup, lookupRes string) {
 			t.Errorf("lookupStaticHost(%v): got %v, want %v", in, res, lookupRes)
 		}
 	}
+}
+
+func TestHostCacheFileReplaced(t *testing.T) {
+	defer func(orig string) { hostsFilePath = orig }(hostsFilePath)
+
+	dir := t.TempDir()
+	hp := filepath.Join(dir, "hosts")
+	if err := os.WriteFile(hp, []byte("192.168.1.1 myhost\n"), 0666); err != nil {
+		t.Fatal(err)
+	}
+	replacement := filepath.Join(dir, "newhosts")
+	if err := os.WriteFile(replacement, []byte("192.168.1.2 myhost\n"), 0666); err != nil {
+		t.Fatal(err)
+	}
+	// Give both files the same modification time and size, so that only the
+	// file identity tells them apart. See https://go.dev/issue/81565.
+	mtime := time.Unix(1136214245, 0)
+	for _, name := range []string{hp, replacement} {
+		if err := os.Chtimes(name, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	hostsFilePath = hp
+	testStaticHost(t, hp, staticHostEntry{"myhost", []string{"192.168.1.1"}})
+
+	if err := os.Rename(replacement, hp); err != nil {
+		t.Fatal(err)
+	}
+	hosts.Lock()
+	hosts.expire = time.Now().Add(-cacheMaxAge)
+	hosts.Unlock()
+	testStaticHost(t, hp, staticHostEntry{"myhost", []string{"192.168.1.2"}})
 }

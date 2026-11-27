@@ -12,13 +12,15 @@ import (
 	"net/netip"
 	"reflect"
 	"runtime"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+var goResolver = Resolver{PreferGo: true}
 
 func hasSuffixFold(s, suffix string) bool {
 	return strings.HasSuffix(strings.ToLower(s), strings.ToLower(suffix))
@@ -244,14 +246,10 @@ func TestLookupGmailTXT(t *testing.T) {
 		if len(txts) == 0 {
 			t.Error("got no record")
 		}
-		found := false
-		for _, txt := range txts {
-			if strings.Contains(txt, tt.txt) && (strings.HasSuffix(txt, tt.host) || strings.HasSuffix(txt, tt.host+".")) {
-				found = true
-				break
-			}
-		}
-		if !found {
+
+		if !slices.ContainsFunc(txts, func(txt string) bool {
+			return strings.Contains(txt, tt.txt) && (strings.HasSuffix(txt, tt.host) || strings.HasSuffix(txt, tt.host+"."))
+		}) {
 			t.Errorf("got %v; want a record containing %s, %s", txts, tt.txt, tt.host)
 		}
 	}
@@ -300,14 +298,7 @@ func TestLookupIPv6LinkLocalAddr(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	found := false
-	for _, addr := range addrs {
-		if addr == "fe80::1%lo0" {
-			found = true
-			break
-		}
-	}
-	if !found {
+	if !slices.Contains(addrs, "fe80::1%lo0") {
 		t.Skipf("not supported on %s", runtime.GOOS)
 	}
 	if _, err := LookupAddr("fe80::1%lo0"); err != nil {
@@ -341,11 +332,49 @@ func TestLookupIPv6LinkLocalAddrWithZone(t *testing.T) {
 	}
 }
 
+func TestLookupNetIPPreservesZone(t *testing.T) {
+	origTestHookLookupIP := testHookLookupIP
+	t.Cleanup(func() {
+		testHookLookupIP = origTestHookLookupIP
+	})
+	defer dnsWaitGroup.Wait()
+
+	const name = "desktop.local"
+	want := netip.MustParseAddr("fe80::1%lo0")
+	testHookLookupIP = func(
+		ctx context.Context,
+		fn func(context.Context, string, string) ([]IPAddr, error),
+		network string,
+		host string,
+	) ([]IPAddr, error) {
+		if host == name {
+			return []IPAddr{
+				{
+					IP:   want.AsSlice(),
+					Zone: want.Zone(),
+				},
+			}, nil
+		}
+		return nil, newDNSError(errNoSuchHost, host, "")
+	}
+
+	ips, err := DefaultResolver.LookupNetIP(t.Context(), "ip", name)
+	if err != nil {
+		t.Fatalf("DefaultResolver.LookupNetIP() failed: %v", err)
+	}
+	if len(ips) == 0 {
+		t.Fatal("DefaultResolver.LookupNetIP() returned no IPs")
+	}
+	if ips[0] != want {
+		t.Errorf("DefaultResolver.LookupNetIP() = %v, want %v", ips[0], want)
+	}
+}
+
 var lookupCNAMETests = []struct {
 	name, cname string
 }{
-	{"www.iana.org", "icann.org."},
-	{"www.iana.org.", "icann.org."},
+	{"www.golang.org", "golang.org."},
+	{"www.golang.org.", "golang.org."},
 	{"www.google.com", "google.com."},
 	{"google.com", "google.com."},
 	{"cname-to-txt.go4.org", "test-txt-record.go4.org."},
@@ -426,12 +455,12 @@ func TestLookupLongTXT(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sort.Strings(txts)
+	slices.Sort(txts)
 	want := []string{
 		strings.Repeat("abcdefghijklmnopqrstuvwxyABCDEFGHJIKLMNOPQRSTUVWXY", 10),
 		"gophers rule",
 	}
-	if !reflect.DeepEqual(txts, want) {
+	if !slices.Equal(txts, want) {
 		t.Fatalf("LookupTXT golang.rsc.io incorrect\nhave %q\nwant %q", txts, want)
 	}
 }
@@ -778,6 +807,8 @@ func TestLookupPort(t *testing.T) {
 		{"udp", "-1", 0, false},
 		{"udp", "65536", 0, false},
 		{"tcp", "123456789", 0, false},
+		{"tcp", "4294985376", 0, false},
+		{"tcp", "bad\x00port", 0, false},
 
 		// Issue 13610: LookupPort("tcp", "")
 		{"tcp", "", 0, true},
@@ -1429,8 +1460,8 @@ func testLookupNoData(t *testing.T, prefix string) {
 			return
 		}
 
-		var dnsErr *DNSError
-		if errors.As(err, &dnsErr) {
+		dnsErr, ok := errors.AsType[*DNSError](err)
+		if ok {
 			succeeded := true
 			if !dnsErr.IsNotFound {
 				succeeded = false
@@ -1464,8 +1495,7 @@ func testLookupNoData(t *testing.T, prefix string) {
 func TestLookupPortNotFound(t *testing.T) {
 	allResolvers(t, func(t *testing.T) {
 		_, err := LookupPort("udp", "_-unknown-service-")
-		var dnsErr *DNSError
-		if !errors.As(err, &dnsErr) || !dnsErr.IsNotFound {
+		if dnsErr, ok := errors.AsType[*DNSError](err); !ok || !dnsErr.IsNotFound {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -1484,8 +1514,7 @@ var tcpOnlyService = func() string {
 func TestLookupPortDifferentNetwork(t *testing.T) {
 	allResolvers(t, func(t *testing.T) {
 		_, err := LookupPort("udp", tcpOnlyService)
-		var dnsErr *DNSError
-		if !errors.As(err, &dnsErr) || !dnsErr.IsNotFound {
+		if dnsErr, ok := errors.AsType[*DNSError](err); !ok || !dnsErr.IsNotFound {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -1505,22 +1534,6 @@ func TestLookupPortIPNetworkString(t *testing.T) {
 		_, err := LookupPort("ip", tcpOnlyService)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
-		}
-	})
-}
-
-func allResolvers(t *testing.T, f func(t *testing.T)) {
-	t.Run("default resolver", f)
-	t.Run("forced go resolver", func(t *testing.T) {
-		if fixup := forceGoDNS(); fixup != nil {
-			defer fixup()
-			f(t)
-		}
-	})
-	t.Run("forced cgo resolver", func(t *testing.T) {
-		if fixup := forceCgoDNS(); fixup != nil {
-			defer fixup()
-			f(t)
 		}
 	})
 }
@@ -1644,5 +1657,35 @@ func TestLookupNoSuchHost(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+func TestDNSErrorUnwrap(t *testing.T) {
+	if runtime.GOOS == "plan9" {
+		// The Plan 9 implementation of the resolver doesn't use the Dial function yet. See https://go.dev/cl/409234
+		t.Skip("skipping on plan9")
+	}
+	rDeadlineExcceeded := &Resolver{PreferGo: true, Dial: func(ctx context.Context, network, address string) (Conn, error) {
+		return nil, context.DeadlineExceeded
+	}}
+	rCancelled := &Resolver{PreferGo: true, Dial: func(ctx context.Context, network, address string) (Conn, error) {
+		return nil, context.Canceled
+	}}
+
+	_, err := rDeadlineExcceeded.LookupHost(context.Background(), "test.go.dev")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("errors.Is(err, context.DeadlineExceeded) = false; want = true")
+	}
+
+	_, err = rCancelled.LookupHost(context.Background(), "test.go.dev")
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("errors.Is(err, context.Canceled) = false; want = true")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = goResolver.LookupHost(ctx, "text.go.dev")
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("errors.Is(err, context.Canceled) = false; want = true")
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"cmd/link/internal/loader"
 	"cmd/link/internal/sym"
 	"fmt"
+	"internal/abi"
 	"internal/buildcfg"
 	"strings"
 	"unicode"
@@ -49,6 +50,12 @@ func (d *deadcodePass) init() {
 		n := d.ldr.NDef()
 		for i := 1; i < n; i++ {
 			s := loader.Sym(i)
+			if d.ldr.SymType(s).IsText() && d.ldr.SymSize(s) == 0 {
+				// Zero-sized text symbol is a function deadcoded by the
+				// compiler. It doesn't really get compiled, and its
+				// metadata may be missing.
+				continue
+			}
 			d.mark(s, 0)
 		}
 		d.mark(d.ctxt.mainInittasks, 0)
@@ -106,6 +113,13 @@ func (d *deadcodePass) init() {
 	for _, s := range d.ctxt.dynexp {
 		if d.ctxt.Debugvlog > 1 {
 			d.ctxt.Logf("deadcode start dynexp: %s<%d>\n", d.ldr.SymName(s), d.ldr.SymVersion(s))
+		}
+		d.mark(s, 0)
+	}
+	// So are wasmexports.
+	for _, s := range d.ldr.WasmExports {
+		if d.ctxt.Debugvlog > 1 {
+			d.ctxt.Logf("deadcode start wasmexport: %s<%d>\n", d.ldr.SymName(s), d.ldr.SymVersion(s))
 		}
 		d.mark(s, 0)
 	}
@@ -201,7 +215,7 @@ func (d *deadcodePass) flood() {
 				rs := r.Sym()
 				if d.ldr.IsItab(rs) {
 					// This relocation can also point at an itab, in which case it
-					// means "the _type field of that itab".
+					// means "the Type field of that itab".
 					rs = decodeItabType(d.ldr, d.ctxt.Arch, rs)
 				}
 				if !d.ldr.IsGoType(rs) && !d.ctxt.linkShared {
@@ -511,7 +525,7 @@ func (d *deadcodePass) decodeIfaceMethod(ldr *loader.Loader, arch *sys.Arch, sym
 	if p == nil {
 		panic(fmt.Sprintf("missing symbol %q", ldr.SymName(symIdx)))
 	}
-	if decodetypeKind(arch, p)&kindMask != kindInterface {
+	if decodetypeKind(arch, p) != abi.Interface {
 		panic(fmt.Sprintf("symbol %q is not an interface", ldr.SymName(symIdx)))
 	}
 	relocs := ldr.Relocs(symIdx)
@@ -531,27 +545,7 @@ func (d *deadcodePass) decodetypeMethods(ldr *loader.Loader, arch *sys.Arch, sym
 	if !decodetypeHasUncommon(arch, p) {
 		panic(fmt.Sprintf("no methods on %q", ldr.SymName(symIdx)))
 	}
-	off := commonsize(arch) // reflect.rtype
-	switch decodetypeKind(arch, p) & kindMask {
-	case kindStruct: // reflect.structType
-		off += 4 * arch.PtrSize
-	case kindPtr: // reflect.ptrType
-		off += arch.PtrSize
-	case kindFunc: // reflect.funcType
-		off += arch.PtrSize // 4 bytes, pointer aligned
-	case kindSlice: // reflect.sliceType
-		off += arch.PtrSize
-	case kindArray: // reflect.arrayType
-		off += 3 * arch.PtrSize
-	case kindChan: // reflect.chanType
-		off += 2 * arch.PtrSize
-	case kindMap: // reflect.mapType
-		off += 4*arch.PtrSize + 8
-	case kindInterface: // reflect.interfaceType
-		off += 3 * arch.PtrSize
-	default:
-		// just Sizeof(rtype)
-	}
+	off := abi.RTypeSize(decodetypeKind(arch, p), arch.PtrSize)
 
 	mcount := int(decodeInuxi(arch, p[off+4:], 2))
 	moff := int(decodeInuxi(arch, p[off+4+2+2:], 4))

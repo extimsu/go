@@ -8,6 +8,9 @@ package codehost
 
 import (
 	"bytes"
+	"cmd/go/internal/cfg"
+	"cmd/go/internal/lockedfile"
+	"cmd/go/internal/vcscmd"
 	"context"
 	"crypto/sha256"
 	"fmt"
@@ -19,10 +22,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"cmd/go/internal/cfg"
-	"cmd/go/internal/lockedfile"
-	"cmd/go/internal/str"
 
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/semver"
@@ -49,7 +48,7 @@ type Repo interface {
 	// "" for the root or "sub/dir" for a subdirectory (no trailing slash).
 	CheckReuse(ctx context.Context, old *Origin, subdir string) error
 
-	// List lists all tags with the given prefix.
+	// Tags lists all tags with the given prefix.
 	Tags(ctx context.Context, prefix string) (*Tags, error)
 
 	// Stat returns information about the revision rev.
@@ -116,9 +115,12 @@ type Origin struct {
 	Ref string `json:",omitempty"`
 
 	// If RepoSum is non-empty, then the resolution of this module version
-	// failed due to the repo being available but the version not being present.
-	// This depends on the entire state of the repo, which RepoSum summarizes.
-	// For Git, this is a hash of all the refs and their hashes.
+	// depends on the entire state of the repo, which RepoSum summarizes.
+	// For Git, this is a hash of all the refs and their hashes, and the RepoSum
+	// is only needed for module versions that don't exist.
+	// For Mercurial, this is a hash of all the branches and their heads' hashes,
+	// since the set of available tags is dervied from .hgtags files in those branches,
+	// and the RepoSum is used for all module versions, available and not,
 	RepoSum string `json:",omitempty"`
 }
 
@@ -171,6 +173,7 @@ type UnknownRevisionError struct {
 func (e *UnknownRevisionError) Error() string {
 	return "unknown revision " + e.Rev
 }
+
 func (UnknownRevisionError) Is(err error) bool {
 	return err == fs.ErrNotExist
 }
@@ -184,6 +187,7 @@ type noCommitsError struct{}
 func (noCommitsError) Error() string {
 	return "no commits"
 }
+
 func (noCommitsError) Is(err error) bool {
 	return err == fs.ErrNotExist
 }
@@ -296,20 +300,22 @@ func (e *RunError) Error() string {
 
 var dirLock sync.Map
 
-// Run runs the command line in the given directory
-// (an empty dir means the current directory).
-// It returns the standard output and, for a non-zero exit,
-// a *RunError indicating the command, exit status, and standard error.
-// Standard error is unavailable for commands that exit successfully.
-func Run(ctx context.Context, dir string, cmdline ...any) ([]byte, error) {
-	return RunWithStdin(ctx, dir, nil, cmdline...)
-}
+// run executes cmd in dir and returns its standard output.
+//
+// On failure, run returns the output collected so far and a *RunError.
+func run(ctx context.Context, dir string, cmd *vcscmd.Command, env ...string) ([]byte, error) {
+	argv, err := cmd.Build()
+	if err != nil {
+		return nil, &RunError{
+			Cmd: strings.Join(argv, " ") + " in " + dir,
+			Err: err,
+		}
+	}
 
-// bashQuoter escapes characters that have special meaning in double-quoted strings in the bash shell.
-// See https://www.gnu.org/software/bash/manual/html_node/Double-Quotes.html.
-var bashQuoter = strings.NewReplacer(`"`, `\"`, `$`, `\$`, "`", "\\`", `\`, `\\`)
+	if cfg.RestrictedBuild() {
+		return nil, fmt.Errorf("VCS command %s is not allowed when GORESTRICTEDBUILD=1", argv[0])
+	}
 
-func RunWithStdin(ctx context.Context, dir string, stdin io.Reader, cmdline ...any) ([]byte, error) {
 	if dir != "" {
 		muIface, ok := dirLock.Load(dir)
 		if !ok {
@@ -320,10 +326,6 @@ func RunWithStdin(ctx context.Context, dir string, stdin io.Reader, cmdline ...a
 		defer mu.Unlock()
 	}
 
-	cmd := str.StringList(cmdline...)
-	if os.Getenv("TESTGOVCS") == "panic" {
-		panic(fmt.Sprintf("use of vcs: %v", cmd))
-	}
 	if xLog, ok := cfg.BuildXWriter(ctx); ok {
 		text := new(strings.Builder)
 		if dir != "" {
@@ -331,7 +333,7 @@ func RunWithStdin(ctx context.Context, dir string, stdin io.Reader, cmdline ...a
 			text.WriteString(dir)
 			text.WriteString("; ")
 		}
-		for i, arg := range cmd {
+		for i, arg := range argv {
 			if i > 0 {
 				text.WriteByte(' ')
 			}
@@ -360,17 +362,26 @@ func RunWithStdin(ctx context.Context, dir string, stdin io.Reader, cmdline ...a
 	// TODO: Set environment to get English error messages.
 	var stderr bytes.Buffer
 	var stdout bytes.Buffer
-	c := exec.CommandContext(ctx, cmd[0], cmd[1:]...)
+	c := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	c.Cancel = func() error { return c.Process.Signal(os.Interrupt) }
 	c.Dir = dir
-	c.Stdin = stdin
 	c.Stderr = &stderr
 	c.Stdout = &stdout
-	// For Git commands, manually supply GIT_DIR so Git works with safe.bareRepository=explicit set. Noop for other commands.
-	c.Env = append(c.Environ(), "GIT_DIR="+dir)
-	err := c.Run()
-	if err != nil {
-		err = &RunError{Cmd: strings.Join(cmd, " ") + " in " + dir, Stderr: stderr.Bytes(), Err: err}
+	c.Env = append(c.Environ(), env...)
+	if argv[0] == "hg" {
+		// Match internal/vcs: do not let user defaults change command semantics.
+		c.Env = append(c.Env, "HGPLAIN=+strictflags")
 	}
-	return stdout.Bytes(), err
+	if err = c.Run(); err != nil {
+		return stdout.Bytes(), &RunError{
+			Cmd:    strings.Join(argv, " ") + " in " + dir,
+			Stderr: stderr.Bytes(),
+			Err:    err,
+		}
+	}
+	return stdout.Bytes(), nil
 }
+
+// bashQuoter escapes characters that have special meaning in double-quoted strings in the bash shell.
+// See https://www.gnu.org/software/bash/manual/html_node/Double-Quotes.html.
+var bashQuoter = strings.NewReplacer(`"`, `\"`, `$`, `\$`, "`", "\\`", `\`, `\\`)

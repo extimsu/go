@@ -305,6 +305,7 @@ func ForCapture(fn *ir.Func) []VarAndLoop {
 						as := ir.NewAssignStmt(x.Pos(), z, tz)
 						as.Def = true
 						as.SetTypecheck(1)
+						z.Defn = as
 						preBody.Append(as)
 						dclFixups[z] = as
 
@@ -361,11 +362,11 @@ func ForCapture(fn *ir.Func) []VarAndLoop {
 						// (6)     if tmp_first {tmp_first = false} else {Post} +
 						//         if !cond {break} + ...
 						tmpFirst := typecheck.TempAt(base.Pos, fn, types.Types[types.TBOOL])
-						tmpFirstDcl = typecheck.Stmt(ir.NewAssignStmt(x.Pos(), tmpFirst, ir.NewBool(base.Pos, true)))
-						tmpFirstSetFalse := typecheck.Stmt(ir.NewAssignStmt(x.Pos(), tmpFirst, ir.NewBool(base.Pos, false)))
+						tmpFirstDcl = typecheck.Stmt(fn, ir.NewAssignStmt(x.Pos(), tmpFirst, ir.NewBool(base.Pos, true)))
+						tmpFirstSetFalse := typecheck.Stmt(fn, ir.NewAssignStmt(x.Pos(), tmpFirst, ir.NewBool(base.Pos, false)))
 						ifTmpFirst := ir.NewIfStmt(x.Pos(), tmpFirst, ir.Nodes{tmpFirstSetFalse}, ir.Nodes{x.Post})
-						ifTmpFirst.PtrInit().Append(typecheck.Stmt(ir.NewDecl(base.Pos, ir.ODCL, tmpFirst))) // declares tmpFirst
-						preBody.Append(typecheck.Stmt(ifTmpFirst))
+						ifTmpFirst.PtrInit().Append(typecheck.Stmt(fn, ir.NewDecl(base.Pos, ir.ODCL, tmpFirst))) // declares tmpFirst
+						preBody.Append(typecheck.Stmt(fn, ifTmpFirst))
 					}
 
 					// body' = prebody +
@@ -446,7 +447,12 @@ func ForCapture(fn *ir.Func) []VarAndLoop {
 			rewriteNodes(fn, editNodes)
 		}
 	}
-	ir.WithFunc(fn, forCapture)
+	ir.WithPos(fn, forCapture)
+
+	if ir.MatchAstDump(fn, "loopvar") {
+		ir.AstDump(fn, "loopvar, "+ir.FuncName(fn))
+	}
+
 	return transformed
 }
 
@@ -556,7 +562,7 @@ func LogTransformations(transformed []VarAndLoop) {
 
 			if logopt.Enabled() {
 				// For automated checking of coverage of this transformation, include this in the JSON information.
-				var nString interface{} = n
+				var nString any = n
 				if inner != outer {
 					nString = fmt.Sprintf("%v (from inline)", n)
 				}

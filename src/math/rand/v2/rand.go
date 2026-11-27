@@ -12,9 +12,12 @@
 // Top-level functions, such as [Float64] and [Int],
 // are safe for concurrent use by multiple goroutines.
 //
+// The [ChaCha8] source is a general-purpose source resistant to prediction.
+// The [PCG] source is faster but unfit for security-relevant purposes.
+//
 // This package's outputs might be easily predictable regardless of how it's
 // seeded. For random numbers suitable for security-sensitive work, see the
-// crypto/rand package.
+// [crypto/rand] package.
 package rand
 
 import (
@@ -55,6 +58,9 @@ func (r *Rand) Int32() int32 { return int32(r.src.Uint64() >> 33) }
 
 // Int returns a non-negative pseudo-random int.
 func (r *Rand) Int() int { return int(uint(r.src.Uint64()) << 1 >> 1) }
+
+// Uint returns a pseudo-random uint.
+func (r *Rand) Uint() uint { return uint(r.src.Uint64()) }
 
 // Int64N returns, as an int64, a non-negative pseudo-random number in the half-open interval [0,n).
 // It panics if n <= 0.
@@ -201,6 +207,16 @@ func (r *Rand) UintN(n uint) uint {
 	return uint(r.uint64n(uint64(n)))
 }
 
+// N returns a pseudo-random number in the half-open interval [0,n).
+// The type parameter Int can be any integer type.
+// It panics if n <= 0.
+func (r *Rand) N[Int intType](n Int) Int {
+	if n <= 0 {
+		panic("invalid argument to N")
+	}
+	return Int(r.uint64n(uint64(n)))
+}
+
 // Float64 returns, as a float64, a pseudo-random number in the half-open interval [0.0,1.0).
 func (r *Rand) Float64() float64 {
 	// There are exactly 1<<53 float64s in [0,1). Use Intn(1<<53) / (1<<53).
@@ -250,7 +266,7 @@ func (r *Rand) Shuffle(n int, swap func(i, j int)) {
 
 // globalRand is the source of random numbers for the top-level
 // convenience functions.
-var globalRand = &Rand{src: &runtimeSource{}}
+var globalRand = &Rand{src: runtimeSource{}}
 
 //go:linkname runtime_rand runtime.rand
 func runtime_rand() uint64
@@ -258,7 +274,7 @@ func runtime_rand() uint64
 // runtimeSource is a Source that uses the runtime fastrand functions.
 type runtimeSource struct{}
 
-func (*runtimeSource) Uint64() uint64 {
+func (runtimeSource) Uint64() uint64 {
 	return runtime_rand()
 }
 
@@ -272,12 +288,12 @@ func Uint32() uint32 { return globalRand.Uint32() }
 
 // Uint64N returns, as a uint64, a pseudo-random number in the half-open interval [0,n)
 // from the default Source.
-// It panics if n <= 0.
+// It panics if n == 0.
 func Uint64N(n uint64) uint64 { return globalRand.Uint64N(n) }
 
 // Uint32N returns, as a uint32, a pseudo-random number in the half-open interval [0,n)
 // from the default Source.
-// It panics if n <= 0.
+// It panics if n == 0.
 func Uint32N(n uint32) uint32 { return globalRand.Uint32N(n) }
 
 // Uint64 returns a pseudo-random 64-bit value as a uint64
@@ -290,6 +306,9 @@ func Int32() int32 { return globalRand.Int32() }
 
 // Int returns a non-negative pseudo-random int from the default Source.
 func Int() int { return globalRand.Int() }
+
+// Uint returns a pseudo-random uint from the default Source.
+func Uint() uint { return globalRand.Uint() }
 
 // Int64N returns, as an int64, a pseudo-random number in the half-open interval [0,n)
 // from the default Source.
@@ -308,17 +327,14 @@ func IntN(n int) int { return globalRand.IntN(n) }
 
 // UintN returns, as a uint, a pseudo-random number in the half-open interval [0,n)
 // from the default Source.
-// It panics if n <= 0.
+// It panics if n == 0.
 func UintN(n uint) uint { return globalRand.UintN(n) }
 
 // N returns a pseudo-random number in the half-open interval [0,n) from the default Source.
 // The type parameter Int can be any integer type.
 // It panics if n <= 0.
 func N[Int intType](n Int) Int {
-	if n <= 0 {
-		panic("invalid argument to N")
-	}
-	return Int(globalRand.uint64n(uint64(n)))
+	return globalRand.N(n)
 }
 
 type intType interface {

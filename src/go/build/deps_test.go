@@ -16,8 +16,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"runtime"
-	"sort"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -32,29 +31,49 @@ import (
 //
 // "a < b" means package b can import package a.
 //
-// See `go doc internal/dag' for the full syntax.
+// See `go doc internal/dag` for the full syntax.
 //
 // All-caps names are pseudo-names for specific points
 // in the dependency lattice.
 var depsRules = `
 	# No dependencies allowed for any of these packages.
 	NONE
-	< cmp, container/list, container/ring,
-	  internal/cfg, internal/coverage, internal/coverage/rtcov,
-	  internal/coverage/uleb128, internal/coverage/calloc,
-	  internal/cpu, internal/goarch, internal/godebugs,
-	  internal/goexperiment, internal/goos,
-	  internal/goversion, internal/nettrace, internal/platform,
+	< unsafe
+	< cmp,
+	  container/list,
+	  container/ring,
+	  internal/byteorder,
+	  internal/cfg,
+	  internal/coverage,
+	  internal/coverage/rtcov,
+	  internal/coverage/uleb128,
+	  internal/coverage/calloc,
+	  internal/cpu,
+	  internal/goarch,
+	  internal/godebugs,
+	  internal/goexperiment,
+	  internal/goos,
+	  internal/goversion,
+	  internal/nettrace,
+	  internal/platform,
+	  internal/profilerecord,
+	  internal/runtime/pprof/label,
+	  internal/syslist,
+	  internal/trace/tracev2,
 	  internal/trace/traceviewer/format,
 	  log/internal,
-	  unicode/utf8, unicode/utf16, unicode,
-	  unsafe;
+	  math/bits,
+	  structs,
+	  unicode,
+	  unicode/utf8,
+	  unicode/utf16;
 
-	# These packages depend only on internal/goarch and unsafe.
-	internal/goarch, unsafe
-	< internal/abi, internal/chacha8rand;
+	internal/goarch < internal/abi;
+	internal/byteorder, internal/cpu, internal/goarch < internal/chacha8rand;
+	internal/goarch, math/bits < internal/strconv;
 
-	unsafe < maps;
+	internal/strconv < simd/internal/simdfmt;
+	internal/cpu, simd/internal/simdfmt < simd/archsimd;
 
 	# RUNTIME is the core runtime group of packages, all of them very light-weight.
 	internal/abi,
@@ -64,38 +83,54 @@ var depsRules = `
 	internal/goarch,
 	internal/godebugs,
 	internal/goexperiment,
-	internal/goos
+	internal/goos,
+	internal/profilerecord,
+	internal/runtime/pprof/label,
+	internal/strconv,
+	internal/trace/tracev2,
+	math/bits,
+	structs,
+	simd/archsimd
 	< internal/bytealg
-	< internal/itoa
+	< internal/stringslite
 	< internal/unsafeheader
-	< runtime/internal/sys
-	< runtime/internal/syscall
-	< runtime/internal/atomic
-	< runtime/internal/math
-	< runtime
-	< sync/atomic
 	< internal/race
+	< internal/msan
+	< internal/asan
+	< internal/runtime/sys
+	< internal/runtime/syscall/linux
+	< internal/runtime/syscall/windows
+	< internal/runtime/atomic
+	< internal/runtime/exithook
+	< internal/runtime/gc
+	< internal/runtime/math
+	< internal/runtime/maps
+	< internal/runtime/cgroup
+	< internal/runtime/gc/scan
+	< runtime
+	< runtime/secret
+	< sync/atomic
+	< internal/sync
+	< weak
+	< internal/synctest
 	< sync
 	< internal/bisect
 	< internal/godebug
 	< internal/reflectlite
 	< errors
-	< internal/oserror, math/bits
+	< internal/oserror;
+
+	cmp, runtime, math/bits
+	< iter
+	< maps, slices;
+
+	internal/oserror, maps, slices
 	< RUNTIME;
 
-	internal/race
-	< iter;
-
-	# slices depends on unsafe for overlapping check, cmp for comparison
-	# semantics, and math/bits for # calculating bitlength of numbers.
-	unsafe, cmp, math/bits
-	< slices;
-
-	RUNTIME, slices
-	< sort;
-
-	sort
-	< container/heap;
+	RUNTIME
+	< sort
+	< container/heap
+	< unique;
 
 	RUNTIME
 	< io;
@@ -112,7 +147,7 @@ var depsRules = `
 	unicode !< path;
 
 	# SYSCALL is RUNTIME plus the packages necessary for basic system calls.
-	RUNTIME, unicode/utf8, unicode/utf16
+	RUNTIME, unicode/utf8, unicode/utf16, internal/synctest
 	< internal/syscall/windows/sysdll, syscall/js
 	< syscall
 	< internal/syscall/unix, internal/syscall/windows, internal/syscall/windows/registry
@@ -126,7 +161,7 @@ var depsRules = `
 	< context
 	< TIME;
 
-	TIME, io, path, sort
+	TIME, io, path, slices
 	< io/fs;
 
 	# MATH is RUNTIME plus the basic math packages.
@@ -164,7 +199,7 @@ var depsRules = `
 	io/fs
 	< internal/testlog
 	< internal/poll
-	< internal/safefilepath
+	< internal/filepathlite
 	< os
 	< os/signal;
 
@@ -173,7 +208,7 @@ var depsRules = `
 
 	unicode, fmt !< net, os, os/signal;
 
-	os/signal, internal/safefilepath, STR
+	os/signal, internal/filepathlite, STR
 	< path/filepath
 	< io/ioutil;
 
@@ -209,7 +244,6 @@ var depsRules = `
 	  internal/types/errors,
 	  mime/quotedprintable,
 	  net/internal/socktest,
-	  net/url,
 	  runtime/trace,
 	  text/scanner,
 	  text/tabwriter;
@@ -220,31 +254,59 @@ var depsRules = `
 	# encodings
 	# core ones do not use fmt.
 	io, strconv, slices
-	< encoding;
+	< encoding, encoding/base32, encoding/base64;
 
 	encoding, reflect
-	< encoding/binary
-	< encoding/base32, encoding/base64;
+	< encoding/binary;
 
 	FMT, encoding < flag;
 
+	FMT, MATH
+	< simd/internal/spec
+	< simd/internal/simdref;
+
+	FMT, simd/archsimd < simd/internal/bridge;
+
+	simd/internal/bridge < simd;
+
 	fmt !< encoding/base32, encoding/base64;
 
-	FMT, encoding/base32, encoding/base64, internal/saferio
+	FMT, encoding, encoding/base32, encoding/base64, encoding/binary,
+	internal/saferio
 	< encoding/ascii85, encoding/csv, encoding/gob, encoding/hex,
-	  encoding/json, encoding/pem, encoding/xml, mime;
+	  encoding/pem, encoding/xml, mime;
+
+	STR, errors
+	< encoding/json/internal
+	< encoding/json/internal/jsonflags
+	< encoding/json/internal/jsonopts
+	< encoding/json/internal/jsonwire
+	< encoding/json/jsontext;
+
+	FMT,
+	encoding/hex,
+	encoding/base32,
+	encoding/base64,
+	encoding/binary,
+	encoding/json/jsontext,
+	encoding/json/internal,
+	encoding/json/internal/jsonflags,
+	encoding/json/internal/jsonopts,
+	encoding/json/internal/jsonwire
+	< encoding/json/v2
+	< encoding/json;
 
 	# hashes
 	io
 	< hash
-	< hash/adler32, hash/crc32, hash/crc64, hash/fnv;
+	< hash/adler32, hash/crc32, hash/crc64, hash/fnv, hash/maphash;
 
 	# math/big
-	FMT, encoding/binary, math/rand
+	FMT, math/rand
 	< math/big;
 
 	# compression
-	FMT, encoding/binary, hash/adler32, hash/crc32
+	FMT, encoding/binary, hash/adler32, hash/crc32, sort
 	< compress/bzip2, compress/flate, compress/lzw, internal/zstd
 	< archive/zip, compress/gzip, compress/zlib;
 
@@ -252,12 +314,18 @@ var depsRules = `
 	FMT
 	< text/template/parse;
 
+	internal/bytealg, math/bits, slices, strconv, unique
+	< net/netip;
+
+	FMT, net/netip
+	< net/url;
+
 	net/url, text/template/parse
 	< text/template
 	< internal/lazytemplate;
 
 	# regexp
-	FMT
+	FMT, sort
 	< regexp/syntax
 	< regexp
 	< internal/lazyregexp;
@@ -270,7 +338,7 @@ var depsRules = `
 	< index/suffixarray;
 
 	# executable parsing
-	FMT, encoding/binary, compress/zlib, internal/saferio, internal/zstd
+	FMT, encoding/binary, compress/zlib, internal/saferio, internal/zstd, sort
 	< runtime/debug
 	< debug/dwarf
 	< debug/elf, debug/gosym, debug/macho, debug/pe, debug/plan9obj, internal/xcoff
@@ -278,7 +346,7 @@ var depsRules = `
 	< DEBUG;
 
 	# go parser and friends.
-	FMT
+	FMT, sort
 	< internal/gover
 	< go/version
 	< go/token
@@ -287,7 +355,10 @@ var depsRules = `
 	< go/internal/typeparams;
 
 	FMT
-	< go/build/constraint, go/doc/comment;
+	< go/build/constraint;
+
+	FMT, sort
+	< go/doc/comment;
 
 	go/internal/typeparams, go/build/constraint
 	< go/parser;
@@ -299,11 +370,8 @@ var depsRules = `
 	math/big, go/token
 	< go/constant;
 
-	FMT, internal/goexperiment
+	FMT, internal/goexperiment, golang.org/x/sys/cpu
 	< internal/buildcfg;
-
-	container/heap, go/constant, go/parser, internal/buildcfg, internal/goversion, internal/types/errors
-	< go/types;
 
 	# The vast majority of standard library packages should not be resorting to regexp.
 	# go/types is a good chokepoint. It shouldn't use regexp, nor should anything
@@ -313,14 +381,8 @@ var depsRules = `
 	go/doc/comment, go/parser, internal/lazyregexp, text/template
 	< go/doc;
 
-	go/build/constraint, go/doc, go/parser, internal/buildcfg, internal/goroot, internal/goversion, internal/platform
+	go/build/constraint, go/doc, go/parser, internal/buildcfg, internal/goroot, internal/goversion, internal/platform, internal/syslist
 	< go/build;
-
-	# databases
-	FMT
-	< database/sql/internal
-	< database/sql/driver
-	< database/sql;
 
 	# images
 	FMT, compress/lzw, compress/zlib
@@ -360,15 +422,10 @@ var depsRules = `
 
 	os
 	< golang.org/x/net/dns/dnsmessage,
-	  golang.org/x/net/lif,
-	  golang.org/x/net/route;
+	  golang.org/x/net/lif;
 
-	os, runtime, strconv, sync, unsafe,
-	internal/godebug
-	< internal/intern;
-
-	internal/bytealg, internal/intern, internal/itoa, math/bits, sort, strconv
-	< net/netip;
+	os, net/netip
+	< internal/routebsd;
 
 	# net is unavoidable when doing any networking,
 	# so large dependencies must be kept out.
@@ -377,14 +434,15 @@ var depsRules = `
 	CGO,
 	golang.org/x/net/dns/dnsmessage,
 	golang.org/x/net/lif,
-	golang.org/x/net/route,
 	internal/godebug,
+	internal/goversion,
 	internal/nettrace,
 	internal/poll,
+	internal/routebsd,
 	internal/singleflight,
-	internal/race,
 	net/netip,
-	os
+	os,
+	sort
 	< net;
 
 	fmt, unicode !< net;
@@ -420,90 +478,218 @@ var depsRules = `
 	NET, log
 	< net/mail;
 
-	NONE < crypto/internal/boring/sig, crypto/internal/boring/syso;
-	sync/atomic < crypto/internal/boring/bcache, crypto/internal/boring/fipstls;
-	crypto/internal/boring/sig, crypto/internal/boring/fipstls < crypto/tls/fipsonly;
+	# FIPS is the FIPS 140 module.
+	# It must not depend on external crypto packages.
+	# Package hash is ok as it's only the interface.
+	# See also fips140deps.AllowedInternalPackages.
+
+	io, math/rand/v2 < crypto/internal/randutil;
+
+	NONE < crypto/internal/constanttime;
+
+	STR < crypto/internal/impl;
+
+	OS < crypto/internal/sysrand
+	< crypto/internal/entropy;
+
+	internal/byteorder < crypto/internal/fips140deps/byteorder;
+	internal/cpu, internal/goarch < crypto/internal/fips140deps/cpu;
+	internal/godebug < crypto/internal/fips140deps/godebug;
+	time, internal/syscall/windows < crypto/internal/fips140deps/time;
+
+	crypto/internal/fips140deps/time, errors, math/bits, sync/atomic, unsafe
+	< crypto/internal/entropy/v1.0.0;
+
+	errors, internal/bytealg, sync, syscall
+	< crypto/internal/entropy/scratch;
+
+	STR, hash,
+	crypto/internal/impl,
+	crypto/internal/entropy,
+	crypto/internal/randutil,
+	crypto/internal/constanttime,
+	crypto/internal/entropy/v1.0.0,
+	crypto/internal/entropy/scratch,
+	crypto/internal/fips140deps/byteorder,
+	crypto/internal/fips140deps/cpu,
+	crypto/internal/fips140deps/godebug
+	< crypto/internal/fips140
+	< crypto/internal/fips140/alias
+	< crypto/internal/fips140/subtle
+	< crypto/internal/fips140/sha256
+	< crypto/internal/fips140/hmac
+	< crypto/internal/fips140/check
+	< crypto/internal/fips140/sha512
+	< crypto/internal/fips140/sha3
+	< crypto/internal/fips140/pbkdf2
+	< crypto/internal/fips140/aes
+	< crypto/internal/fips140/drbg
+	< crypto/internal/fips140/aes/gcm
+	< crypto/internal/fips140/hkdf
+	< crypto/internal/fips140/mlkem
+	< crypto/internal/fips140/mldsa
+	< crypto/internal/fips140/ssh
+	< crypto/internal/fips140/tls12
+	< crypto/internal/fips140/tls13
+	< crypto/internal/fips140/bigmod
+	< crypto/internal/fips140/nistec/fiat
+	< crypto/internal/fips140/nistec
+	< crypto/internal/fips140/ecdh
+	< crypto/internal/fips140/ecdsa
+	< crypto/internal/fips140/edwards25519/field
+	< crypto/internal/fips140/edwards25519
+	< crypto/internal/fips140/ed25519
+	< crypto/internal/fips140/rsa
+	< crypto/fips140 < FIPS;
+
+	crypto !< FIPS;
 
 	# CRYPTO is core crypto algorithms - no cgo, fmt, net.
-	# Unfortunately, stuck with reflect via encoding/binary.
+	# Mostly wrappers around the FIPS module.
+
+	NONE < crypto/internal/boring/sig, crypto/internal/boring/syso;
+	sync/atomic < crypto/internal/boring/bcache;
+
+	FIPS, internal/godebug, embed,
 	crypto/internal/boring/sig,
 	crypto/internal/boring/syso,
-	encoding/binary,
-	golang.org/x/sys/cpu,
-	hash, embed
+	crypto/internal/boring/bcache
+	< crypto/internal/fips140hash
+	< crypto/internal/fips140only
 	< crypto
 	< crypto/subtle
-	< crypto/internal/alias
-	< crypto/cipher;
-
-	crypto/cipher,
-	crypto/internal/boring/bcache
+	< crypto/sha3
+	< crypto/cipher
 	< crypto/internal/boring
-	< crypto/boring;
-
-	crypto/internal/alias
-	< crypto/internal/randutil
-	< crypto/internal/nistec/fiat
-	< crypto/internal/nistec
-	< crypto/internal/edwards25519/field
-	< crypto/internal/edwards25519;
-
-	crypto/boring
-	< crypto/aes, crypto/des, crypto/hmac, crypto/md5, crypto/rc4,
-	  crypto/sha1, crypto/sha256, crypto/sha512;
-
-	crypto/boring, crypto/internal/edwards25519/field
-	< crypto/ecdh;
-
-	crypto/aes,
-	crypto/des,
-	crypto/ecdh,
-	crypto/hmac,
-	crypto/internal/edwards25519,
-	crypto/md5,
-	crypto/rc4,
-	crypto/sha1,
-	crypto/sha256,
-	crypto/sha512
+	< crypto/boring
+	< crypto/internal/rand
+	< crypto/aes,
+	  crypto/des,
+	  crypto/rc4,
+	  crypto/md5,
+	  crypto/sha1,
+	  crypto/sha256,
+	  crypto/sha512,
+	  crypto/hmac,
+	  crypto/hkdf,
+	  crypto/pbkdf2,
+	  crypto/ecdh,
+	  crypto/mlkem,
+	  crypto/mldsa
 	< CRYPTO;
+
+	CRYPTO
+	< golang.org/x/crypto/hkdf;
 
 	CGO, fmt, net !< CRYPTO;
 
-	# CRYPTO-MATH is core bignum-based crypto - no cgo, net; fmt now ok.
-	CRYPTO, FMT, math/big
+	# CRYPTO-MATH is crypto that exposes math/big APIs - no cgo, net; fmt now ok.
+
+	CRYPTO, FMT, math/big, internal/saferio
 	< crypto/internal/boring/bbig
+	< crypto/internal/fips140cache
 	< crypto/rand
-	< crypto/ed25519
+	< crypto/ed25519 # depends on crypto/rand.Reader
 	< encoding/asn1
 	< golang.org/x/crypto/cryptobyte/asn1
 	< golang.org/x/crypto/cryptobyte
-	< crypto/internal/bigmod
 	< crypto/dsa, crypto/elliptic, crypto/rsa
 	< crypto/ecdsa
 	< CRYPTO-MATH;
 
 	CGO, net !< CRYPTO-MATH;
 
+	# uuids
+	crypto/rand, errors, encoding/binary, encoding/hex
+	< uuid;
+
+	# databases
+	FMT, uuid
+	< database/sql/internal
+	< database/sql/driver;
+
+	database/sql/driver, math/rand/v2 < database/sql;
+
 	# TLS, Prince of Dependencies.
-	CRYPTO-MATH, NET, container/list, encoding/hex, encoding/pem
+
+	crypto/fips140, sync/atomic < crypto/tls/internal/fips140tls;
+
+	crypto/internal/boring/sig, crypto/tls/internal/fips140tls < crypto/tls/fipsonly;
+
+	CRYPTO, golang.org/x/sys/cpu, encoding/binary, reflect
 	< golang.org/x/crypto/internal/alias
 	< golang.org/x/crypto/internal/subtle
 	< golang.org/x/crypto/chacha20
 	< golang.org/x/crypto/internal/poly1305
-	< golang.org/x/crypto/chacha20poly1305
-	< golang.org/x/crypto/hkdf
-	< crypto/x509/internal/macos
-	< crypto/x509/pkix;
+	< golang.org/x/crypto/chacha20poly1305;
 
-	crypto/internal/boring/fipstls, crypto/x509/pkix
+	CRYPTO-MATH, golang.org/x/crypto/chacha20poly1305
+	< crypto/hpke;
+
+	CRYPTO-MATH, NET, container/list, encoding/hex, encoding/pem, crypto/hpke,
+	golang.org/x/crypto/chacha20poly1305, crypto/tls/internal/fips140tls
+	< crypto/x509/internal/macos
+	< crypto/x509/pkix
 	< crypto/x509
+	< crypto/internal/upki
 	< crypto/tls;
 
 	# crypto-aware packages
 
-	DEBUG, go/build, go/types, text/scanner, crypto/md5
-	< internal/pkgbits
-	< go/internal/gcimporter, go/internal/gccgoimporter, go/internal/srcimporter
+	FMT, hash/maphash
+	< container/hash;
+
+	hash/maphash, container/heap, go/constant, go/parser, internal/buildcfg, internal/goversion, internal/types/errors
+	< go/types;
+
+	FMT, flag, go/types, time
+	< go/analysis;
+
+	# x/tools
+	# These are the only allowed dependencies of gcexportdata. Any change here
+	# must be mirrored in x/tools/go/gcexportdata/deps_test.go.
+	FMT, STR, crypto/md5, encoding/binary, encoding/json, go/analysis, go/build, go/token, go/types
+	< golang.org/x/tools/go/types/objectpath,
+	  golang.org/x/tools/internal/pkgbits
+	< golang.org/x/tools/internal/exportdata
+	< golang.org/x/tools/go/gcexportdata;
+
+	# The vendored golang.org/x/tools analysis framework (passes and
+	# unitchecker), for cmd/vet and cmd/fix (via internal/analysis/...).
+	# Its packages that have no rule of their own form a single node,
+	# golang.org/x/tools/... (see TestDependencies): imports among them
+	# are x/tools' business; only their imports of other packages, and
+	# their importers, are policy.
+	FMT, archive/zip, crypto/sha256, encoding/gob, flag, go/format, log,
+	golang.org/x/tools/go/gcexportdata
+	< golang.org/x/tools/...
+	< internal/analysis/fipsdit, internal/analysis/suite/fix, internal/analysis/suite/vet, internal/analysis/unitchecker;
+
+	# The protocol between the go command and go test's analysis tool.
+	# The go command imports it, so it must not depend on the analysis
+	# framework, or go/types.
+	FMT, encoding/binary, encoding/json
+	< internal/analysis/gotestchecker/protocol;
+
+	go/types !< internal/analysis/gotestchecker/protocol;
+
+	# go test's analysis driver
+	golang.org/x/tools/..., golang.org/x/tools/go/gcexportdata,
+	golang.org/x/tools/go/types/objectpath, runtime/debug,
+	internal/analysis/gotestchecker/protocol
+	< internal/analysis/gotestchecker;
+
+	# go/importer
+	DEBUG, crypto/sha256, go/build, go/types, text/scanner
+	< internal/exportdata, internal/pkgbits;
+
+	golang.org/x/tools/go/gcexportdata, internal/exportdata, internal/pkgbits
+	< go/internal/gcimporter;
+
+	internal/exportdata, internal/pkgbits
+	< go/internal/gccgoimporter, go/internal/srcimporter;
+
+	go/internal/gccgoimporter, go/internal/gcimporter, go/internal/srcimporter
 	< go/importer;
 
 	NET, crypto/rand, mime/quotedprintable
@@ -512,12 +698,12 @@ var depsRules = `
 	crypto/tls
 	< net/smtp;
 
-	crypto/rand
-	< hash/maphash; # for purego implementation
-
 	# HTTP, King of Dependencies.
 
-	FMT
+	context
+	< internal/gate;
+
+	FMT, encoding/binary
 	< golang.org/x/net/http2/hpack
 	< net/http/internal, net/http/internal/ascii, net/http/internal/testcert;
 
@@ -542,7 +728,14 @@ var depsRules = `
 	net/http/httptrace,
 	mime/multipart,
 	log
+	< net/http/internal/httpcommon, net/http/internal/httpsfv
+	< net/http/internal/http2
 	< net/http;
+
+	net/http, golang.org/x/crypto/hkdf, log/slog
+	< golang.org/x/net/internal/quic/quicwire
+	< golang.org/x/net/quic
+	< net/http/internal/http3;
 
 	# HTTP-aware packages
 
@@ -552,15 +745,13 @@ var depsRules = `
 	net/http, net/http/internal/ascii
 	< net/http/cookiejar, net/http/httputil;
 
-	net/http, flag
-	< net/http/httptest;
-
 	net/http, regexp
 	< net/http/cgi
 	< net/http/fcgi;
 
 	# Profiling
-	FMT, compress/gzip, encoding/binary, text/tabwriter
+	internal/runtime/pprof/label, runtime, context < internal/runtime/pprof;
+	FMT, compress/gzip, encoding/binary, sort, text/tabwriter, internal/runtime/pprof, internal/runtime/pprof/label
 	< runtime/pprof;
 
 	OS, compress/gzip, internal/lazyregexp
@@ -589,15 +780,25 @@ var depsRules = `
 	FMT, DEBUG, flag, runtime/trace, internal/sysinfo, math/rand
 	< testing;
 
+	testing, math, math/rand/v2
+	< simd/archsimd/internal/test_helpers, simd/internal/test_helpers;
+
 	log/slog, testing
 	< testing/slogtest;
 
-	FMT, crypto/sha256, encoding/json, go/ast, go/parser, go/token,
-	internal/godebug, math/rand, encoding/hex, crypto/sha256
-	< internal/fuzz;
+	testing, crypto/rand
+	< testing/cryptotest;
 
-	internal/fuzz, internal/testlog, runtime/pprof, regexp
-	< testing/internal/testdeps;
+	NET, internal/gate
+	< internal/nettest;
+
+	net/http, flag, internal/nettest, testing
+	< net/http/httptest;
+
+	FMT, crypto/sha256, encoding/binary, encoding/json,
+	go/ast, go/parser, go/token,
+	internal/godebug, math/rand, encoding/hex
+	< internal/fuzz;
 
 	OS, flag, testing, internal/cfg, internal/platform, internal/goroot
 	< internal/testenv;
@@ -614,32 +815,47 @@ var depsRules = `
 	syscall
 	< os/exec/internal/fdtest;
 
+	FMT, sort
+	< internal/diff;
+
 	FMT
-	< internal/diff, internal/txtar;
+	< internal/txtar;
+
+	internal/synctest, testing
+	< testing/synctest;
+
+	testing
+	< internal/testhash;
+
+	CRYPTO-MATH
+	< crypto/mlkem/mlkemtest;
+
+	CRYPTO-MATH, testing, internal/testenv, internal/testhash, encoding/json, regexp
+	< crypto/internal/cryptotest;
+
+	crypto/internal/cryptotest, encoding/hex
+	< crypto/internal/cryptotest/wycheproof;
+
+	FMT, encoding/json, time, regexp
+	< crypto/internal/cryptotest/x509limbo;
+
+	CGO, FMT
+	< crypto/internal/sysrand/internal/seccomp;
+
+	FIPS
+	< crypto/internal/fips140/check/checktest;
 
 	# v2 execution trace parser.
-	FMT
-	< internal/trace/v2/event;
+	FMT, io, internal/trace/tracev2
+	< internal/trace/version;
 
-	internal/trace/v2/event
-	< internal/trace/v2/event/go122;
+	FMT, encoding/binary, internal/trace/version
+	< internal/trace/raw;
 
-	FMT, io, internal/trace/v2/event/go122
-	< internal/trace/v2/version;
+	FMT, internal/trace/version, io, sort, encoding/binary
+	< internal/trace/internal/tracev1;
 
-	FMT, encoding/binary, internal/trace/v2/version
-	< internal/trace/v2/raw;
-
-	FMT, encoding/binary, internal/trace/v2/version
-	< internal/trace/v2;
-
-	regexp, internal/trace/v2, internal/trace/v2/raw, internal/txtar
-	< internal/trace/v2/testtrace;
-
-	regexp, internal/txtar, internal/trace/v2, internal/trace/v2/raw
-	< internal/trace/v2/internal/testgen/go122;
-
-	FMT, container/heap, math/rand, internal/trace/v2
+	FMT, encoding/binary, internal/trace/version, internal/trace/internal/tracev1, container/heap, math/rand, regexp
 	< internal/trace;
 
 	# cmd/trace dependencies.
@@ -654,7 +870,7 @@ var depsRules = `
 	< internal/trace/traceviewer;
 
 	# Coverage.
-	FMT, crypto/md5, encoding/binary, regexp, sort, text/tabwriter, unsafe,
+	FMT, hash/fnv, encoding/binary, regexp, sort, text/tabwriter,
 	internal/coverage, internal/coverage/uleb128
 	< internal/coverage/cmerge,
 	  internal/coverage/pods,
@@ -672,14 +888,56 @@ var depsRules = `
 	internal/coverage, crypto/sha256, FMT
 	< cmd/internal/cov/covcmd;
 
-    encoding/json,
+	encoding/json,
 	runtime/debug,
 	internal/coverage/calloc,
 	internal/coverage/cformat,
 	internal/coverage/decodecounter, internal/coverage/decodemeta,
 	internal/coverage/encodecounter, internal/coverage/encodemeta,
 	internal/coverage/pods
+	< internal/coverage/cfile
 	< runtime/coverage;
+
+	internal/coverage/cfile, internal/fuzz, internal/testlog, runtime/pprof, regexp
+	< testing/internal/testdeps;
+
+	# Test-only packages can have anything they want
+
+	FMT, compress/gzip, embed, encoding/binary
+	< encoding/json/internal/jsontest;
+
+	CGO, internal/syscall/unix
+	< net/internal/cgotest;
+
+	FMT, testing
+	< internal/cgrouptest;
+
+	regexp, internal/testenv, internal/trace, internal/trace/raw, internal/txtar, testing
+	< internal/trace/testtrace;
+
+	C, CGO
+	< internal/runtime/cgobench;
+
+	# Generate-only packages can have anything they want.
+
+	container/heap,
+	encoding/binary,
+	fmt,
+	hash/maphash,
+	io,
+	log,
+	math/bits,
+	os,
+	reflect,
+	strings,
+	sync
+	< internal/runtime/gc/internal/gen;
+
+	regexp, internal/txtar, internal/trace, internal/trace/raw
+	< internal/trace/internal/testgen;
+
+	FMT
+	< math/big/internal/asmgen;
 `
 
 // listStdPkgs returns the same list of packages as "go list std".
@@ -713,21 +971,30 @@ func listStdPkgs(goroot string) ([]string, error) {
 }
 
 func TestDependencies(t *testing.T) {
-	if !testenv.HasSrc() {
-		// Tests run in a limited file system and we do not
-		// provide access to every source file.
-		t.Skipf("skipping on %s/%s, missing full GOROOT", runtime.GOOS, runtime.GOARCH)
-	}
+	testenv.MustHaveSource(t)
 
 	ctxt := Default
 	all, err := listStdPkgs(ctxt.GOROOT)
 	if err != nil {
 		t.Fatal(err)
 	}
-	sort.Strings(all)
+	slices.Sort(all)
 
 	sawImport := map[string]map[string]bool{} // from package => to package => true
 	policy := depsPolicy(t)
+
+	// The vendored golang.org/x/tools packages that have no rule of
+	// their own form a single node (see depsRules).
+	defined := make(map[string]bool)
+	for _, n := range policy.Nodes {
+		defined[n] = true
+	}
+	node := func(pkg string) string {
+		if strings.HasPrefix(pkg, "golang.org/x/tools/") && !defined[pkg] {
+			return "golang.org/x/tools/..."
+		}
+		return pkg
+	}
 
 	for _, pkg := range all {
 		imports, err := findImports(pkg)
@@ -741,7 +1008,11 @@ func TestDependencies(t *testing.T) {
 		var bad []string
 		for _, imp := range imports {
 			sawImport[pkg][imp] = true
-			if !policy.HasEdge(pkg, imp) {
+			from, to := node(pkg), node(imp)
+			if from == to {
+				continue // within golang.org/x/tools/...
+			}
+			if !policy.HasEdge(from, to) {
 				bad = append(bad, imp)
 			}
 		}
@@ -805,7 +1076,7 @@ func findImports(pkg string) ([]string, error) {
 			}
 		}
 	}
-	sort.Strings(imports)
+	slices.Sort(imports)
 	return imports, nil
 }
 
@@ -821,9 +1092,7 @@ func depsPolicy(t *testing.T) *dag.Graph {
 // TestStdlibLowercase tests that all standard library package names are
 // lowercase. See Issue 40065.
 func TestStdlibLowercase(t *testing.T) {
-	if !testenv.HasSrc() {
-		t.Skipf("skipping on %s/%s, missing full GOROOT", runtime.GOOS, runtime.GOARCH)
-	}
+	testenv.MustHaveSource(t)
 
 	ctxt := Default
 	all, err := listStdPkgs(ctxt.GOROOT)

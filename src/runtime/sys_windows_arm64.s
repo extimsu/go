@@ -6,100 +6,15 @@
 #include "go_tls.h"
 #include "textflag.h"
 #include "funcdata.h"
-#include "time_windows.h"
 #include "cgo/abi_arm64.h"
 
 // Offsets into Thread Environment Block (pointer in R18)
 #define TEB_error 0x68
-#define TEB_TlsSlots 0x1480
-#define TEB_ArbitraryPtr 0x28
 
 // Note: R0-R7 are args, R8 is indirect return value address,
 // R9-R15 are caller-save, R19-R29 are callee-save.
 //
 // load_g and save_g (in tls_arm64.s) clobber R27 (REGTMP) and R0.
-
-TEXT runtime·asmstdcall_trampoline<ABIInternal>(SB),NOSPLIT,$0
-	B	runtime·asmstdcall(SB)
-
-// void runtime·asmstdcall(void *c);
-TEXT runtime·asmstdcall(SB),NOSPLIT,$16
-	STP	(R19, R20), 16(RSP) // save old R19, R20
-	MOVD	R0, R19	// save libcall pointer
-	MOVD	RSP, R20	// save stack pointer
-
-	// SetLastError(0)
-	MOVD	$0,	TEB_error(R18_PLATFORM)
-	MOVD	libcall_args(R19), R12	// libcall->args
-
-	// Do we have more than 8 arguments?
-	MOVD	libcall_n(R19), R0
-	CMP	$0,	R0; BEQ	_0args
-	CMP	$1,	R0; BEQ	_1args
-	CMP	$2,	R0; BEQ	_2args
-	CMP	$3,	R0; BEQ	_3args
-	CMP	$4,	R0; BEQ	_4args
-	CMP	$5,	R0; BEQ	_5args
-	CMP	$6,	R0; BEQ	_6args
-	CMP	$7,	R0; BEQ	_7args
-	CMP	$8,	R0; BEQ	_8args
-
-	// Reserve stack space for remaining args
-	SUB	$8, R0, R2
-	ADD	$1, R2, R3 // make even number of words for stack alignment
-	AND	$~1, R3
-	LSL	$3, R3
-	SUB	R3, RSP
-
-	// R4: size of stack arguments (n-8)*8
-	// R5: &args[8]
-	// R6: loop counter, from 0 to (n-8)*8
-	// R7: scratch
-	// R8: copy of RSP - (R2)(RSP) assembles as (R2)(ZR)
-	SUB	$8, R0, R4
-	LSL	$3, R4
-	ADD	$(8*8), R12, R5
-	MOVD	$0, R6
-	MOVD	RSP, R8
-stackargs:
-	MOVD	(R6)(R5), R7
-	MOVD	R7, (R6)(R8)
-	ADD	$8, R6
-	CMP	R6, R4
-	BNE	stackargs
-
-_8args:
-	MOVD	(7*8)(R12), R7
-_7args:
-	MOVD	(6*8)(R12), R6
-_6args:
-	MOVD	(5*8)(R12), R5
-_5args:
-	MOVD	(4*8)(R12), R4
-_4args:
-	MOVD	(3*8)(R12), R3
-_3args:
-	MOVD	(2*8)(R12), R2
-_2args:
-	MOVD	(1*8)(R12), R1
-_1args:
-	MOVD	(0*8)(R12), R0
-_0args:
-
-	MOVD	libcall_fn(R19), R12	// branch to libcall->fn
-	BL	(R12)
-
-	MOVD	R20, RSP			// free stack space
-	MOVD	R0, libcall_r1(R19)		// save return value to libcall->r1
-	// TODO(rsc) floating point like amd64 in libcall->r2?
-
-	// GetLastError
-	MOVD	TEB_error(R18_PLATFORM), R0
-	MOVD	R0, libcall_err(R19)
-
-	// Restore callee-saved registers.
-	LDP	16(RSP), (R19, R20)
-	RET
 
 TEXT runtime·getlasterror(SB),NOSPLIT,$0
 	MOVD	TEB_error(R18_PLATFORM), R0
@@ -228,36 +143,21 @@ TEXT runtime·tstart_stdcall(SB),NOSPLIT,$96-0
 	MOVD	$0, R0
 	RET
 
-TEXT runtime·nanotime1(SB),NOSPLIT,$0-8
-	MOVD	$_INTERRUPT_TIME, R3
-	MOVD	time_lo(R3), R0
+TEXT runtime·nanotime2<ABIInternal>(SB),NOSPLIT,$40-0
+	NO_LOCAL_POINTERS
+	// asmcgocall passes the result pointer in R0 using the Windows ABI.
+	// Save LastError outside the call's argument and result slots.
+	MOVWU	TEB_error(R18_PLATFORM), R1
+	MOVW	R1, 40(RSP)
+	MOVD	runtime·_QueryInterruptTimePrecise(SB), R0
+	MOVD	R0, 8(RSP)
+	MOVD	$32(RSP), R0
+	MOVD	R0, 16(RSP)
+	BL	runtime·asmcgocall(SB)
+	MOVWU	40(RSP), R1
+	MOVW	R1, TEB_error(R18_PLATFORM)
+	MOVD	32(RSP), R0
 	MOVD	$100, R1
 	MUL	R1, R0
-	MOVD	R0, ret+0(FP)
 	RET
 
-// This is called from rt0_go, which runs on the system stack
-// using the initial stack allocated by the OS.
-// It calls back into standard C using the BL below.
-TEXT runtime·wintls(SB),NOSPLIT,$0
-	// Allocate a TLS slot to hold g across calls to external code
-	MOVD	runtime·_TlsAlloc(SB), R0
-	SUB	$16, RSP	// skip over saved frame pointer below RSP
-	BL	(R0)
-	ADD	$16, RSP
-
-	// Assert that slot is less than 64 so we can use _TEB->TlsSlots
-	CMP	$64, R0
-	BLT	ok
-	// Fallback to the TEB arbitrary pointer.
-	// TODO: don't use the arbitrary pointer (see go.dev/issue/59824)
-	MOVD	$TEB_ArbitraryPtr, R0
-	B	settls
-ok:
-
-	// Save offset from R18 into tls_g.
-	LSL	$3, R0
-	ADD	$TEB_TlsSlots, R0
-settls:
-	MOVD	R0, runtime·tls_g(SB)
-	RET

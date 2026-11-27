@@ -85,12 +85,17 @@ const (
 
 	_EV_ADD       = 0x1
 	_EV_DELETE    = 0x2
+	_EV_ENABLE    = 0x4
+	_EV_DISABLE   = 0x8
 	_EV_CLEAR     = 0x20
 	_EV_RECEIPT   = 0x40
 	_EV_ERROR     = 0x4000
 	_EV_EOF       = 0x8000
 	_EVFILT_READ  = -0x1
 	_EVFILT_WRITE = -0x2
+	_EVFILT_USER  = -0xa
+
+	_NOTE_TRIGGER = 0x1000000
 
 	_PTHREAD_CREATE_DETACHED = 0x2
 
@@ -104,6 +109,9 @@ const (
 
 	_VM_REGION_BASIC_INFO_COUNT_64 = 0x9
 	_VM_REGION_BASIC_INFO_64       = 0x9
+
+	_MACH_TASK_BASIC_INFO       = 0x14
+	_MACH_TASK_BASIC_INFO_COUNT = 0xc
 )
 
 type stackt struct {
@@ -375,7 +383,18 @@ type machTimebaseInfo struct {
 	denom uint32
 }
 
+type machTaskBasicInfo struct {
+	virtual_size      uint64
+	resident_size     uint64
+	resident_size_max uint64
+	user_time         [2]int32
+	system_time       [2]int32
+	policy            int32
+	suspend_count     int32
+}
+
 type machPort uint32
+type machTaskFlavour uint32
 type machVMMapRead uint32
 type machVMAddress uint64
 type machVMSize uint64

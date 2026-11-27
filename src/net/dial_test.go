@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"internal/testenv"
 	"io"
+	"net/netip"
 	"os"
 	"runtime"
 	"strings"
@@ -231,7 +232,6 @@ func TestDialParallel(t *testing.T) {
 	}
 
 	for i, tt := range testCases {
-		i, tt := i, tt
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
 			dialTCP := func(ctx context.Context, network string, laddr, raddr *TCPAddr) (*TCPConn, error) {
 				n := "tcp6"
@@ -526,7 +526,7 @@ func TestDialerLocalAddr(t *testing.T) {
 	type test struct {
 		network, raddr string
 		laddr          Addr
-		error
+		error          error
 	}
 	var tests = []test{
 		{"tcp4", "127.0.0.1", nil, nil},
@@ -690,6 +690,10 @@ func TestDialerDualStack(t *testing.T) {
 }
 
 func TestDialerKeepAlive(t *testing.T) {
+	t.Cleanup(func() {
+		testHookSetKeepAlive = func(KeepAliveConfig) {}
+	})
+
 	handler := func(ls *localServer, ln Listener) {
 		for {
 			c, err := ln.Accept()
@@ -699,26 +703,30 @@ func TestDialerKeepAlive(t *testing.T) {
 			c.Close()
 		}
 	}
-	ls := newLocalServer(t, "tcp")
+	ln := newLocalListener(t, "tcp", &ListenConfig{
+		KeepAlive: -1, // prevent calling hook from accepting
+	})
+	ls := (&streamListener{Listener: ln}).newLocalServer()
 	defer ls.teardown()
 	if err := ls.buildup(handler); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { testHookSetKeepAlive = func(time.Duration) {} }()
 
 	tests := []struct {
 		ka       time.Duration
 		expected time.Duration
 	}{
 		{-1, -1},
-		{0, 15 * time.Second},
+		{0, 0},
 		{5 * time.Second, 5 * time.Second},
 		{30 * time.Second, 30 * time.Second},
 	}
 
+	var got time.Duration = -1
+	testHookSetKeepAlive = func(cfg KeepAliveConfig) { got = cfg.Idle }
+
 	for _, test := range tests {
-		var got time.Duration = -1
-		testHookSetKeepAlive = func(d time.Duration) { got = d }
+		got = -1
 		d := Dialer{KeepAlive: test.ka}
 		c, err := d.Dial("tcp", ls.Listener.Addr().String())
 		if err != nil {
@@ -1054,6 +1062,128 @@ func TestDialerControlContext(t *testing.T) {
 			})
 		}
 	})
+}
+
+func TestDialContext(t *testing.T) {
+	switch runtime.GOOS {
+	case "plan9":
+		t.Skipf("not supported on %s", runtime.GOOS)
+	case "js", "wasip1":
+		t.Skipf("skipping: fake net does not support Dialer.ControlContext")
+	}
+
+	t.Run("StreamDial", func(t *testing.T) {
+		var err error
+		for i, network := range []string{"tcp", "tcp4", "tcp6", "unix", "unixpacket"} {
+			if !testableNetwork(network) {
+				continue
+			}
+			ln := newLocalListener(t, network)
+			defer ln.Close()
+			var id int
+			d := Dialer{ControlContext: func(ctx context.Context, network string, address string, c syscall.RawConn) error {
+				id = ctx.Value("id").(int)
+				return controlOnConnSetup(network, address, c)
+			}}
+			var c Conn
+			switch network {
+			case "tcp", "tcp4", "tcp6":
+				var raddr netip.AddrPort
+				raddr, err = netip.ParseAddrPort(ln.Addr().String())
+				if err != nil {
+					t.Error(err)
+					continue
+				}
+				c, err = d.DialTCP(context.WithValue(context.Background(), "id", i+1), network, (*TCPAddr)(nil).AddrPort(), raddr)
+			case "unix", "unixpacket":
+				var raddr *UnixAddr
+				raddr, err = ResolveUnixAddr(network, ln.Addr().String())
+				if err != nil {
+					t.Error(err)
+					continue
+				}
+				c, err = d.DialUnix(context.WithValue(context.Background(), "id", i+1), network, nil, raddr)
+			}
+			if err != nil {
+				t.Error(err)
+				continue
+			}
+			if id != i+1 {
+				t.Errorf("%s: got id %d, want %d", network, id, i+1)
+			}
+			c.Close()
+		}
+	})
+	t.Run("PacketDial", func(t *testing.T) {
+		var err error
+		for i, network := range []string{"udp", "udp4", "udp6", "unixgram"} {
+			if !testableNetwork(network) {
+				continue
+			}
+			c1 := newLocalPacketListener(t, network)
+			if network == "unixgram" {
+				defer os.Remove(c1.LocalAddr().String())
+			}
+			defer c1.Close()
+			var id int
+			d := Dialer{ControlContext: func(ctx context.Context, network string, address string, c syscall.RawConn) error {
+				id = ctx.Value("id").(int)
+				return controlOnConnSetup(network, address, c)
+			}}
+			var c2 Conn
+			switch network {
+			case "udp", "udp4", "udp6":
+				var raddr netip.AddrPort
+				raddr, err = netip.ParseAddrPort(c1.LocalAddr().String())
+				if err != nil {
+					t.Error(err)
+					continue
+				}
+				c2, err = d.DialUDP(context.WithValue(context.Background(), "id", i+1), network, (*UDPAddr)(nil).AddrPort(), raddr)
+			case "unixgram":
+				var raddr *UnixAddr
+				raddr, err = ResolveUnixAddr(network, c1.LocalAddr().String())
+				if err != nil {
+					t.Error(err)
+					continue
+				}
+				c2, err = d.DialUnix(context.WithValue(context.Background(), "id", i+1), network, nil, raddr)
+			}
+			if err != nil {
+				t.Error(err)
+				continue
+			}
+			if id != i+1 {
+				t.Errorf("%s: got id %d, want %d", network, id, i+1)
+			}
+			c2.Close()
+		}
+	})
+}
+
+func TestDialNetipInvalidRaddr(t *testing.T) {
+	assertErrMissingAddress := func(t *testing.T, name string, err error) {
+		t.Helper()
+		if err == nil {
+			t.Errorf("%s err = nil", name)
+			return
+		}
+		e, ok := err.(*OpError)
+		if !ok {
+			t.Errorf("%s err = %#v, want *OpError", name, err)
+			return
+		}
+		if e.Err != errMissingAddress {
+			t.Errorf("%s err = %#v, want *OpError errMissingAddress", name, err)
+		}
+	}
+	var d Dialer
+	_, err := d.DialTCP(t.Context(), "tcp", netip.AddrPort{}, netip.AddrPort{})
+	assertErrMissingAddress(t, "DialTCP()", err)
+	_, err = d.DialUDP(t.Context(), "udp", netip.AddrPort{}, netip.AddrPort{})
+	assertErrMissingAddress(t, "DialUDP()", err)
+	_, err = d.DialIP(t.Context(), "ip6:ipv6-icmp", netip.Addr{}, netip.Addr{})
+	assertErrMissingAddress(t, "DialIP()", err)
 }
 
 // mustHaveExternalNetwork is like testenv.MustHaveExternalNetwork

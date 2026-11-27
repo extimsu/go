@@ -202,6 +202,7 @@ type Decoder struct {
 	buf            bytes.Buffer
 	saved          *bytes.Buffer
 	stk            *stack
+	stkDepth       int
 	free           *stack
 	needClose      bool
 	toClose        Name
@@ -212,7 +213,7 @@ type Decoder struct {
 	line           int
 	linestart      int64
 	offset         int64
-	unmarshalDepth int
+	inUnmarshalXML bool
 }
 
 // NewDecoder creates a new XML parser reading from r.
@@ -398,6 +399,9 @@ func (d *Decoder) push(kind int) *stack {
 	}
 	s.next = d.stk
 	s.kind = kind
+	if kind == stkStart {
+		d.stkDepth++
+	}
 	d.stk = s
 	return s
 }
@@ -405,6 +409,9 @@ func (d *Decoder) push(kind int) *stack {
 func (d *Decoder) pop() *stack {
 	s := d.stk
 	if s != nil {
+		if s.kind == stkStart {
+			d.stkDepth--
+		}
 		d.stk = s.next
 		s.next = d.free
 		d.free = s
@@ -492,8 +499,12 @@ func (d *Decoder) popElement(t *EndElement) bool {
 		d.err = d.syntaxError("element <" + s.name.Local + "> closed by </" + name.Local + ">")
 		return false
 	case s.name.Space != name.Space:
+		ns := name.Space
+		if name.Space == "" {
+			ns = `""`
+		}
 		d.err = d.syntaxError("element <" + s.name.Local + "> in space " + s.name.Space +
-			" closed by </" + name.Local + "> in space " + name.Space)
+			" closed by </" + name.Local + "> in space " + ns)
 		return false
 	}
 
@@ -538,7 +549,7 @@ var errRawToken = errors.New("xml: cannot use RawToken from UnmarshalXML method"
 // start and end elements match and does not translate
 // name space prefixes to their corresponding URLs.
 func (d *Decoder) RawToken() (Token, error) {
-	if d.unmarshalDepth > 0 {
+	if d.inUnmarshalXML {
 		return nil, errRawToken
 	}
 	return d.rawToken()
@@ -1000,8 +1011,9 @@ Input:
 		}
 
 		// <![CDATA[ section ends with ]]>.
-		// It is an error for ]]> to appear in ordinary text.
-		if b0 == ']' && b1 == ']' && b == '>' {
+		// It is an error for ]]> to appear in ordinary text,
+		// but it is allowed in quoted strings.
+		if quote < 0 && b0 == ']' && b1 == ']' && b == '>' {
 			if cdata {
 				trunc = 2
 				break Input
@@ -2045,16 +2057,27 @@ func procInst(param, s string) string {
 	// TODO: this parsing is somewhat lame and not exact.
 	// It works for all actual cases, though.
 	param = param + "="
-	_, v, _ := strings.Cut(s, param)
-	if v == "" {
+	lenp := len(param)
+	i := 0
+	var sep byte
+	for i < len(s) {
+		sub := s[i:]
+		k := strings.Index(sub, param)
+		if k < 0 || lenp+k >= len(sub) {
+			return ""
+		}
+		i += lenp + k + 1
+		if c := sub[lenp+k]; c == '\'' || c == '"' {
+			sep = c
+			break
+		}
+	}
+	if sep == 0 {
 		return ""
 	}
-	if v[0] != '\'' && v[0] != '"' {
+	j := strings.IndexByte(s[i:], sep)
+	if j < 0 {
 		return ""
 	}
-	unquote, _, ok := strings.Cut(v[1:], v[:1])
-	if !ok {
-		return ""
-	}
-	return unquote
+	return s[i : i+j]
 }

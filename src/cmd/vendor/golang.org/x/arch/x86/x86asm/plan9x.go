@@ -34,7 +34,7 @@ func GoSyntax(inst Inst, pc uint64, symname SymLookup) string {
 	var rep string
 	var last Prefix
 	for _, p := range inst.Prefix {
-		if p == 0 || p.IsREX() || p.IsVEX() {
+		if p == 0 || p.IsREX() || p.IsVEX() || p.IsEVEX() {
 			break
 		}
 
@@ -62,13 +62,96 @@ func GoSyntax(inst Inst, pc uint64, symname SymLookup) string {
 	}
 
 	op := inst.Op.String()
-	if plan9Suffix[inst.Op] {
+	if inst.Op == MOVD {
+		// MOVD is the 32-bit move between a general register or memory and
+		// an MMX/XMM register. cmd/asm spells that form MOVL; its MOVD is a
+		// synonym for the 64-bit MOVQ.
+		op = "MOVL"
+	}
+	if condition := plan9CMOV[inst.Op]; condition != "" {
+		s := inst.DataSize
+		if inst.MemBytes != 0 {
+			s = inst.MemBytes * 8
+		}
+		op = "CMOV"
+		switch s {
+		case 16:
+			op += "W"
+		case 32:
+			op += "L"
+		case 64:
+			op += "Q"
+		}
+		op += condition
+	} else if inst.Op == VFPCLASSPD || inst.Op == VFPCLASSPS || inst.Op == VCVTTPD2DQ || inst.Op == VCVTTPD2UDQ || inst.Op == VCVTTPD2QQ || inst.Op == VCVTTPD2UQQ || inst.Op == VCVTPD2DQ || inst.Op == VCVTPD2UDQ || inst.Op == VCVTPD2QQ || inst.Op == VCVTPD2UQQ || inst.Op == VCVTPD2PS {
+		vexL := 0
+		isEvex := false
+		for i, p := range inst.Prefix {
+			if p.IsEVEX() && i+3 < len(inst.Prefix) && inst.Prefix[i+3] != 0 {
+				vexL = int((inst.Prefix[i+3]&0xFF)>>5) & 3
+				isEvex = true
+				break
+			} else if p.IsVEX() && i+2 < len(inst.Prefix) {
+				if p&0xFF == 0xC4 {
+					vexL = int((inst.Prefix[i+2]&0xFF)>>2) & 1
+				} else if p&0xFF == 0xC5 {
+					vexL = int((inst.Prefix[i+1]&0xFF)>>2) & 1
+				}
+				break
+			}
+		}
+		if !isEvex || inst.Op == VFPCLASSPD || inst.Op == VFPCLASSPS || inst.Op == VCVTPD2DQ {
+			switch vexL {
+			case 0:
+				op += "X"
+			case 1:
+				if inst.Op != VCMPPD && inst.Op != VCMPPS && inst.Op != VCMPPH && inst.Op != VCMPBF16 {
+					op += "Y"
+				}
+			case 2:
+				if inst.Op != VCMPPD && inst.Op != VCMPPS && inst.Op != VCMPPH && inst.Op != VCMPBF16 {
+					op += "Z"
+				}
+			}
+		}
+	} else if inst.Op == VCVTTSD2SI || inst.Op == VCVTTSS2SI || inst.Op == VCVTSD2SI || inst.Op == VCVTSS2SI || inst.Op == VCVTSI2SD || inst.Op == VCVTSI2SS {
+		is64 := false
+		if (inst.Op == VCVTSI2SD || inst.Op == VCVTSI2SS) && inst.MemBytes == 8 {
+			is64 = true
+		} else {
+			for _, a := range inst.Args {
+				if r, ok := a.(Reg); ok && RAX <= r && r <= R15 {
+					is64 = true
+					break
+				}
+			}
+		}
+		if inst.Op == VCVTSI2SD || inst.Op == VCVTSI2SS {
+			if is64 {
+				op += "Q"
+			} else {
+				op += "L"
+			}
+		} else {
+			if is64 {
+				op += "Q"
+			}
+		}
+	} else if plan9Suffix[inst.Op] {
 		s := inst.DataSize
 		if inst.MemBytes != 0 {
 			s = inst.MemBytes * 8
 		} else if inst.Args[1] == nil { // look for register-only 64-bit instruction, like PUSHQ AX
 			if r, ok := inst.Args[0].(Reg); ok && RAX <= r && r <= R15 {
 				s = 64
+			}
+		}
+		// The byte forms of these opcodes do not use the operand-size
+		// attribute, so DataSize is 32 even though they operate on 8-bit
+		// registers. cmd/asm spells them with the B suffix (CMPB R8, $0xc).
+		if i, ok := plan9ByteWidthArg[inst.Op]; ok {
+			if r, ok := inst.Args[i].(Reg); ok && AL <= r && r <= R15B {
+				s = 8
 			}
 		}
 		switch s {
@@ -81,6 +164,29 @@ func GoSyntax(inst Inst, pc uint64, symname SymLookup) string {
 		case 64:
 			op += "Q"
 		}
+	}
+
+	if inst.Broadcast {
+		op += ".BCST"
+	}
+	if inst.SAE {
+		if hasRC(inst.Op) {
+			switch inst.Rounding {
+			case 0:
+				op += ".RN_SAE"
+			case 1:
+				op += ".RD_SAE"
+			case 2:
+				op += ".RU_SAE"
+			case 3:
+				op += ".RZ_SAE"
+			}
+		} else {
+			op += ".SAE"
+		}
+	}
+	if inst.Zeroing {
+		op += ".Z"
 	}
 
 	if inst.Op == CMP {
@@ -116,12 +222,23 @@ func plan9Arg(inst *Inst, pc uint64, symname func(uint64) (string, uint64), arg 
 		return fmt.Sprintf("%#x", addr)
 
 	case Imm:
-		if s, base := symname(uint64(a)); s != "" {
-			suffix := ""
-			if uint64(a) != base {
-				suffix = fmt.Sprintf("%+d", uint64(a)-base)
+		if (inst.Op == MOV || inst.Op == PUSH) && inst.DataSize == 32 {
+			// Only try to convert an immediate to a symbol in certain
+			// special circumstances. See issue 72942.
+			//
+			// On 64-bit, symbol addresses always hit the Mem case below.
+			// Particularly, we use LEAQ to materialize the address of
+			// a global or function.
+			//
+			// On 32-bit, we sometimes use MOVL. Still try to symbolize
+			// those immediates.
+			if s, base := symname(uint64(a)); s != "" {
+				suffix := ""
+				if uint64(a) != base {
+					suffix = fmt.Sprintf("%+d", uint64(a)-base)
+				}
+				return fmt.Sprintf("$%s%s(SB)", s, suffix)
 			}
-			return fmt.Sprintf("$%s%s(SB)", s, suffix)
 		}
 		if inst.Mode == 32 {
 			return fmt.Sprintf("$%#x", uint32(a))
@@ -177,16 +294,41 @@ func memArgToSymbol(a Mem, pc uint64, instrLen int, symname SymLookup) (string, 
 	return s, int64(disp) - int64(base)
 }
 
+var plan9CMOV = map[Op]string{
+	CMOVA:  "HI",
+	CMOVAE: "CC",
+	CMOVB:  "CS",
+	CMOVBE: "LS",
+	CMOVE:  "EQ",
+	CMOVNE: "NE",
+	CMOVG:  "GT",
+	CMOVGE: "GE",
+	CMOVL:  "LT",
+	CMOVLE: "LE",
+	CMOVO:  "OS",
+	CMOVNO: "OC",
+	CMOVS:  "MI",
+	CMOVNS: "PL",
+	CMOVP:  "PS",
+	CMOVNP: "PC",
+}
+
 var plan9Suffix = [maxOp + 1]bool{
 	ADC:       true,
 	ADD:       true,
 	AND:       true,
+	ANDN:      true,
+	BEXTR:     true,
+	BLSI:      true,
+	BLSMSK:    true,
+	BLSR:      true,
 	BSF:       true,
 	BSR:       true,
 	BT:        true,
 	BTC:       true,
 	BTR:       true,
 	BTS:       true,
+	BZHI:      true,
 	CMP:       true,
 	CMPXCHG:   true,
 	CVTSI2SD:  true,
@@ -207,11 +349,14 @@ var plan9Suffix = [maxOp + 1]bool{
 	MOV:       true,
 	MOVNTI:    true,
 	MUL:       true,
+	MULX:      true,
 	NEG:       true,
 	NOP:       true,
 	NOT:       true,
 	OR:        true,
 	OUT:       true,
+	PDEP:      true,
+	PEXT:      true,
 	POP:       true,
 	POPA:      true,
 	POPCNT:    true,
@@ -221,17 +366,58 @@ var plan9Suffix = [maxOp + 1]bool{
 	RCR:       true,
 	ROL:       true,
 	ROR:       true,
+	RORX:      true,
 	SAR:       true,
+	SARX:      true,
 	SBB:       true,
 	SHL:       true,
+	SHLX:      true,
 	SHLD:      true,
 	SHR:       true,
+	SHRX:      true,
 	SHRD:      true,
 	SUB:       true,
 	TEST:      true,
 	XADD:      true,
 	XCHG:      true,
 	XOR:       true,
+}
+
+// plan9ByteWidthArg lists the instructions that have a byte form and, for
+// each, the index (in Intel operand order) of the operand whose register
+// width selects the B suffix. Other register operands never do: the CL
+// shift count of SHL/ROL/..., or the shift amount of the BMI2 SHLX/SHRX/
+// SARX, which has no byte form at all. Memory operands are sized through
+// MemBytes.
+var plan9ByteWidthArg = map[Op]int{
+	ADC:     0,
+	ADD:     0,
+	AND:     0,
+	CMP:     0,
+	CMPXCHG: 0,
+	DEC:     0,
+	DIV:     0,
+	IDIV:    0,
+	IMUL:    0, // only the one-operand form has a byte encoding
+	INC:     0,
+	MOV:     0,
+	MUL:     0,
+	NEG:     0,
+	NOT:     0,
+	OR:      0,
+	RCL:     0,
+	RCR:     0,
+	ROL:     0,
+	ROR:     0,
+	SAR:     0,
+	SBB:     0,
+	SHL:     0,
+	SHR:     0,
+	SUB:     0,
+	TEST:    0,
+	XADD:    0,
+	XCHG:    0,
+	XOR:     0,
 }
 
 var plan9Reg = [...]string{
@@ -338,6 +524,94 @@ var plan9Reg = [...]string{
 	X13:  "X13",
 	X14:  "X14",
 	X15:  "X15",
+	X16:  "X16",
+	X17:  "X17",
+	X18:  "X18",
+	X19:  "X19",
+	X20:  "X20",
+	X21:  "X21",
+	X22:  "X22",
+	X23:  "X23",
+	X24:  "X24",
+	X25:  "X25",
+	X26:  "X26",
+	X27:  "X27",
+	X28:  "X28",
+	X29:  "X29",
+	X30:  "X30",
+	X31:  "X31",
+	Y0:   "Y0",
+	Y1:   "Y1",
+	Y2:   "Y2",
+	Y3:   "Y3",
+	Y4:   "Y4",
+	Y5:   "Y5",
+	Y6:   "Y6",
+	Y7:   "Y7",
+	Y8:   "Y8",
+	Y9:   "Y9",
+	Y10:  "Y10",
+	Y11:  "Y11",
+	Y12:  "Y12",
+	Y13:  "Y13",
+	Y14:  "Y14",
+	Y15:  "Y15",
+	Y16:  "Y16",
+	Y17:  "Y17",
+	Y18:  "Y18",
+	Y19:  "Y19",
+	Y20:  "Y20",
+	Y21:  "Y21",
+	Y22:  "Y22",
+	Y23:  "Y23",
+	Y24:  "Y24",
+	Y25:  "Y25",
+	Y26:  "Y26",
+	Y27:  "Y27",
+	Y28:  "Y28",
+	Y29:  "Y29",
+	Y30:  "Y30",
+	Y31:  "Y31",
+	Z0:   "Z0",
+	Z1:   "Z1",
+	Z2:   "Z2",
+	Z3:   "Z3",
+	Z4:   "Z4",
+	Z5:   "Z5",
+	Z6:   "Z6",
+	Z7:   "Z7",
+	Z8:   "Z8",
+	Z9:   "Z9",
+	Z10:  "Z10",
+	Z11:  "Z11",
+	Z12:  "Z12",
+	Z13:  "Z13",
+	Z14:  "Z14",
+	Z15:  "Z15",
+	Z16:  "Z16",
+	Z17:  "Z17",
+	Z18:  "Z18",
+	Z19:  "Z19",
+	Z20:  "Z20",
+	Z21:  "Z21",
+	Z22:  "Z22",
+	Z23:  "Z23",
+	Z24:  "Z24",
+	Z25:  "Z25",
+	Z26:  "Z26",
+	Z27:  "Z27",
+	Z28:  "Z28",
+	Z29:  "Z29",
+	Z30:  "Z30",
+	Z31:  "Z31",
+	K0:   "K0",
+	K1:   "K1",
+	K2:   "K2",
+	K3:   "K3",
+	K4:   "K4",
+	K5:   "K5",
+	K6:   "K6",
+	K7:   "K7",
 	CS:   "CS",
 	SS:   "SS",
 	DS:   "DS",

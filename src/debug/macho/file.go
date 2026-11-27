@@ -26,6 +26,7 @@ import (
 	"internal/saferio"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -39,6 +40,7 @@ type File struct {
 	Symtab   *Symtab
 	Dysymtab *Dysymtab
 
+	name   string
 	closer io.Closer
 }
 
@@ -228,6 +230,9 @@ func (f *File) Close() error {
 // The Mach-O binary is expected to start at position 0 in the ReaderAt.
 func NewFile(r io.ReaderAt) (*File, error) {
 	f := new(File)
+	if rf, ok := r.(*os.File); ok {
+		f.name = rf.Name()
+	}
 	sr := io.NewSectionReader(r, 0, 1<<63-1)
 
 	// Read and decode Mach magic to determine byte order, size.
@@ -610,15 +615,33 @@ func (f *File) Section(name string) *Section {
 // DWARF returns the DWARF debug information for the Mach-O file.
 func (f *File) DWARF() (*dwarf.Data, error) {
 	dwarfSuffix := func(s *Section) string {
+		sectname := s.Name
+		var pfx int
 		switch {
-		case strings.HasPrefix(s.Name, "__debug_"):
-			return s.Name[8:]
-		case strings.HasPrefix(s.Name, "__zdebug_"):
-			return s.Name[9:]
+		case strings.HasPrefix(sectname, "__debug_"):
+			pfx = 8
+		case strings.HasPrefix(sectname, "__zdebug_"):
+			pfx = 9
 		default:
 			return ""
 		}
-
+		// Mach-O executables truncate section names to 16 characters, mangling some DWARF sections.
+		// As of DWARFv5 these are the only problematic section names (see DWARFv5 Appendix G).
+		for _, longname := range []string{
+			"__debug_str_offsets",
+			"__zdebug_line_str",
+			"__zdebug_loclists",
+			"__zdebug_pubnames",
+			"__zdebug_pubtypes",
+			"__zdebug_rnglists",
+			"__zdebug_str_offsets",
+		} {
+			if sectname == longname[:16] {
+				sectname = longname
+				break
+			}
+		}
+		return sectname[pfx:]
 	}
 	sectionData := func(s *Section) ([]byte, error) {
 		b, err := s.Data()
@@ -628,12 +651,12 @@ func (f *File) DWARF() (*dwarf.Data, error) {
 
 		if len(b) >= 12 && string(b[:4]) == "ZLIB" {
 			dlen := binary.BigEndian.Uint64(b[4:12])
-			dbuf := make([]byte, dlen)
 			r, err := zlib.NewReader(bytes.NewBuffer(b[12:]))
 			if err != nil {
 				return nil, err
 			}
-			if _, err := io.ReadFull(r, dbuf); err != nil {
+			dbuf, err := saferio.ReadData(r, dlen)
+			if err != nil {
 				return nil, err
 			}
 			if err := r.Close(); err != nil {
@@ -665,6 +688,21 @@ func (f *File) DWARF() (*dwarf.Data, error) {
 
 	d, err := dwarf.New(dat["abbrev"], nil, nil, dat["info"], dat["line"], nil, dat["ranges"], dat["str"])
 	if err != nil {
+		// Loading DWARF failed. Try loading it from a split DWARF file in
+		// <file>.dSYM/Contents/Resources/DWARF. Check UUID to ensure it is
+		// for the same binary.
+		if f.name != "" {
+			if u := f.uuid(); u != nil {
+				dsym := filepath.Join(f.name+".dSYM", "Contents", "Resources", "DWARF", filepath.Base(f.name))
+				if df, err := Open(dsym); err == nil {
+					defer df.Close()
+					if bytes.Equal(u, df.uuid()) {
+						df.name = ""
+						return df.DWARF()
+					}
+				}
+			}
+		}
 		return nil, err
 	}
 
@@ -697,19 +735,44 @@ func (f *File) DWARF() (*dwarf.Data, error) {
 	return d, nil
 }
 
+func (f *File) uuid() []byte {
+	const loadCmdUUID = 0x1b // LC_UUID
+	for _, l := range f.Loads {
+		raw := l.Raw()
+		if len(raw) >= 24 && f.ByteOrder.Uint32(raw[:4]) == loadCmdUUID {
+			return raw[8:24]
+		}
+	}
+	return nil
+}
+
 // ImportedSymbols returns the names of all symbols
 // referred to by the binary f that are expected to be
 // satisfied by other libraries at dynamic load time.
 func (f *File) ImportedSymbols() ([]string, error) {
-	if f.Dysymtab == nil || f.Symtab == nil {
+	if f.Symtab == nil {
 		return nil, &FormatError{0, "missing symbol table", nil}
 	}
 
 	st := f.Symtab
 	dt := f.Dysymtab
 	var all []string
-	for _, s := range st.Syms[dt.Iundefsym : dt.Iundefsym+dt.Nundefsym] {
-		all = append(all, s.Name)
+	if dt != nil {
+		for _, s := range st.Syms[dt.Iundefsym : dt.Iundefsym+dt.Nundefsym] {
+			all = append(all, s.Name)
+		}
+	} else {
+		// From Darwin's include/mach-o/nlist.h
+		const (
+			N_TYPE = 0x0e
+			N_UNDF = 0x0
+			N_EXT  = 0x01
+		)
+		for _, s := range st.Syms {
+			if s.Type&N_TYPE == N_UNDF && s.Type&N_EXT != 0 {
+				all = append(all, s.Name)
+			}
+		}
 	}
 	return all, nil
 }

@@ -1,5 +1,4 @@
 # Build something to create the executable, including several cases
-[short] skip
 
 # --------------------- clean executables -------------------------
 
@@ -54,6 +53,20 @@ go test -c
 exists -exec src.test$GOEXE
 go clean
 ! exists src.test$GOEXE
+
+# --------------------- clean darwin split DWARF -------------------------
+
+[GOOS:darwin] go build -ldflags=-splitdwarf
+[GOOS:darwin] exists -exec src$GOEXE
+[GOOS:darwin] exists src$GOEXE.dSYM
+[GOOS:darwin] go test -c -ldflags=-splitdwarf
+[GOOS:darwin] exists -exec src.test$GOEXE
+[GOOS:darwin] exists src.test$GOEXE.dSYM
+[GOOS:darwin] go clean
+[GOOS:darwin] ! exists src$GOEXE
+[GOOS:darwin] ! exists src$GOEXE.dSYM
+[GOOS:darwin] ! exists src.test$GOEXE
+[GOOS:darwin] ! exists src.test$GOEXE.dSYM
 
 -- main.go --
 package main

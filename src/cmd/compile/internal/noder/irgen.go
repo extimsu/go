@@ -12,8 +12,11 @@ import (
 	"sort"
 
 	"cmd/compile/internal/base"
+	"cmd/compile/internal/midway"
 	"cmd/compile/internal/rangefunc"
 	"cmd/compile/internal/syntax"
+	"cmd/compile/internal/typecheck"
+	"cmd/compile/internal/types"
 	"cmd/compile/internal/types2"
 	"cmd/internal/src"
 )
@@ -22,21 +25,36 @@ var versionErrorRx = regexp.MustCompile(`requires go[0-9]+\.[0-9]+ or later`)
 
 // checkFiles configures and runs the types2 checker on the given
 // parsed source files and then returns the result.
-func checkFiles(m posMap, noders []*noder) (*types2.Package, *types2.Info) {
+// The map result value indicates which closures are generated from the bodies of range function loops.
+// The slice result value lists the package-level declarations that the
+// midway rewrite kept only for type checking and export data
+// (see [midway.RewriteWrapper]).
+func checkFiles(m posMap, noders []*noder) (*types2.Package, *types2.Info, map[*syntax.FuncLit]bool, []string) {
 	if base.SyntaxErrors() != 0 {
 		base.ErrorExit()
 	}
 
 	// setup and syntax error reporting
 	files := make([]*syntax.File, len(noders))
-	// posBaseMap maps all file pos bases back to *syntax.File
+	// fileBaseMap maps all file pos bases back to *syntax.File
 	// for checking Go version mismatched.
-	posBaseMap := make(map[*syntax.PosBase]*syntax.File)
+	fileBaseMap := make(map[*syntax.PosBase]*syntax.File)
 	for i, p := range noders {
 		files[i] = p.file
-		posBaseMap[p.file.Pos().Base()] = p.file
+		// The file.Pos() is the position of the package clause.
+		// If there's a //line directive before that, file.Pos().Base()
+		// refers to that directive, not the file itself.
+		// Make sure to consistently map back to file base, here and
+		// when we look for a file in the conf.Error handler below,
+		// otherwise the file may not be found (was go.dev/issue/67141).
+		fileBaseMap[p.file.Pos().FileBase()] = p.file
 	}
 
+	didMidway := false
+	var midwayOriginals []string
+	var initOrderPlan *midway.InitOrderPlan
+
+recheck:
 	// typechecking
 	ctxt := types2.NewContext()
 	importer := gcimports{
@@ -68,13 +86,12 @@ func checkFiles(m posMap, noders []*noder) (*types2.Package, *types2.Info) {
 		terr := err.(types2.Error)
 		msg := terr.Msg
 		if versionErrorRx.MatchString(msg) {
-			posBase := terr.Pos.Base()
-			for !posBase.IsFileBase() { // line directive base
-				posBase = posBase.Pos().Base()
-			}
-			fileVersion := info.FileVersions[posBase]
-			file := posBaseMap[posBase]
-			if file.GoVersion == fileVersion {
+			fileBase := terr.Pos.FileBase()
+			fileVersion := info.FileVersions[fileBase]
+			file := fileBaseMap[fileBase]
+			if file == nil {
+				// This should never happen, but be careful and don't crash.
+			} else if file.GoVersion == fileVersion {
 				// If we have a version error caused by //go:build, report it.
 				msg = fmt.Sprintf("%s (file declares //go:build %s)", msg, fileVersion)
 			} else {
@@ -97,7 +114,7 @@ func checkFiles(m posMap, noders []*noder) (*types2.Package, *types2.Info) {
 	for _, file := range files {
 		syntax.Inspect(file, func(n syntax.Node) bool {
 			if n, ok := n.(*syntax.InterfaceType); ok {
-				if f.hasCycle(n.GetTypeInfo().Type.(*types2.Interface)) {
+				if f.hasCycle(types2.Unalias(n.GetTypeInfo().Type).(*types2.Interface)) {
 					base.ErrorfAt(m.makeXPos(n.Pos()), errors.InvalidTypeCycle, "invalid recursive type: anonymous interface refers to itself (see https://go.dev/issue/56103)")
 
 					for typ := range f.cyclic {
@@ -137,6 +154,76 @@ func checkFiles(m posMap, noders []*noder) (*types2.Package, *types2.Info) {
 	}
 	base.ExitIfErrors()
 
+	// Implementation restriction: we don't allow not-in-heap types to
+	// be used as map keys/values, or channel.
+	{
+		for _, file := range files {
+			syntax.Inspect(file, func(n syntax.Node) bool {
+				if n, ok := n.(*syntax.TypeDecl); ok {
+					switch n := n.Type.(type) {
+					case *syntax.MapType:
+						typ := n.GetTypeInfo().Type.Underlying().(*types2.Map)
+						if isNotInHeap(typ.Key()) {
+							base.ErrorfAt(m.makeXPos(n.Pos()), 0, "incomplete (or unallocatable) map key not allowed")
+						}
+						if isNotInHeap(typ.Elem()) {
+							base.ErrorfAt(m.makeXPos(n.Pos()), 0, "incomplete (or unallocatable) map value not allowed")
+						}
+					case *syntax.ChanType:
+						typ := n.GetTypeInfo().Type.Underlying().(*types2.Chan)
+						if isNotInHeap(typ.Elem()) {
+							base.ErrorfAt(m.makeXPos(n.Pos()), 0, "chan of incomplete (or unallocatable) type not allowed")
+						}
+					}
+				}
+				return true
+			})
+		}
+	}
+	base.ExitIfErrors()
+
+	if len(base.Debug.AstDump) > 0 {
+		dumpSyntax(pkg, info, files, "checked")
+	}
+
+	// The midway rewrite only affects code that depends on package simd,
+	// which is only possible if this is package simd or simd is reachable
+	// from the imports. The importer adds every package in the transitive
+	// import graph to importer.packages (export data lists each package's
+	// imports), so this is a cheap way to skip midway for most packages.
+	simdReachable := pkg.Path() == midway.SimdPkg || importer.packages[midway.SimdPkg] != nil
+	if buildcfg.Experiment.SIMDStable && !didMidway && simdReachable {
+		didMidway = true
+		// Perform midway transformation on AST directly
+		var plan *midway.InitOrderPlan
+		if midwayOriginals, plan = midway.RewriteWrapper(pkg, info, files); plan != nil {
+			initOrderPlan = plan
+			// midway made changes; type checking must be repeated.
+			if len(base.Debug.AstDump) > 0 {
+				// TODO how should this interact with -W and textual dumps
+				dumpSyntax(pkg, info, files, "midway before recheck")
+			}
+			// necessary to reset type checking
+			for _, p := range types.PkgMap() {
+				p.Direct = false
+			}
+			// necessary to reset type checking
+			typecheck.Target.Imports = nil
+			goto recheck
+		}
+	}
+	if initOrderPlan != nil {
+		// Midway's rewrite may have split initializers into several new ones.
+		// Those can wind up in the wrong place in the recomputed init order.
+		// Use the pre-midway init order to put the split initializers where
+		// the original initializers were.
+		initOrderPlan.Apply(info)
+	}
+
+	if len(base.Debug.AstDump) > 0 {
+		dumpSyntax(pkg, info, files, "midway after recheck")
+	}
+
 	// Rewrite range over function to explicit function calls
 	// with the loop bodies converted into new implicit closures.
 	// We do this now, before serialization to unified IR, so that if the
@@ -144,9 +231,25 @@ func checkFiles(m posMap, noders []*noder) (*types2.Package, *types2.Info) {
 	// If we do the rewrite in the back end, like between typecheck and walk,
 	// then the new implicit closure will not have a unified IR inline body,
 	// and bodyReaderFor will fail.
-	rangefunc.Rewrite(pkg, info, files)
+	rangeInfo := rangefunc.Rewrite(pkg, info, files)
 
-	return pkg, info
+	if len(base.Debug.AstDump) > 0 {
+		dumpSyntax(pkg, info, files, "rangefunc")
+	}
+
+	return pkg, info, rangeInfo, midwayOriginals
+}
+
+func dumpSyntax(pkg *types2.Package, info *types2.Info, files []*syntax.File, phase string) {
+	for _, file := range files {
+		for _, decl := range file.DeclList {
+			if fn, ok := decl.(*syntax.FuncDecl); ok {
+				if MatchASTDump(fn) {
+					DumpNodeHTML(pkg, file, info, fn, phase, fn)
+				}
+			}
+		}
+	}
 }
 
 // A cycleFinder detects anonymous interface cycles (go.dev/issue/56103).
@@ -171,7 +274,7 @@ func (f *cycleFinder) hasCycle(typ *types2.Interface) bool {
 // visit recursively walks typ0 to check any referenced interface types.
 func (f *cycleFinder) visit(typ0 types2.Type) bool {
 	for { // loop for tail recursion
-		switch typ := typ0.(type) {
+		switch typ := types2.Unalias(typ0).(type) {
 		default:
 			base.Fatalf("unexpected type: %T", typ)
 

@@ -10,8 +10,8 @@ package net
 import (
 	"internal/bytealg"
 	"io"
+	"io/fs"
 	"os"
-	"time"
 )
 
 type file struct {
@@ -64,12 +64,8 @@ func (f *file) readLine() (s string, ok bool) {
 	return
 }
 
-func (f *file) stat() (mtime time.Time, size int64, err error) {
-	st, err := f.file.Stat()
-	if err != nil {
-		return time.Time{}, 0, err
-	}
-	return st.ModTime(), st.Size(), nil
+func (f *file) stat() (fs.FileInfo, error) {
+	return f.file.Stat()
 }
 
 func open(name string) (*file, error) {
@@ -80,12 +76,8 @@ func open(name string) (*file, error) {
 	return &file{fd, make([]byte, 0, 64*1024), false}, nil
 }
 
-func stat(name string) (mtime time.Time, size int64, err error) {
-	st, err := os.Stat(name)
-	if err != nil {
-		return time.Time{}, 0, err
-	}
-	return st.ModTime(), st.Size(), nil
+func stat(name string) (fs.FileInfo, error) {
+	return os.Stat(name)
 }
 
 // Count occurrences in s of any bytes in t.
@@ -182,7 +174,7 @@ func xtoi2(s string, e byte) (byte, bool) {
 
 // hasUpperCase tells whether the given string contains at least one upper-case.
 func hasUpperCase(s string) bool {
-	for i := range s {
+	for i := range len(s) {
 		if 'A' <= s[i] && s[i] <= 'Z' {
 			return true
 		}
@@ -251,21 +243,10 @@ func foreachField(x string, fn func(field string) error) error {
 	return nil
 }
 
-// stringsHasSuffix is strings.HasSuffix. It reports whether s ends in
-// suffix.
-func stringsHasSuffix(s, suffix string) bool {
-	return len(s) >= len(suffix) && s[len(s)-len(suffix):] == suffix
-}
-
 // stringsHasSuffixFold reports whether s ends in suffix,
 // ASCII-case-insensitively.
 func stringsHasSuffixFold(s, suffix string) bool {
 	return len(s) >= len(suffix) && stringsEqualFold(s[len(s)-len(suffix):], suffix)
-}
-
-// stringsHasPrefix is strings.HasPrefix. It reports whether s begins with prefix.
-func stringsHasPrefix(s, prefix string) bool {
-	return len(s) >= len(prefix) && s[:len(prefix)] == prefix
 }
 
 // stringsEqualFold is strings.EqualFold, ASCII only. It reports whether s and t

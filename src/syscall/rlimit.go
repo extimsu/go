@@ -7,11 +7,16 @@
 package syscall
 
 import (
+	"internal/asan"
+	"internal/msan"
 	"sync/atomic"
 )
 
 // origRlimitNofile, if non-nil, is the original soft RLIMIT_NOFILE.
 var origRlimitNofile atomic.Pointer[Rlimit]
+
+// setRlimitNofile, if non-zero, is the soft RLIMIT_NOFILE value set by init.
+var setRlimitNofile uint64
 
 // Some systems set an artificially low soft limit on open file count, for compatibility
 // with code that uses select and its hard-coded maximum file descriptor
@@ -29,21 +34,43 @@ var origRlimitNofile atomic.Pointer[Rlimit]
 // which Go of course has no choice but to respect.
 func init() {
 	var lim Rlimit
-	if err := Getrlimit(RLIMIT_NOFILE, &lim); err == nil && lim.Cur != lim.Max {
-		origRlimitNofile.Store(&lim)
+	if err := Getrlimit(RLIMIT_NOFILE, &lim); err == nil && lim.Max > 0 && lim.Cur < lim.Max-1 {
 		nlim := lim
-		nlim.Cur = nlim.Max
+
+		// We set Cur to Max - 1 so that we are more likely to
+		// detect cases where another process uses prlimit
+		// to change our resource limits. The theory is that
+		// using prlimit to change to Cur == Max is more likely
+		// than using prlimit to change to Cur == Max - 1.
+		// The place we check for this is in exec_linux.go.
+		nlim.Cur = nlim.Max - 1
+
+		if asan.Enabled || msan.Enabled {
+			// LLVM's sanitizer runtime closes all file descriptors up to
+			// sysconf(_SC_OPEN_MAX) (soft RLIMIT_NOFILE) one by one when
+			// spawning llvm-symbolizer (https://github.com/llvm/llvm-project/issues/63297).
+			// Cap how high we raise the soft limit so symbolizer startup
+			// stays fast when the hard limit is very large.
+			const maxSanitizerNofile = 100_000
+			if nlim.Cur > maxSanitizerNofile {
+				nlim.Cur = maxSanitizerNofile
+			}
+		}
+
 		adjustFileLimit(&nlim)
-		setrlimit(RLIMIT_NOFILE, &nlim)
+		if nlim.Cur > lim.Cur {
+			setRlimitNofile = uint64(nlim.Cur)
+			origRlimitNofile.Store(&lim)
+			setrlimit(RLIMIT_NOFILE, &nlim)
+		}
 	}
 }
 
 func Setrlimit(resource int, rlim *Rlimit) error {
-	err := setrlimit(resource, rlim)
-	if err == nil && resource == RLIMIT_NOFILE {
+	if resource == RLIMIT_NOFILE {
 		// Store nil in origRlimitNofile to tell StartProcess
 		// to not adjust the rlimit in the child process.
 		origRlimitNofile.Store(nil)
 	}
-	return err
+	return setrlimit(resource, rlim)
 }

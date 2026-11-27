@@ -6,7 +6,9 @@
 package base32
 
 import (
+	"internal/byteorder"
 	"io"
+	"math"
 	"slices"
 	"strconv"
 )
@@ -127,61 +129,59 @@ func (enc *Encoding) Encode(dst, src []byte) {
 	// outside of the loop to speed up the encoder.
 	_ = enc.encode
 
-	di, si := 0, 0
-	n := (len(src) / 5) * 5
-	for si < n {
+	for len(src) >= 5 {
 		// Combining two 32 bit loads allows the same code to be used
 		// for 32 and 64 bit platforms.
-		hi := uint32(src[si+0])<<24 | uint32(src[si+1])<<16 | uint32(src[si+2])<<8 | uint32(src[si+3])
-		lo := hi<<8 | uint32(src[si+4])
+		hi := uint32(src[0])<<24 | uint32(src[1])<<16 | uint32(src[2])<<8 | uint32(src[3])
+		lo := hi<<8 | uint32(src[4])
 
-		dst[di+0] = enc.encode[(hi>>27)&0x1F]
-		dst[di+1] = enc.encode[(hi>>22)&0x1F]
-		dst[di+2] = enc.encode[(hi>>17)&0x1F]
-		dst[di+3] = enc.encode[(hi>>12)&0x1F]
-		dst[di+4] = enc.encode[(hi>>7)&0x1F]
-		dst[di+5] = enc.encode[(hi>>2)&0x1F]
-		dst[di+6] = enc.encode[(lo>>5)&0x1F]
-		dst[di+7] = enc.encode[(lo)&0x1F]
+		_ = dst[7] // Eliminate bounds checks below.
+		dst[0] = enc.encode[(hi>>27)&0x1F]
+		dst[1] = enc.encode[(hi>>22)&0x1F]
+		dst[2] = enc.encode[(hi>>17)&0x1F]
+		dst[3] = enc.encode[(hi>>12)&0x1F]
+		dst[4] = enc.encode[(hi>>7)&0x1F]
+		dst[5] = enc.encode[(hi>>2)&0x1F]
+		dst[6] = enc.encode[(lo>>5)&0x1F]
+		dst[7] = enc.encode[(lo)&0x1F]
 
-		si += 5
-		di += 8
+		src = src[5:]
+		dst = dst[8:]
 	}
 
 	// Add the remaining small block
-	remain := len(src) - si
-	if remain == 0 {
+	if len(src) == 0 {
 		return
 	}
 
 	// Encode the remaining bytes in reverse order.
 	val := uint32(0)
-	switch remain {
+	switch len(src) {
 	case 4:
-		val |= uint32(src[si+3])
-		dst[di+6] = enc.encode[val<<3&0x1F]
-		dst[di+5] = enc.encode[val>>2&0x1F]
+		val |= uint32(src[3])
+		dst[6] = enc.encode[val<<3&0x1F]
+		dst[5] = enc.encode[val>>2&0x1F]
 		fallthrough
 	case 3:
-		val |= uint32(src[si+2]) << 8
-		dst[di+4] = enc.encode[val>>7&0x1F]
+		val |= uint32(src[2]) << 8
+		dst[4] = enc.encode[val>>7&0x1F]
 		fallthrough
 	case 2:
-		val |= uint32(src[si+1]) << 16
-		dst[di+3] = enc.encode[val>>12&0x1F]
-		dst[di+2] = enc.encode[val>>17&0x1F]
+		val |= uint32(src[1]) << 16
+		dst[3] = enc.encode[val>>12&0x1F]
+		dst[2] = enc.encode[val>>17&0x1F]
 		fallthrough
 	case 1:
-		val |= uint32(src[si+0]) << 24
-		dst[di+1] = enc.encode[val>>22&0x1F]
-		dst[di+0] = enc.encode[val>>27&0x1F]
+		val |= uint32(src[0]) << 24
+		dst[1] = enc.encode[val>>22&0x1F]
+		dst[0] = enc.encode[val>>27&0x1F]
 	}
 
 	// Pad the final quantum
 	if enc.padChar != NoPadding {
-		nPad := (remain * 8 / 5) + 1
+		nPad := (len(src) * 8 / 5) + 1
 		for i := nPad; i < 8; i++ {
-			dst[di+i] = byte(enc.padChar)
+			dst[i] = byte(enc.padChar)
 		}
 	}
 }
@@ -281,9 +281,17 @@ func NewEncoder(enc *Encoding, w io.Writer) io.WriteCloser {
 
 // EncodedLen returns the length in bytes of the base32 encoding
 // of an input buffer of length n.
+// It panics if the encoded length overflows int,
+// which can happen only if n > [math.MaxInt]/8*5.
 func (enc *Encoding) EncodedLen(n int) int {
 	if enc.padChar == NoPadding {
+		if n > math.MaxInt/8*5+4 {
+			panic("encoded length overflows int")
+		}
 		return n/5*8 + (n%5*8+4)/5
+	}
+	if n > math.MaxInt/8*5 {
+		panic("encoded length overflows int")
 	}
 	return (n + 4) / 5 * 8
 }
@@ -308,6 +316,41 @@ func (enc *Encoding) decode(dst, src []byte) (n int, end bool, err error) {
 
 	dsti := 0
 	olen := len(src)
+
+	// Fast path: decode whole quanta, 8 bytes in and 5 out.
+	// A quantum holding padding or a bad byte ends the fast path;
+	// the loop below takes it from there and reports any error.
+	// If the padding character is itself in the alphabet, a table
+	// lookup cannot tell padding from data, so skip the fast path.
+	if enc.decodeMap[byte(enc.padChar)] == invalidIndex {
+		for len(src) >= 8 {
+			d0 := enc.decodeMap[src[0]]
+			d1 := enc.decodeMap[src[1]]
+			d2 := enc.decodeMap[src[2]]
+			d3 := enc.decodeMap[src[3]]
+			d4 := enc.decodeMap[src[4]]
+			d5 := enc.decodeMap[src[5]]
+			d6 := enc.decodeMap[src[6]]
+			d7 := enc.decodeMap[src[7]]
+			// A valid index fits in 5 bits and invalidIndex is all
+			// ones, so the OR is invalidIndex if any byte is bad.
+			if d0|d1|d2|d3|d4|d5|d6|d7 == invalidIndex {
+				break
+			}
+
+			// Pack eight 5-bit values into 5 bytes. The first 4 bytes
+			// fit in a uint32, which is cheap on 32-bit machines too.
+			hi := uint32(d0)<<27 | uint32(d1)<<22 | uint32(d2)<<17 | uint32(d3)<<12 |
+				uint32(d4)<<7 | uint32(d5)<<2 | uint32(d6)>>3
+			_ = dst[4] // Eliminate bounds checks below.
+			byteorder.BEPutUint32(dst, hi)
+			dst[4] = d6<<5 | d7
+
+			src = src[8:]
+			dst = dst[5:]
+			n += 5
+		}
+	}
 
 	for len(src) > 0 && !end {
 		// Decode quantum using the base32 alphabet
@@ -387,7 +430,8 @@ func (enc *Encoding) decode(dst, src []byte) (n int, end bool, err error) {
 
 // Decode decodes src using the encoding enc. It writes at most
 // [Encoding.DecodedLen](len(src)) bytes to dst and returns the number of bytes
-// written. If src contains invalid base32 data, it will return the
+// written. The caller must ensure that dst is large enough to hold all
+// the decoded data. If src contains invalid base32 data, it will return the
 // number of bytes successfully written and [CorruptInputError].
 // Newline characters (\r and \n) are ignored.
 func (enc *Encoding) Decode(dst, src []byte) (n int, err error) {
@@ -400,6 +444,7 @@ func (enc *Encoding) Decode(dst, src []byte) (n int, err error) {
 // AppendDecode appends the base32 decoded src to dst
 // and returns the extended buffer.
 // If the input is malformed, it returns the partially decoded src and an error.
+// New line characters (\r and \n) are ignored.
 func (enc *Encoding) AppendDecode(dst, src []byte) ([]byte, error) {
 	// Compute the output size without padding to avoid over allocating.
 	n := len(src)
@@ -414,6 +459,8 @@ func (enc *Encoding) AppendDecode(dst, src []byte) ([]byte, error) {
 }
 
 // DecodeString returns the bytes represented by the base32 string s.
+// If the input is malformed, it returns the partially decoded data and
+// [CorruptInputError]. New line characters (\r and \n) are ignored.
 func (enc *Encoding) DecodeString(s string) ([]byte, error) {
 	buf := []byte(s)
 	l := stripNewlines(buf, buf)
@@ -467,7 +514,7 @@ func (d *decoder) Read(p []byte) (n int, err error) {
 	}
 
 	// Read a chunk.
-	nn := len(p) / 5 * 8
+	nn := (len(p) + 4) / 5 * 8
 	if nn < 8 {
 		nn = 8
 	}
@@ -539,13 +586,34 @@ type newlineFilteringReader struct {
 // stripNewlines removes newline characters and returns the number
 // of non-newline characters copied to dst.
 func stripNewlines(dst, src []byte) int {
+	const (
+		lo = 0x0101010101010101 // low bit of each byte
+		hi = 0x8080808080808080 // high bit of each byte
+	)
 	offset := 0
-	for _, b := range src {
-		if b == '\r' || b == '\n' {
-			continue
+	for len(src) > 0 {
+		if len(src) >= 8 {
+			// Look at 8 bytes at once. The expression below is
+			// nonzero exactly when some byte of x is <= '\r', which
+			// covers both newlines: subtracting '\r'+1 from every
+			// byte wraps a byte that small and sets its high bit,
+			// and &^x drops bytes whose high bit was already set.
+			// This is the classic zero-byte test (see Hacker's
+			// Delight, section 6-1) with '\r'+1 in place of 1.
+			x := byteorder.LEUint64(src)
+			if (x-lo*('\r'+1))&^x&hi == 0 {
+				// No newline in sight; copy all 8 bytes.
+				byteorder.LEPutUint64(dst[offset:], x)
+				offset += 8
+				src = src[8:]
+				continue
+			}
 		}
-		dst[offset] = b
-		offset++
+		if b := src[0]; b != '\r' && b != '\n' {
+			dst[offset] = b
+			offset++
+		}
+		src = src[1:]
 	}
 	return offset
 }

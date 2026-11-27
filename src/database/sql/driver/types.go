@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strconv"
 	"time"
+	"uuid"
 )
 
 // ValueConverter is the interface providing the ConvertValue method.
@@ -33,6 +34,10 @@ type ValueConverter interface {
 }
 
 // Valuer is the interface providing the Value method.
+//
+// Errors returned by the [Value] method are wrapped by the database/sql package.
+// This allows callers to use [errors.Is] for precise error handling after operations
+// like [database/sql.Query], [database/sql.Exec], or [database/sql.QueryRow].
 //
 // Types implementing Valuer interface are able to convert
 // themselves to a driver [Value].
@@ -253,6 +258,9 @@ func (defaultConverter) ConvertValue(v any) (Value, error) {
 	// For now, continue to prefer the Valuer interface over the decimal decompose interface.
 	case decimalDecompose:
 		return vr, nil
+
+	case uuid.UUID:
+		return vr.String(), nil
 	}
 
 	rv := reflect.ValueOf(v)

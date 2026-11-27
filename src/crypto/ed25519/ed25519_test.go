@@ -9,11 +9,11 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto"
-	"crypto/internal/boring"
+	"crypto/internal/cryptotest"
 	"crypto/rand"
 	"crypto/sha512"
 	"encoding/hex"
-	"internal/testenv"
+	"errors"
 	"log"
 	"os"
 	"strings"
@@ -42,12 +42,60 @@ func Example_ed25519ctx() {
 	}
 }
 
+func TestGenerateKey(t *testing.T) {
+	// nil is like using crypto/rand.Reader.
+	public, private, err := GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(public) != PublicKeySize {
+		t.Errorf("public key has the wrong size: %d", len(public))
+	}
+	if len(private) != PrivateKeySize {
+		t.Errorf("private key has the wrong size: %d", len(private))
+	}
+	if !bytes.Equal(private.Public().(PublicKey), public) {
+		t.Errorf("public key doesn't match private key")
+	}
+	fromSeed := NewKeyFromSeed(private.Seed())
+	if !bytes.Equal(private, fromSeed) {
+		t.Errorf("recreating key pair from seed gave different private key")
+	}
+
+	_, k2, err := GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(private, k2) {
+		t.Errorf("GenerateKey returned the same private key twice")
+	}
+
+	_, k3, err := GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(private, k3) {
+		t.Errorf("GenerateKey returned the same private key twice")
+	}
+
+	// GenerateKey is documented to be the same as NewKeyFromSeed.
+	seed := make([]byte, SeedSize)
+	rand.Read(seed)
+	_, k4, err := GenerateKey(bytes.NewReader(seed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	k4n := NewKeyFromSeed(seed)
+	if !bytes.Equal(k4, k4n) {
+		t.Errorf("GenerateKey with seed gave different private key")
+	}
+}
+
 type zeroReader struct{}
 
 func (zeroReader) Read(buf []byte) (int, error) {
-	for i := range buf {
-		buf[i] = 0
-	}
+	clear(buf)
 	return len(buf), nil
 }
 
@@ -204,26 +252,52 @@ func TestCryptoSigner(t *testing.T) {
 	}
 }
 
-func TestEqual(t *testing.T) {
-	public, private, _ := GenerateKey(rand.Reader)
-
-	if !public.Equal(public) {
-		t.Errorf("public key is not equal to itself: %q", public)
+func TestKeys(t *testing.T) {
+	pub1, k1, err := GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !public.Equal(crypto.Signer(private).Public()) {
-		t.Errorf("private.Public() is not Equal to public: %q", public)
-	}
-	if !private.Equal(private) {
-		t.Errorf("private key is not equal to itself: %q", private)
+	pub2, k2, err := GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	otherPub, otherPriv, _ := GenerateKey(rand.Reader)
-	if public.Equal(otherPub) {
-		t.Errorf("different public keys are Equal")
-	}
-	if private.Equal(otherPriv) {
-		t.Errorf("different private keys are Equal")
-	}
+	t.Run("PrivateKey", func(t *testing.T) {
+		newPrivateKey := func(seed []byte) (PrivateKey, error) {
+			if len(seed) != SeedSize {
+				return nil, errors.New("NewKeyFromSeed would panic")
+			}
+			return NewKeyFromSeed(seed), nil
+		}
+		cryptotest.TestPrivateKey(t, k1, k2, newPrivateKey, PrivateKey.Seed)
+	})
+
+	// A PublicKey is its own encoding, so only the Equal tests are meaningful.
+	t.Run("PublicKey", func(t *testing.T) {
+		newPublicKey := func(b []byte) (PublicKey, error) {
+			if len(b) != PublicKeySize {
+				return nil, errors.New("wrong public key length")
+			}
+			return bytes.Clone(b), nil
+		}
+		cryptotest.TestPublicKey(t, pub1, pub2, newPublicKey, func(k PublicKey) []byte {
+			return bytes.Clone(k)
+		})
+	})
+
+	// A PrivateKey can't be made from its public key, so only the test that
+	// Public returns a copy is meaningful.
+	t.Run("PrivateKey.Public", func(t *testing.T) {
+		newPrivateKey := func(pub []byte) (PrivateKey, error) {
+			if !bytes.Equal(pub, pub1) {
+				return nil, errors.New("wrong public key")
+			}
+			return bytes.Clone(k1), nil
+		}
+		cryptotest.TestKeyEncoding(t, k1, newPrivateKey, func(k PrivateKey) []byte {
+			return k.Public().(PublicKey)
+		})
+	})
 }
 
 func TestGolden(t *testing.T) {
@@ -321,15 +395,11 @@ func TestMalleability(t *testing.T) {
 }
 
 func TestAllocations(t *testing.T) {
-	if boring.Enabled {
-		t.Skip("skipping allocations test with BoringCrypto")
-	}
-	testenv.SkipIfOptimizationOff(t)
-
+	cryptotest.SkipTestAllocations(t)
+	seed := make([]byte, SeedSize)
+	priv := NewKeyFromSeed(seed)
 	if allocs := testing.AllocsPerRun(100, func() {
-		seed := make([]byte, SeedSize)
 		message := []byte("Hello, world!")
-		priv := NewKeyFromSeed(seed)
 		pub := priv.Public().(PublicKey)
 		signature := Sign(priv, message)
 		if !Verify(pub, message, signature) {

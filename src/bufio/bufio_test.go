@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"internal/asan"
 	"io"
 	"math/rand"
 	"strconv"
@@ -585,6 +586,9 @@ func TestWriteInvalidRune(t *testing.T) {
 }
 
 func TestReadStringAllocs(t *testing.T) {
+	if asan.Enabled {
+		t.Skip("test allocates more with -asan; see #70079")
+	}
 	r := strings.NewReader("       foo       foo        42        42        42        42        42        42        42        42       4.2       4.2       4.2       4.2\n")
 	buf := NewReader(r)
 	allocs := testing.AllocsPerRun(100, func() {
@@ -636,7 +640,7 @@ func TestWriter(t *testing.T) {
 			for l := 0; l < len(written); l++ {
 				if written[l] != data[l] {
 					t.Errorf("wrong bytes written")
-					t.Errorf("want=%q", data[0:len(written)])
+					t.Errorf("want=%q", data[:len(written)])
 					t.Errorf("have=%q", written)
 				}
 			}
@@ -912,7 +916,7 @@ var testOutput = []byte("0123456789abcdefghijklmnopqrstuvwxy")
 var testInput = []byte("012\n345\n678\n9ab\ncde\nfgh\nijk\nlmn\nopq\nrst\nuvw\nxy")
 var testInputrn = []byte("012\r\n345\r\n678\r\n9ab\r\ncde\r\nfgh\r\nijk\r\nlmn\r\nopq\r\nrst\r\nuvw\r\nxy\r\n\n\r\n")
 
-// TestReader wraps a []byte and returns reads of a specific length.
+// testReader wraps a []byte and returns reads of a specific length.
 type testReader struct {
 	data   []byte
 	stride int
@@ -935,7 +939,6 @@ func (t *testReader) Read(buf []byte) (n int, err error) {
 }
 
 func testReadLine(t *testing.T, input []byte) {
-	//for stride := 1; stride < len(input); stride++ {
 	for stride := 1; stride < 2; stride++ {
 		done := 0
 		reader := testReader{input, stride}
@@ -1146,7 +1149,7 @@ func (w errorWriterToTest) Write(p []byte) (int, error) {
 var errorWriterToTests = []errorWriterToTest{
 	{1, 0, nil, io.ErrClosedPipe, io.ErrClosedPipe},
 	{0, 1, io.ErrClosedPipe, nil, io.ErrClosedPipe},
-	{0, 0, io.ErrUnexpectedEOF, io.ErrClosedPipe, io.ErrClosedPipe},
+	{0, 0, io.ErrUnexpectedEOF, io.ErrClosedPipe, io.ErrUnexpectedEOF},
 	{0, 1, io.EOF, nil, nil},
 }
 
@@ -1992,5 +1995,22 @@ func BenchmarkWriterFlush(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		bw.WriteString(str)
 		bw.Flush()
+	}
+}
+
+func BenchmarkWriteString(b *testing.B) {
+	small := strings.Repeat("x", 50)
+	huge := strings.Repeat("x", 8<<10)
+	for _, tc := range []struct{ name, s string }{
+		{"small", small},
+		{"huge", huge},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			bw := NewWriter(io.Discard)
+			for b.Loop() {
+				bw.WriteString(tc.s)
+			}
+		})
 	}
 }

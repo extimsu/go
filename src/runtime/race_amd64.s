@@ -43,7 +43,7 @@
 // func runtime·raceread(addr uintptr)
 // Called from instrumented code.
 // Defined as ABIInternal so as to avoid introducing a wrapper,
-// which would render runtime.getcallerpc ineffective.
+// which would render sys.GetCallerPC ineffective.
 TEXT	runtime·raceread<ABIInternal>(SB), NOSPLIT, $0-8
 	MOVQ	AX, RARG1
 	MOVQ	(SP), RARG2
@@ -69,7 +69,7 @@ TEXT	runtime·racereadpc(SB), NOSPLIT, $0-24
 // func runtime·racewrite(addr uintptr)
 // Called from instrumented code.
 // Defined as ABIInternal so as to avoid introducing a wrapper,
-// which would render runtime.getcallerpc ineffective.
+// which would render sys.GetCallerPC ineffective.
 TEXT	runtime·racewrite<ABIInternal>(SB), NOSPLIT, $0-8
 	MOVQ	AX, RARG1
 	MOVQ	(SP), RARG2
@@ -95,7 +95,7 @@ TEXT	runtime·racewritepc(SB), NOSPLIT, $0-24
 // func runtime·racereadrange(addr, size uintptr)
 // Called from instrumented code.
 // Defined as ABIInternal so as to avoid introducing a wrapper,
-// which would render runtime.getcallerpc ineffective.
+// which would render sys.GetCallerPC ineffective.
 TEXT	runtime·racereadrange<ABIInternal>(SB), NOSPLIT, $0-16
 	MOVQ	AX, RARG1
 	MOVQ	BX, RARG2
@@ -122,7 +122,7 @@ TEXT	runtime·racereadrangepc1(SB), NOSPLIT, $0-24
 // func runtime·racewriterange(addr, size uintptr)
 // Called from instrumented code.
 // Defined as ABIInternal so as to avoid introducing a wrapper,
-// which would render runtime.getcallerpc ineffective.
+// which would render sys.GetCallerPC ineffective.
 TEXT	runtime·racewriterange<ABIInternal>(SB), NOSPLIT, $0-16
 	MOVQ	AX, RARG1
 	MOVQ	BX, RARG2
@@ -303,6 +303,57 @@ TEXT	sync∕atomic·AddUintptr(SB), NOSPLIT, $0-24
 	GO_ARGS
 	JMP	sync∕atomic·AddInt64(SB)
 
+// And
+TEXT	sync∕atomic·AndInt32(SB), NOSPLIT|NOFRAME, $0-20
+	GO_ARGS
+	MOVQ	$__tsan_go_atomic32_fetch_and(SB), AX
+	CALL	racecallatomic<>(SB)
+	RET
+
+TEXT	sync∕atomic·AndInt64(SB), NOSPLIT|NOFRAME, $0-24
+	GO_ARGS
+	MOVQ	$__tsan_go_atomic64_fetch_and(SB), AX
+	CALL	racecallatomic<>(SB)
+	RET
+
+TEXT	sync∕atomic·AndUint32(SB), NOSPLIT, $0-20
+	GO_ARGS
+	JMP	sync∕atomic·AndInt32(SB)
+
+TEXT	sync∕atomic·AndUint64(SB), NOSPLIT, $0-24
+	GO_ARGS
+	JMP	sync∕atomic·AndInt64(SB)
+
+TEXT	sync∕atomic·AndUintptr(SB), NOSPLIT, $0-24
+	GO_ARGS
+	JMP	sync∕atomic·AndInt64(SB)
+
+// Or
+TEXT	sync∕atomic·OrInt32(SB), NOSPLIT|NOFRAME, $0-20
+	GO_ARGS
+	MOVQ	$__tsan_go_atomic32_fetch_or(SB), AX
+	CALL	racecallatomic<>(SB)
+	RET
+
+TEXT	sync∕atomic·OrInt64(SB), NOSPLIT|NOFRAME, $0-24
+	GO_ARGS
+	MOVQ	$__tsan_go_atomic64_fetch_or(SB), AX
+	CALL	racecallatomic<>(SB)
+	RET
+
+TEXT	sync∕atomic·OrUint32(SB), NOSPLIT, $0-20
+	GO_ARGS
+	JMP	sync∕atomic·OrInt32(SB)
+
+TEXT	sync∕atomic·OrUint64(SB), NOSPLIT, $0-24
+	GO_ARGS
+	JMP	sync∕atomic·OrInt64(SB)
+
+TEXT	sync∕atomic·OrUintptr(SB), NOSPLIT, $0-24
+	GO_ARGS
+	JMP	sync∕atomic·OrInt64(SB)
+
+
 // CompareAndSwap
 TEXT	sync∕atomic·CompareAndSwapInt32(SB), NOSPLIT|NOFRAME, $0-17
 	GO_ARGS
@@ -387,9 +438,16 @@ TEXT	racecall<>(SB), NOSPLIT|NOFRAME, $0-0
 	MOVQ	g_m(R14), R13
 	// Switch to g0 stack.
 	MOVQ	SP, R12		// callee-saved, preserved across the CALL
+
+	// Switch to g0 stack if we aren't already on g0 or gsignal.
+	MOVQ	m_gsignal(R13), R10
+	CMPQ	R10, R14
+	JE	call	// already on gsignal
+
 	MOVQ	m_g0(R13), R10
 	CMPQ	R10, R14
 	JE	call	// already on g0
+
 	MOVQ	(g_sched+gobuf_sp)(R10), SP
 call:
 	ANDQ	$~15, SP	// alignment for gcc ABI
@@ -398,6 +456,13 @@ call:
 	// Back to Go world, set special registers.
 	// The g register (R14) is preserved in C.
 	XORPS	X15, X15
+#ifndef GOAMD64_v3
+#ifndef GOAMD64_v4
+	CMPB	internal∕cpu·X86+const_offsetX86HasAVX(SB), $1
+	JNE	2(PC)
+#endif
+#endif
+	VXORPS	X15, X15, X15
 	RET
 
 // C->Go callback thunk that allows to call runtime·racesymbolize from C code.
@@ -428,7 +493,7 @@ rest:
 	MOVQ	g(R12), R14
 	MOVQ	g_m(R14), R13
 	MOVQ	m_g0(R13), R15
-	CMPQ	R13, R15
+	CMPQ	R14, R15
 	JEQ	noswitch	// branch if already on g0
 	MOVQ	R15, g(R12)	// g = m->g0
 	MOVQ	R15, R14	// set g register

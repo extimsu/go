@@ -83,6 +83,43 @@ func TestFloatGobEncoding(t *testing.T) {
 	}
 }
 
+func TestFloatGobEncodingNearPrecLimit(t *testing.T) {
+	for _, prec := range []uint{MaxPrec - (_W - 1), MaxPrec - (_W - 2), MaxPrec} {
+		const f = -1.5 // can be represented exactly with one mantissa word
+		x := new(Float).SetPrec(prec).SetFloat64(f)
+		res, err := x.GobEncode()
+		if err != nil {
+			t.Fatalf("%v (prec = %d)", err, prec)
+		}
+
+		z := new(Float)
+		err = z.GobDecode(res)
+		if err != nil {
+			t.Errorf("%v (prec = %d)", err, prec)
+			continue
+		}
+
+		// sanity check
+		if z.Cmp(x) != 0 {
+			// reduce precision so x, z print quickly
+			x.SetPrec(10)
+			z.SetPrec(10)
+			t.Errorf("GobEncode/GobDecode round trip: %v != %v", x, z)
+		}
+	}
+
+	// example from go.dev/issue/83040
+	var buf bytes.Buffer
+	x := new(Float).SetPrec(MaxPrec).SetFloat64(1.5)
+	if err := gob.NewEncoder(&buf).Encode(x); err != nil {
+		t.Fatalf("%v (prec = %d, via gob.Encoder.Encode)", err, uint(MaxPrec))
+	}
+	var z Float
+	if err := gob.NewDecoder(&buf).Decode(&z); err != nil {
+		t.Errorf("%v (prec = %d, via gob.Decoder.Decode)", err, uint(MaxPrec))
+	}
+}
+
 func TestFloatCorruptGob(t *testing.T) {
 	var buf bytes.Buffer
 	tx := NewFloat(4 / 3).SetPrec(1000).SetMode(ToPositiveInf)
@@ -164,10 +201,65 @@ func TestFloatGobDecodeInvalid(t *testing.T) {
 			[]byte{1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0},
 			"Float.GobDecode: nonzero finite number with empty mantissa",
 		},
+		{
+			[]byte{1, 0xe0, 0, 0, 0, 64}, // rounding mode 7
+			"Float.GobDecode: invalid encoding",
+		},
+		{
+			[]byte{1, 0x18, 0, 0, 0, 64}, // accuracy 2
+			"Float.GobDecode: invalid encoding",
+		},
+		{
+			[]byte{1, 6, 0, 0, 0, 64}, // form 3
+			"Float.GobDecode: invalid encoding",
+		},
 	} {
 		err := NewFloat(0).GobDecode(tc.buf)
 		if err == nil || !strings.HasPrefix(err.Error(), tc.msg) {
 			t.Errorf("expected GobDecode error prefix: %s, got: %v", tc.msg, err)
 		}
+	}
+}
+
+func TestFloatAppendText(t *testing.T) {
+	for _, test := range floatVals {
+		for _, sign := range []string{"", "+", "-"} {
+			for _, prec := range []uint{0, 1, 2, 10, 53, 64, 100, 1000} {
+				if prec > 53 && testing.Short() {
+					continue
+				}
+				x := sign + test
+				var tx Float
+				_, _, err := tx.SetPrec(prec).Parse(x, 0)
+				if err != nil {
+					t.Errorf("parsing of %s (prec = %d) failed (invalid test case): %v", x, prec, err)
+					continue
+				}
+				buf := make([]byte, 4, 32)
+				b, err := tx.AppendText(buf)
+				if err != nil {
+					t.Errorf("marshaling of %v (prec = %d) failed: %v", &tx, prec, err)
+					continue
+				}
+				var rx Float
+				rx.SetPrec(prec)
+				if err := rx.UnmarshalText(b[4:]); err != nil {
+					t.Errorf("unmarshaling of %v (prec = %d) failed: %v", &tx, prec, err)
+					continue
+				}
+				if rx.Cmp(&tx) != 0 {
+					t.Errorf("AppendText of %v (prec = %d) failed: got %v want %v", &tx, prec, &rx, &tx)
+				}
+			}
+		}
+	}
+}
+
+func TestFloatAppendTextNil(t *testing.T) {
+	var x *Float
+	buf := make([]byte, 4, 16)
+	data, _ := x.AppendText(buf)
+	if string(data[4:]) != "<nil>" {
+		t.Errorf("got %q, want <nil>", data[4:])
 	}
 }

@@ -92,6 +92,7 @@ type (
 		mu   sync.Mutex
 		s    string
 		l, r *stringVal
+		n    int64 // length of the string value; immutable
 	}
 	int64Val   int64                    // Int values representable as an int64
 	intVal     struct{ val *big.Int }   // Int values not representable as an int64
@@ -137,15 +138,13 @@ func (x *stringVal) String() string {
 // concatenation. See golang.org/issue/23348.
 func (x *stringVal) string() string {
 	x.mu.Lock()
+	defer x.mu.Unlock()
 	if x.l != nil {
 		x.s = strings.Join(reverse(x.appendReverse(nil)), "")
 		x.l = nil
 		x.r = nil
 	}
-	s := x.s
-	x.mu.Unlock()
-
-	return s
+	return x.s
 }
 
 // reverse reverses x in place and returns it.
@@ -390,7 +389,7 @@ func MakeString(s string) Value {
 	if s == "" {
 		return &emptyString // common case
 	}
-	return &stringVal{s: s}
+	return &stringVal{s: s, n: int64(len(s))}
 }
 
 var emptyString stringVal
@@ -609,6 +608,20 @@ func Val(x Value) any {
 	}
 }
 
+// StringLen returns the length of x if x is a [String].
+// If x is [Unknown], the result is 0.
+// In all other cases, the function panics.
+func StringLen(x Value) int64 {
+	switch x := x.(type) {
+	case *stringVal:
+		return x.n
+	case unknownVal:
+		return 0
+	default:
+		panic(fmt.Sprintf("%v not a String", x))
+	}
+}
+
 // Make returns the [Value] for x.
 //
 //	type of x        result Kind
@@ -625,7 +638,7 @@ func Make(x any) Value {
 	case bool:
 		return boolVal(x)
 	case string:
-		return &stringVal{s: x}
+		return &stringVal{s: x, n: int64(len(x))}
 	case int64:
 		return int64Val(x)
 	case *big.Int:
@@ -1083,7 +1096,10 @@ func match0(x, y Value) (_, _ Value) {
 			return rtof(x1), y
 		}
 	case complexVal:
-		return vtoc(x), y
+		switch x1 := x.(type) {
+		case int64Val, intVal, ratVal, floatVal:
+			return vtoc(x1), y
+		}
 	}
 
 	// force unknown and invalid values into "x position" in callers of match
@@ -1263,7 +1279,8 @@ func BinaryOp(x_ Value, op token.Token, y_ Value) Value {
 
 	case *stringVal:
 		if op == token.ADD {
-			return &stringVal{l: x, r: y.(*stringVal)}
+			y := y.(*stringVal)
+			return &stringVal{l: x, r: y, n: x.n + y.n}
 		}
 	}
 

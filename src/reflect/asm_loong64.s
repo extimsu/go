@@ -34,20 +34,15 @@ TEXT ·makeFuncStub(SB),(NOSPLIT|WRAPPER),$432
 	JAL	runtime·spillArgs(SB)
 	MOVV	REGCTXT, 32(R3) // save REGCTXT > args of moveMakeFuncArgPtrs < LOCAL_REGARGS
 
-#ifdef GOEXPERIMENT_regabiargs
 	MOVV	REGCTXT, R4
 	MOVV	R25, R5
-#else
-	MOVV	REGCTXT, 8(R3)
-	MOVV	R25, 16(R3)
-#endif
 	JAL	·moveMakeFuncArgPtrs<ABIInternal>(SB)
 	MOVV	32(R3), REGCTXT // restore REGCTXT
 
 	MOVV	REGCTXT, 8(R3)
 	MOVV	$argframe+0(FP), R20
 	MOVV	R20, 16(R3)
-	MOVV	R0, LOCAL_RETVALID(R3)
+	MOVB	R0, LOCAL_RETVALID(R3)
 	ADDV	$LOCAL_RETVALID, R3, R20
 	MOVV	R20, 24(R3)
 	ADDV	$LOCAL_REGARGS, R3, R20
@@ -66,13 +61,8 @@ TEXT ·methodValueCall(SB),(NOSPLIT|WRAPPER),$432
 	ADDV	$LOCAL_REGARGS, R3, R25 // spillArgs using R25
 	JAL	runtime·spillArgs(SB)
 	MOVV	REGCTXT, 32(R3) // save REGCTXT > args of moveMakeFuncArgPtrs < LOCAL_REGARGS
-#ifdef GOEXPERIMENT_regabiargs
 	MOVV	REGCTXT, R4
 	MOVV	R25, R5
-#else
-	MOVV	REGCTXT, 8(R3)
-	MOVV	R25, 16(R3)
-#endif
 	JAL	·moveMakeFuncArgPtrs<ABIInternal>(SB)
 	MOVV	32(R3), REGCTXT // restore REGCTXT
 	MOVV	REGCTXT, 8(R3)

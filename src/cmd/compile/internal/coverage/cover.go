@@ -75,7 +75,7 @@ func Fixup() {
 		}
 		if strings.HasPrefix(s.Name, counterPrefix) {
 			ckTypSanity(nm, "countervar")
-			nm.SetCoverageCounter(true)
+			nm.SetCoverageAuxVar(true)
 			s := nm.Linksym()
 			s.Type = objabi.SCOVERAGE_COUNTER
 		}
@@ -131,7 +131,7 @@ func metaHashAndLen() ([16]byte, int) {
 	}
 	var hv [16]byte
 	for i := 0; i < 16; i++ {
-		nib := string(mhash[i*2 : i*2+2])
+		nib := mhash[i*2 : i*2+2]
 		x, err := strconv.ParseInt(nib, 16, 32)
 		if err != nil {
 			base.Fatalf("metahash bad byte %q", nib)
@@ -155,8 +155,8 @@ func registerMeta(cnames names, hashv [16]byte, mdlen int) {
 	hashx := ir.NewCompLitExpr(pos, ir.OCOMPLIT, ht, elist)
 
 	// Materalize expression corresponding to address of the meta-data symbol.
-	mdax := typecheck.NodAddr(cnames.MetaVar)
-	mdauspx := typecheck.ConvNop(mdax, types.Types[types.TUNSAFEPTR])
+	mdax := typecheck.NodAddr(cnames.InitFn, cnames.MetaVar)
+	mdauspx := typecheck.ConvNop(cnames.InitFn, mdax, types.Types[types.TUNSAFEPTR])
 
 	// Materialize expression for length.
 	lenx := ir.NewInt(base.Pos, int64(mdlen)) // untyped
@@ -171,11 +171,11 @@ func registerMeta(cnames names, hashv [16]byte, mdlen int) {
 	cmodeNode := ir.NewInt(base.Pos, int64(cnames.CounterMode))
 	cgranNode := ir.NewInt(base.Pos, int64(cnames.CounterGran))
 	pkPathNode := ir.NewString(base.Pos, base.Ctxt.Pkgpath)
-	callx := typecheck.Call(pos, fn, []ir.Node{mdauspx, lenx, hashx,
+	callx := typecheck.Call(cnames.InitFn, pos, fn, []ir.Node{mdauspx, lenx, hashx,
 		pkPathNode, pkIdNode, cmodeNode, cgranNode}, false)
 	assign := callx
 	if pkid == coverage.NotHardCoded {
-		assign = typecheck.Stmt(ir.NewAssignStmt(pos, cnames.PkgIdVar, callx))
+		assign = typecheck.Stmt(cnames.InitFn, ir.NewAssignStmt(pos, cnames.PkgIdVar, callx))
 	}
 
 	// Tack the call onto the start of our init function. We do this
@@ -195,6 +195,6 @@ func addInitHookCall(initfn *ir.Func, cmode coverage.CounterMode) {
 	initf := typecheck.LookupCoverage("initHook")
 	istestNode := ir.NewBool(base.Pos, istest)
 	args := []ir.Node{istestNode}
-	callx := typecheck.Call(pos, initf, args, false)
+	callx := typecheck.Call(initfn, pos, initf, args, false)
 	initfn.Body.Append(callx)
 }

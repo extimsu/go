@@ -33,7 +33,6 @@ type systeminfo struct {
 const (
 	PROCESSOR_ARCHITECTURE_AMD64 = 9
 	PROCESSOR_ARCHITECTURE_INTEL = 0
-	PROCESSOR_ARCHITECTURE_ARM   = 5
 	PROCESSOR_ARCHITECTURE_ARM64 = 12
 	PROCESSOR_ARCHITECTURE_IA64  = 6
 )
@@ -41,14 +40,12 @@ const (
 var sysinfo systeminfo
 
 func sysinit() {
-	syscall.Syscall(procGetSystemInfo.Addr(), 1, uintptr(unsafe.Pointer(&sysinfo)), 0, 0)
+	syscall.SyscallN(procGetSystemInfo.Addr(), uintptr(unsafe.Pointer(&sysinfo)))
 	switch sysinfo.wProcessorArchitecture {
 	case PROCESSOR_ARCHITECTURE_AMD64:
 		gohostarch = "amd64"
 	case PROCESSOR_ARCHITECTURE_INTEL:
 		gohostarch = "386"
-	case PROCESSOR_ARCHITECTURE_ARM:
-		gohostarch = "arm"
 	case PROCESSOR_ARCHITECTURE_ARM64:
 		gohostarch = "arm64"
 	default:

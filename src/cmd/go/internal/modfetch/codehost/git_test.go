@@ -8,8 +8,10 @@ import (
 	"archive/zip"
 	"bytes"
 	"cmd/go/internal/cfg"
+	"cmd/go/internal/vcscmd"
 	"cmd/go/internal/vcweb/vcstest"
 	"context"
+	"errors"
 	"flag"
 	"internal/testenv"
 	"io"
@@ -24,6 +26,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/mod/semver"
 )
 
 func TestMain(m *testing.M) {
@@ -33,7 +37,7 @@ func TestMain(m *testing.M) {
 	}
 }
 
-var gitrepo1, hgrepo1, vgotest1 string
+var gitrepo1, gitsha256repo, hgrepo1, vgotest1 string
 
 var altRepos = func() []string {
 	return []string{
@@ -42,7 +46,7 @@ var altRepos = func() []string {
 	}
 }
 
-// TODO: Convert gitrepo1 to svn, bzr, fossil and add tests.
+// TODO: Convert gitrepo1 to svn and fossil and add tests.
 // For now, at least the hgrepo1 tests check the general vcs.go logic.
 
 // localGitRepo is like gitrepo1 but allows archive access
@@ -63,11 +67,13 @@ func localGitURL(t testing.TB) string {
 		// If we use a file:// URL to access the local directory,
 		// then git starts up all the usual protocol machinery,
 		// which will let us test remote git archive invocations.
-		_, localGitURLErr = Run(context.Background(), "", "git", "clone", "--mirror", gitrepo1, localGitRepo)
+		_, localGitURLErr = run(context.Background(), "", vcscmd.New("git", "clone", "--mirror").Operands(gitrepo1, localGitRepo))
 		if localGitURLErr != nil {
 			return
 		}
-		_, localGitURLErr = Run(context.Background(), localGitRepo, "git", "config", "daemon.uploadarch", "true")
+		repo := gitRepo{dir: localGitRepo}
+		_, localGitURLErr = repo.runGit(context.Background(), vcscmd.New("git", "config", "daemon.uploadarch", "true"))
+		// TODO(david.finkel): do the same with the git repo using sha256 object hashes
 	})
 
 	if localGitURLErr != nil {
@@ -102,6 +108,7 @@ func testMain(m *testing.M) (err error) {
 	}()
 
 	gitrepo1 = srv.HTTP.URL + "/git/gitrepo1"
+	gitsha256repo = srv.HTTP.URL + "/git/gitrepo-sha256"
 	hgrepo1 = srv.HTTP.URL + "/hg/hgrepo1"
 	vgotest1 = srv.HTTP.URL + "/git/vgotest1"
 
@@ -171,7 +178,7 @@ func (w *testWriter) Write(p []byte) (int, error) {
 
 func testRepo(ctx context.Context, t *testing.T, remote string) (Repo, error) {
 	if remote == "localGitRepo" {
-		return LocalGitRepo(ctx, localGitURL(t))
+		return NewRepo(ctx, "git", localGitURL(t), false)
 	}
 	vcsName := "git"
 	for _, k := range []string{"hg"} {
@@ -186,22 +193,59 @@ func testRepo(ctx context.Context, t *testing.T, remote string) (Repo, error) {
 	if runtime.GOOS == "android" && strings.HasSuffix(testenv.Builder(), "-corellium") {
 		testenv.SkipFlaky(t, 59940)
 	}
-	return NewRepo(ctx, vcsName, remote)
+	return NewRepo(ctx, vcsName, remote, false)
+}
+
+func TestExtractGitVersion(t *testing.T) {
+	t.Parallel()
+	for _, tbl := range []struct {
+		in, exp string
+	}{
+		{in: "git version 2.52.0.rc2", exp: "v2.52.0"},
+		{in: "git version 2.52.0.38.g5e6e4854e0", exp: "v2.52.0"},
+		{in: "git version 2.51.2", exp: "v2.51.2"},
+		{in: "git version 1.5.0.5.GIT", exp: "v1.5.0"},
+		{in: "git version 1.5.1-rc3.GIT", exp: "v1.5.1"},
+		{in: "git version 1.5.2.GIT", exp: "v1.5.2"},
+		{in: "git version 2.43.0.rc2.23.gc3cc3e1da7", exp: "v2.43.0"},
+	} {
+		t.Run(tbl.exp, func(t *testing.T) {
+			out, extrErr := extractGitVersion([]byte(tbl.in))
+			if extrErr != nil {
+				t.Errorf("failed to extract git version from %q: %s", tbl.in, extrErr)
+			}
+			if out != tbl.exp {
+				t.Errorf("unexpected git version extractGitVersion(%q) = %q; want %q", tbl.in, out, tbl.exp)
+			}
+		})
+	}
 }
 
 func TestTags(t *testing.T) {
-	t.Parallel()
+
+	gitVers, gitVersErr := gitVersion()
+	if gitVersErr != nil {
+		t.Logf("git version check failed: %s", gitVersErr)
+	}
 
 	type tagsTest struct {
 		repo   string
 		prefix string
 		tags   []Tag
+		// Override the git default hash for a few cases to make sure
+		// we handle all 3 reasonable states.
+		defGitHash string
 	}
 
 	runTest := func(tt tagsTest) func(*testing.T) {
 		return func(t *testing.T) {
-			t.Parallel()
+			if tt.repo == gitsha256repo && semver.Compare(gitVers, minGitSHA256Vers) < 0 {
+				t.Skipf("git version is too old (%+v); skipping git sha256 test", gitVers)
+			}
 			ctx := testContext(t)
+			if tt.defGitHash != "" {
+				t.Setenv("GIT_DEFAULT_HASH", tt.defGitHash)
+			}
 
 			r, err := testRepo(ctx, t, tt.repo)
 			if err != nil {
@@ -218,26 +262,69 @@ func TestTags(t *testing.T) {
 	}
 
 	for _, tt := range []tagsTest{
-		{gitrepo1, "xxx", []Tag{}},
+		{gitrepo1, "xxx", []Tag{}, ""},
+		{gitrepo1, "xxx", []Tag{}, "sha256"},
+		{gitrepo1, "xxx", []Tag{}, "sha1"},
 		{gitrepo1, "", []Tag{
 			{"v1.2.3", "ede458df7cd0fdca520df19a33158086a8a68e81"},
 			{"v1.2.4-annotated", "ede458df7cd0fdca520df19a33158086a8a68e81"},
 			{"v2.0.1", "76a00fb249b7f93091bc2c89a789dab1fc1bc26f"},
 			{"v2.0.2", "9d02800338b8a55be062c838d1f02e0c5780b9eb"},
 			{"v2.3", "76a00fb249b7f93091bc2c89a789dab1fc1bc26f"},
-		}},
+		}, ""},
 		{gitrepo1, "v", []Tag{
 			{"v1.2.3", "ede458df7cd0fdca520df19a33158086a8a68e81"},
 			{"v1.2.4-annotated", "ede458df7cd0fdca520df19a33158086a8a68e81"},
 			{"v2.0.1", "76a00fb249b7f93091bc2c89a789dab1fc1bc26f"},
 			{"v2.0.2", "9d02800338b8a55be062c838d1f02e0c5780b9eb"},
 			{"v2.3", "76a00fb249b7f93091bc2c89a789dab1fc1bc26f"},
-		}},
+		}, ""},
 		{gitrepo1, "v1", []Tag{
 			{"v1.2.3", "ede458df7cd0fdca520df19a33158086a8a68e81"},
 			{"v1.2.4-annotated", "ede458df7cd0fdca520df19a33158086a8a68e81"},
-		}},
-		{gitrepo1, "2", []Tag{}},
+		}, ""},
+		{gitrepo1, "v1", []Tag{
+			{"v1.2.3", "ede458df7cd0fdca520df19a33158086a8a68e81"},
+			{"v1.2.4-annotated", "ede458df7cd0fdca520df19a33158086a8a68e81"},
+		}, "sha256"},
+		{gitrepo1, "v1", []Tag{
+			{"v1.2.3", "ede458df7cd0fdca520df19a33158086a8a68e81"},
+			{"v1.2.4-annotated", "ede458df7cd0fdca520df19a33158086a8a68e81"},
+		}, "sha1"},
+		{gitrepo1, "2", []Tag{}, ""},
+		{gitsha256repo, "xxx", []Tag{}, ""},
+		{gitsha256repo, "", []Tag{
+			{"v1.2.3", "47b8b51b2a2d9d5caa3d460096c4e01f05700ce3a9390deb54400bd508214c5c"},
+			{"v1.2.4-annotated", "47b8b51b2a2d9d5caa3d460096c4e01f05700ce3a9390deb54400bd508214c5c"},
+			{"v1.3.0", "a9157cad2aa6dc2f78aa31fced5887f04e758afa8703f04d0178702ebf04ee17"},
+			{"v2.0.1", "b7550fd9d2129c724c39ae0536e8b2fae4364d8c82bb8b0880c9b71f67295d09"},
+			{"v2.0.2", "1401e4e1fdb4169b51d44a1ff62af63ccc708bf5c12d15051268b51bbb6cbd82"},
+			{"v2.3", "b7550fd9d2129c724c39ae0536e8b2fae4364d8c82bb8b0880c9b71f67295d09"},
+		}, ""},
+		{gitsha256repo, "v", []Tag{
+			{"v1.2.3", "47b8b51b2a2d9d5caa3d460096c4e01f05700ce3a9390deb54400bd508214c5c"},
+			{"v1.2.4-annotated", "47b8b51b2a2d9d5caa3d460096c4e01f05700ce3a9390deb54400bd508214c5c"},
+			{"v1.3.0", "a9157cad2aa6dc2f78aa31fced5887f04e758afa8703f04d0178702ebf04ee17"},
+			{"v2.0.1", "b7550fd9d2129c724c39ae0536e8b2fae4364d8c82bb8b0880c9b71f67295d09"},
+			{"v2.0.2", "1401e4e1fdb4169b51d44a1ff62af63ccc708bf5c12d15051268b51bbb6cbd82"},
+			{"v2.3", "b7550fd9d2129c724c39ae0536e8b2fae4364d8c82bb8b0880c9b71f67295d09"},
+		}, ""},
+		{gitsha256repo, "v1", []Tag{
+			{"v1.2.3", "47b8b51b2a2d9d5caa3d460096c4e01f05700ce3a9390deb54400bd508214c5c"},
+			{"v1.2.4-annotated", "47b8b51b2a2d9d5caa3d460096c4e01f05700ce3a9390deb54400bd508214c5c"},
+			{"v1.3.0", "a9157cad2aa6dc2f78aa31fced5887f04e758afa8703f04d0178702ebf04ee17"},
+		}, ""},
+		{gitsha256repo, "v1", []Tag{
+			{"v1.2.3", "47b8b51b2a2d9d5caa3d460096c4e01f05700ce3a9390deb54400bd508214c5c"},
+			{"v1.2.4-annotated", "47b8b51b2a2d9d5caa3d460096c4e01f05700ce3a9390deb54400bd508214c5c"},
+			{"v1.3.0", "a9157cad2aa6dc2f78aa31fced5887f04e758afa8703f04d0178702ebf04ee17"},
+		}, "sha1"},
+		{gitsha256repo, "v1", []Tag{
+			{"v1.2.3", "47b8b51b2a2d9d5caa3d460096c4e01f05700ce3a9390deb54400bd508214c5c"},
+			{"v1.2.4-annotated", "47b8b51b2a2d9d5caa3d460096c4e01f05700ce3a9390deb54400bd508214c5c"},
+			{"v1.3.0", "a9157cad2aa6dc2f78aa31fced5887f04e758afa8703f04d0178702ebf04ee17"},
+		}, "sha256"},
+		{gitsha256repo, "2", []Tag{}, ""},
 	} {
 		t.Run(path.Base(tt.repo)+"/"+tt.prefix, runTest(tt))
 		if tt.repo == gitrepo1 {
@@ -262,6 +349,11 @@ func TestTags(t *testing.T) {
 func TestLatest(t *testing.T) {
 	t.Parallel()
 
+	gitVers, gitVersErr := gitVersion()
+	if gitVersErr != nil {
+		t.Logf("git version check failed: %s", gitVersErr)
+	}
+
 	type latestTest struct {
 		repo string
 		info *RevInfo
@@ -270,6 +362,10 @@ func TestLatest(t *testing.T) {
 		return func(t *testing.T) {
 			t.Parallel()
 			ctx := testContext(t)
+
+			if tt.repo == gitsha256repo && semver.Compare(gitVers, minGitSHA256Vers) < 0 {
+				t.Skipf("git version is too old (%+v); skipping git sha256 test", gitVers)
+			}
 
 			r, err := testRepo(ctx, t, tt.repo)
 			if err != nil {
@@ -303,17 +399,34 @@ func TestLatest(t *testing.T) {
 			},
 		},
 		{
+			gitsha256repo,
+			&RevInfo{
+				Origin: &Origin{
+					VCS:  "git",
+					URL:  gitsha256repo,
+					Ref:  "HEAD",
+					Hash: "47b8b51b2a2d9d5caa3d460096c4e01f05700ce3a9390deb54400bd508214c5c",
+				},
+				Name:    "47b8b51b2a2d9d5caa3d460096c4e01f05700ce3a9390deb54400bd508214c5c",
+				Short:   "47b8b51b2a2d",
+				Version: "47b8b51b2a2d9d5caa3d460096c4e01f05700ce3a9390deb54400bd508214c5c",
+				Time:    time.Date(2018, 4, 17, 19, 43, 22, 0, time.UTC),
+				Tags:    []string{"v1.2.3", "v1.2.4-annotated"},
+			},
+		},
+		{
 			hgrepo1,
 			&RevInfo{
 				Origin: &Origin{
 					VCS:  "hg",
 					URL:  hgrepo1,
-					Hash: "18518c07eb8ed5c80221e997e518cccaa8c0c287",
+					Ref:  "tip",
+					Hash: "745aacc8b24decc44ac2b13870f5472b479f4d72",
 				},
-				Name:    "18518c07eb8ed5c80221e997e518cccaa8c0c287",
-				Short:   "18518c07eb8e",
-				Version: "18518c07eb8ed5c80221e997e518cccaa8c0c287",
-				Time:    time.Date(2018, 6, 27, 16, 16, 30, 0, time.UTC),
+				Name:    "745aacc8b24decc44ac2b13870f5472b479f4d72",
+				Short:   "745aacc8b24d",
+				Version: "745aacc8b24decc44ac2b13870f5472b479f4d72",
+				Time:    time.Date(2018, 6, 27, 16, 16, 10, 0, time.UTC),
 			},
 		},
 	} {
@@ -333,6 +446,11 @@ func TestLatest(t *testing.T) {
 func TestReadFile(t *testing.T) {
 	t.Parallel()
 
+	gitVers, gitVersErr := gitVersion()
+	if gitVersErr != nil {
+		t.Logf("git version check failed: %s", gitVersErr)
+	}
+
 	type readFileTest struct {
 		repo string
 		rev  string
@@ -344,6 +462,10 @@ func TestReadFile(t *testing.T) {
 		return func(t *testing.T) {
 			t.Parallel()
 			ctx := testContext(t)
+
+			if tt.repo == gitsha256repo && semver.Compare(gitVers, minGitSHA256Vers) < 0 {
+				t.Skipf("git version is too old (%+v); skipping git sha256 test", gitVers)
+			}
 
 			r, err := testRepo(ctx, t, tt.repo)
 			if err != nil {
@@ -390,6 +512,24 @@ func TestReadFile(t *testing.T) {
 			file: "another.txt",
 			err:  fs.ErrNotExist.Error(),
 		},
+		{
+			repo: gitsha256repo,
+			rev:  "latest",
+			file: "README",
+			data: "",
+		},
+		{
+			repo: gitsha256repo,
+			rev:  "v2",
+			file: "another.txt",
+			data: "another\n",
+		},
+		{
+			repo: gitsha256repo,
+			rev:  "v2.3.4",
+			file: "another.txt",
+			err:  fs.ErrNotExist.Error(),
+		},
 	} {
 		t.Run(path.Base(tt.repo)+"/"+tt.rev+"/"+tt.file, runTest(tt))
 		if tt.repo == gitrepo1 {
@@ -408,6 +548,11 @@ type zipFile struct {
 func TestReadZip(t *testing.T) {
 	t.Parallel()
 
+	gitVers, gitVersErr := gitVersion()
+	if gitVersErr != nil {
+		t.Logf("git version check failed: %s", gitVersErr)
+	}
+
 	type readZipTest struct {
 		repo   string
 		rev    string
@@ -419,6 +564,10 @@ func TestReadZip(t *testing.T) {
 		return func(t *testing.T) {
 			t.Parallel()
 			ctx := testContext(t)
+
+			if tt.repo == gitsha256repo && semver.Compare(gitVers, minGitSHA256Vers) < 0 {
+				t.Skipf("git version is too old (%+v); skipping git sha256 test", gitVers)
+			}
 
 			r, err := testRepo(ctx, t, tt.repo)
 			if err != nil {
@@ -481,6 +630,16 @@ func TestReadZip(t *testing.T) {
 			},
 		},
 		{
+			repo:   gitsha256repo,
+			rev:    "v2.3.4",
+			subdir: "",
+			files: map[string]uint64{
+				"prefix/":       0,
+				"prefix/README": 0,
+				"prefix/v2":     3,
+			},
+		},
+		{
 			repo:   hgrepo1,
 			rev:    "v2.3.4",
 			subdir: "",
@@ -493,6 +652,18 @@ func TestReadZip(t *testing.T) {
 
 		{
 			repo:   gitrepo1,
+			rev:    "v2",
+			subdir: "",
+			files: map[string]uint64{
+				"prefix/":            0,
+				"prefix/README":      0,
+				"prefix/v2":          3,
+				"prefix/another.txt": 8,
+				"prefix/foo.txt":     13,
+			},
+		},
+		{
+			repo:   gitsha256repo,
 			rev:    "v2",
 			subdir: "",
 			files: map[string]uint64{
@@ -530,12 +701,24 @@ func TestReadZip(t *testing.T) {
 			},
 		},
 		{
+			repo:   gitsha256repo,
+			rev:    "v3",
+			subdir: "",
+			files: map[string]uint64{
+				"prefix/":                    0,
+				"prefix/v3/":                 0,
+				"prefix/v3/sub/":             0,
+				"prefix/v3/sub/dir/":         0,
+				"prefix/v3/sub/dir/file.txt": 16,
+				"prefix/README":              0,
+			},
+		},
+		{
 			repo:   hgrepo1,
 			rev:    "v3",
 			subdir: "",
 			files: map[string]uint64{
 				"prefix/.hg_archival.txt":    ^uint64(0),
-				"prefix/.hgtags":             405,
 				"prefix/v3/sub/dir/file.txt": 16,
 				"prefix/README":              0,
 			},
@@ -554,6 +737,18 @@ func TestReadZip(t *testing.T) {
 			},
 		},
 		{
+			repo:   gitsha256repo,
+			rev:    "v3",
+			subdir: "v3/sub/dir",
+			files: map[string]uint64{
+				"prefix/":                    0,
+				"prefix/v3/":                 0,
+				"prefix/v3/sub/":             0,
+				"prefix/v3/sub/dir/":         0,
+				"prefix/v3/sub/dir/file.txt": 16,
+			},
+		},
+		{
 			repo:   hgrepo1,
 			rev:    "v3",
 			subdir: "v3/sub/dir",
@@ -575,6 +770,18 @@ func TestReadZip(t *testing.T) {
 			},
 		},
 		{
+			repo:   gitsha256repo,
+			rev:    "v3",
+			subdir: "v3/sub",
+			files: map[string]uint64{
+				"prefix/":                    0,
+				"prefix/v3/":                 0,
+				"prefix/v3/sub/":             0,
+				"prefix/v3/sub/dir/":         0,
+				"prefix/v3/sub/dir/file.txt": 16,
+			},
+		},
+		{
 			repo:   hgrepo1,
 			rev:    "v3",
 			subdir: "v3/sub",
@@ -585,6 +792,12 @@ func TestReadZip(t *testing.T) {
 
 		{
 			repo:   gitrepo1,
+			rev:    "aaaaaaaaab",
+			subdir: "",
+			err:    "unknown revision",
+		},
+		{
+			repo:   gitsha256repo,
 			rev:    "aaaaaaaaab",
 			subdir: "",
 			err:    "unknown revision",
@@ -618,15 +831,20 @@ func TestReadZip(t *testing.T) {
 }
 
 var hgmap = map[string]string{
-	"HEAD": "41964ddce1180313bdc01d0a39a2813344d6261d", // not tip due to bad hgrepo1 conversion
-	"9d02800338b8a55be062c838d1f02e0c5780b9eb": "8f49ee7a6ddcdec6f0112d9dca48d4a2e4c3c09e",
-	"76a00fb249b7f93091bc2c89a789dab1fc1bc26f": "88fde824ec8b41a76baa16b7e84212cee9f3edd0",
-	"ede458df7cd0fdca520df19a33158086a8a68e81": "41964ddce1180313bdc01d0a39a2813344d6261d",
-	"97f6aa59c81c623494825b43d39e445566e429a4": "c0cbbfb24c7c3c50c35c7b88e7db777da4ff625d",
+	"HEAD": "c0186fb00e50985709b12266419f50bf11860166",
+	"9d02800338b8a55be062c838d1f02e0c5780b9eb": "b1ed98abc2683d326f89b924875bf14bd584898e", // v2.0.2, v2
+	"76a00fb249b7f93091bc2c89a789dab1fc1bc26f": "a546811101e11d6aff2ac72072d2d439b3a88f33", // v2.3, v2.0.1
+	"ede458df7cd0fdca520df19a33158086a8a68e81": "c0186fb00e50985709b12266419f50bf11860166", // v1.2.3, v1.2.4-annotated
+	"97f6aa59c81c623494825b43d39e445566e429a4": "c1638e3673b121d9c83e92166fce2a25dcadd6cb", // foo.txt commit on v2.3.4 branch
 }
 
 func TestStat(t *testing.T) {
 	t.Parallel()
+
+	gitVers, gitVersErr := gitVersion()
+	if gitVersErr != nil {
+		t.Logf("git version check failed: %s", gitVersErr)
+	}
 
 	type statTest struct {
 		repo string
@@ -638,6 +856,10 @@ func TestStat(t *testing.T) {
 		return func(t *testing.T) {
 			t.Parallel()
 			ctx := testContext(t)
+
+			if tt.repo == gitsha256repo && semver.Compare(gitVers, minGitSHA256Vers) < 0 {
+				t.Skipf("git version is too old (%+v); skipping git sha256 test", gitVers)
+			}
 
 			r, err := testRepo(ctx, t, tt.repo)
 			if err != nil {
@@ -756,6 +978,98 @@ func TestStat(t *testing.T) {
 			rev:  "aaaaaaaaab",
 			err:  "unknown revision",
 		},
+		{
+			repo: gitsha256repo,
+			rev:  "HEAD",
+			info: &RevInfo{
+				Name:    "47b8b51b2a2d9d5caa3d460096c4e01f05700ce3a9390deb54400bd508214c5c",
+				Short:   "47b8b51b2a2d",
+				Version: "47b8b51b2a2d9d5caa3d460096c4e01f05700ce3a9390deb54400bd508214c5c",
+				Time:    time.Date(2018, 4, 17, 19, 43, 22, 0, time.UTC),
+				Tags:    []string{"v1.2.3", "v1.2.4-annotated"},
+			},
+		},
+		{
+			repo: gitsha256repo,
+			rev:  "v2", // branch
+			info: &RevInfo{
+				Name:    "1401e4e1fdb4169b51d44a1ff62af63ccc708bf5c12d15051268b51bbb6cbd82",
+				Short:   "1401e4e1fdb4",
+				Version: "1401e4e1fdb4169b51d44a1ff62af63ccc708bf5c12d15051268b51bbb6cbd82",
+				Time:    time.Date(2018, 4, 17, 20, 00, 32, 0, time.UTC),
+				Tags:    []string{"v2.0.2"},
+			},
+		},
+		{
+			repo: gitsha256repo,
+			rev:  "v2.3.4", // badly-named branch (semver should be a tag)
+			info: &RevInfo{
+				Name:    "b7550fd9d2129c724c39ae0536e8b2fae4364d8c82bb8b0880c9b71f67295d09",
+				Short:   "b7550fd9d212",
+				Version: "b7550fd9d2129c724c39ae0536e8b2fae4364d8c82bb8b0880c9b71f67295d09",
+				Time:    time.Date(2018, 4, 17, 19, 45, 48, 0, time.UTC),
+				Tags:    []string{"v2.0.1", "v2.3"},
+			},
+		},
+		{
+			repo: gitsha256repo,
+			rev:  "v2.3", // badly-named tag (we only respect full semver v2.3.0)
+			info: &RevInfo{
+				Name:    "b7550fd9d2129c724c39ae0536e8b2fae4364d8c82bb8b0880c9b71f67295d09",
+				Short:   "b7550fd9d212",
+				Version: "v2.3",
+				Time:    time.Date(2018, 4, 17, 19, 45, 48, 0, time.UTC),
+				Tags:    []string{"v2.0.1", "v2.3"},
+			},
+		},
+		{
+			repo: gitsha256repo,
+			rev:  "v1.2.3", // tag
+			info: &RevInfo{
+				Name:    "47b8b51b2a2d9d5caa3d460096c4e01f05700ce3a9390deb54400bd508214c5c",
+				Short:   "47b8b51b2a2d",
+				Version: "v1.2.3",
+				Time:    time.Date(2018, 4, 17, 19, 43, 22, 0, time.UTC),
+				Tags:    []string{"v1.2.3", "v1.2.4-annotated"},
+			},
+		},
+		{
+			repo: gitsha256repo,
+			rev:  "47b8b51b", // hash prefix in refs
+			info: &RevInfo{
+				Name:    "47b8b51b2a2d9d5caa3d460096c4e01f05700ce3a9390deb54400bd508214c5c",
+				Short:   "47b8b51b2a2d",
+				Version: "47b8b51b2a2d9d5caa3d460096c4e01f05700ce3a9390deb54400bd508214c5c",
+				Time:    time.Date(2018, 4, 17, 19, 43, 22, 0, time.UTC),
+				Tags:    []string{"v1.2.3", "v1.2.4-annotated"},
+			},
+		},
+		{
+			repo: gitsha256repo,
+			rev:  "0be440b6", // hash prefix not in refs
+			info: &RevInfo{
+				Name:    "0be440b60b6c81be26c7256781d8e57112ec46c8cd1a9481a8e78a283f10570c",
+				Short:   "0be440b60b6c",
+				Version: "0be440b60b6c81be26c7256781d8e57112ec46c8cd1a9481a8e78a283f10570c",
+				Time:    time.Date(2018, 4, 17, 20, 0, 19, 0, time.UTC),
+			},
+		},
+		{
+			repo: gitsha256repo,
+			rev:  "v1.2.4-annotated", // annotated tag uses unwrapped commit hash
+			info: &RevInfo{
+				Name:    "47b8b51b2a2d9d5caa3d460096c4e01f05700ce3a9390deb54400bd508214c5c",
+				Short:   "47b8b51b2a2d",
+				Version: "v1.2.4-annotated",
+				Time:    time.Date(2018, 4, 17, 19, 43, 22, 0, time.UTC),
+				Tags:    []string{"v1.2.3", "v1.2.4-annotated"},
+			},
+		},
+		{
+			repo: gitsha256repo,
+			rev:  "aaaaaaaaab",
+			err:  "unknown revision",
+		},
 	} {
 		t.Run(path.Base(tt.repo)+"/"+tt.rev, runTest(tt))
 		if tt.repo == gitrepo1 {
@@ -792,4 +1106,123 @@ func remap(name string, m map[string]string) string {
 		}
 	}
 	return name
+}
+
+func initLocalGitTest(t *testing.T) (dir string, git func(...string) string) {
+	t.Helper()
+	testenv.MustHaveExecPath(t, "git")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", home)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(home, ".gitconfig"))
+	t.Setenv("GIT_ALLOW_PROTOCOL", "file")
+	t.Setenv("LC_ALL", "C")
+
+	dir = t.TempDir()
+	git = func(args ...string) string {
+		t.Helper()
+		cmd := testenv.Command(t, "git", args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %q: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	git("init", "-q")
+	git("config", "user.name", "Gopher")
+	git("config", "user.email", "gopher@example.com")
+	return dir, git
+}
+
+func TestGitStatFullFetch(t *testing.T) {
+	dir, git := initLocalGitTest(t)
+	const branch = "release-1.0"
+	const tag = "heads/" + branch
+	git("symbolic-ref", "HEAD", "refs/heads/"+branch)
+	git("commit", "--allow-empty", "-qm", "Begin development")
+	git("commit", "--allow-empty", "-qm", "Release")
+	tagHash := git("rev-parse", "HEAD")
+	git("tag", tag)
+	git("commit", "--allow-empty", "-qm", "Continue development")
+	headHash := git("rev-parse", "HEAD")
+
+	// The short tag name also names a branch via Git's refs/ abbreviation.
+	// The full-fetch fallback must use the qualified tag, not the branch.
+	for _, tt := range []struct{ rev, hash, version string }{
+		{tag, tagHash, tag},
+		{branch, headHash, headHash},
+		{"HEAD", headHash, headHash},
+	} {
+		cache := t.TempDir()
+		git("init", "--bare", "-q", cache)
+		git("--git-dir", cache, "symbolic-ref", "HEAD", "refs/heads/unborn")
+		// Simulate a stale shallow lock. It prevents the shallow fetch but
+		// does not prevent a full fetch into this repository.
+		if err := os.WriteFile(filepath.Join(cache, "shallow.lock"), nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+		r := &gitRepo{dir: cache, remote: dir}
+		r.mu.Path = cache + ".lock"
+		info, err := r.Stat(t.Context(), tt.rev)
+		if err != nil {
+			t.Errorf("Stat(%q): %v", tt.rev, err)
+			continue
+		}
+		if r.fetchLevel != fetchAll {
+			t.Errorf("Stat(%q) did not perform a full fetch", tt.rev)
+		}
+		if info.Name != tt.hash || info.Version != tt.version {
+			t.Errorf("Stat(%q) = (hash %q, version %q); want (%q, %q)", tt.rev, info.Name, info.Version, tt.hash, tt.version)
+		}
+	}
+}
+
+func TestGitReadZipLiteralPath(t *testing.T) {
+	dir, git := initLocalGitTest(t)
+	const subdir = "docs[old]"
+	const notes = "Release notes\n"
+	for _, d := range []string{subdir, "docso"} {
+		if err := os.Mkdir(filepath.Join(dir, d), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, d, "notes.txt"), []byte(notes), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git("--literal-pathspecs", "add", subdir+"/notes.txt", "docso/notes.txt")
+	git("commit", "-qm", "Add release notes")
+	hash := git("rev-parse", "HEAD")
+
+	ctx := t.Context()
+	r, err := newGitRepo(ctx, dir, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc, err := r.ReadZip(ctx, hash, subdir, MaxZipFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	z, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := fs.ReadFile(z, "prefix/"+subdir+"/notes.txt"); err != nil || string(got) != notes {
+		t.Errorf("reading release notes from zip: got %q, %v; want %q", got, err, notes)
+	}
+
+	// This directory is absent, even though it matches docso as a pattern.
+	rc, err = r.ReadZip(ctx, hash, "docs[o]", MaxZipFile)
+	if rc != nil {
+		rc.Close()
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("ReadZip with nonexistent subdir: got %v, want %v", err, fs.ErrNotExist)
+	}
 }

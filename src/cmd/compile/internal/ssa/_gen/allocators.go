@@ -41,47 +41,57 @@ func genAllocators() {
 			capacity: "cap(%s)",
 			mak:      "make([]*Value, %s)",
 			resize:   "%s[:%s]",
-			clear:    "for i := range %[1]s {\n%[1]s[i] = nil\n}",
+			clear:    "clear(%s)",
 			minLog:   5,
 			maxLog:   32,
 		},
 		{
-			name:     "Int64Slice",
-			typ:      "[]int64",
+			name:     "LimitSlice",
+			typ:      "[]Limit", // the limit type is basically [4]uint64.
 			capacity: "cap(%s)",
-			mak:      "make([]int64, %s)",
+			mak:      "make([]Limit, %s)",
 			resize:   "%s[:%s]",
-			clear:    "for i := range %[1]s {\n%[1]s[i] = 0\n}",
-			minLog:   5,
-			maxLog:   32,
+			clear:    "clear(%s)",
+			minLog:   3,
+			maxLog:   30,
 		},
 		{
 			name:     "SparseSet",
-			typ:      "*sparseSet",
+			typ:      "*SparseSet",
 			capacity: "%s.cap()",
-			mak:      "newSparseSet(%s)",
+			mak:      "NewSparseSet(%s)",
 			resize:   "", // larger-sized sparse sets are ok
-			clear:    "%s.clear()",
+			clear:    "%s.Clear()",
 			minLog:   5,
 			maxLog:   32,
 		},
 		{
 			name:     "SparseMap",
-			typ:      "*sparseMap",
+			typ:      "*SparseMap",
 			capacity: "%s.cap()",
-			mak:      "newSparseMap(%s)",
+			mak:      "NewSparseMap(%s)",
 			resize:   "", // larger-sized sparse maps are ok
-			clear:    "%s.clear()",
+			clear:    "%s.Clear()",
 			minLog:   5,
 			maxLog:   32,
 		},
 		{
 			name:     "SparseMapPos",
-			typ:      "*sparseMapPos",
+			typ:      "*SparseMapPos",
 			capacity: "%s.cap()",
 			mak:      "newSparseMapPos(%s)",
 			resize:   "", // larger-sized sparse maps are ok
-			clear:    "%s.clear()",
+			clear:    "%s.Clear()",
+			minLog:   5,
+			maxLog:   32,
+		},
+		{
+			name:     "SparseMapValue",
+			typ:      "*SparseMapValue",
+			capacity: "%s.cap()",
+			mak:      "NewSparseMapValue(%s)",
+			resize:   "", // larger-sized sparse maps are ok
+			clear:    "%s.ClearDense()",
 			minLog:   5,
 			maxLog:   32,
 		},
@@ -93,36 +103,51 @@ func genAllocators() {
 			base: "ValueSlice",
 		},
 		{
+			name: "Int64",
+			typ:  "[]int64",
+			base: "LimitSlice",
+		},
+		{
 			name: "IntSlice",
 			typ:  "[]int",
-			base: "Int64Slice",
+			base: "LimitSlice",
 		},
 		{
 			name: "Int32Slice",
 			typ:  "[]int32",
-			base: "Int64Slice",
+			base: "LimitSlice",
 		},
 		{
 			name: "Int8Slice",
 			typ:  "[]int8",
-			base: "Int64Slice",
+			base: "LimitSlice",
 		},
 		{
 			name: "BoolSlice",
 			typ:  "[]bool",
-			base: "Int64Slice",
+			base: "LimitSlice",
 		},
 		{
 			name: "IDSlice",
 			typ:  "[]ID",
-			base: "Int64Slice",
+			base: "LimitSlice",
+		},
+		{
+			name: "UintSlice",
+			typ:  "[]uint",
+			base: "LimitSlice",
+		},
+		{
+			name: "KnownBitsEntriesSlice",
+			typ:  "[]knownBitsEntry",
+			base: "LimitSlice",
 		},
 	}
 
 	w := new(bytes.Buffer)
 	fmt.Fprintf(w, "// Code generated from _gen/allocators.go using 'go generate'; DO NOT EDIT.\n")
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, "package ssa")
+	fmt.Fprintf(w, "package %s\n", splitCorePkg)
 
 	fmt.Fprintln(w, "import (")
 	fmt.Fprintln(w, "\"internal/unsafeheader\"")
@@ -150,13 +175,14 @@ func genAllocators() {
 		panic(err)
 	}
 
-	if err := os.WriteFile("../allocators.go", b, 0666); err != nil {
+	mkdirOutFile(allocatorsFile)
+	if err := os.WriteFile(outFile(allocatorsFile), b, 0666); err != nil {
 		log.Fatalf("can't write output: %v\n", err)
 	}
 }
 func genAllocator(w io.Writer, a allocator) {
 	fmt.Fprintf(w, "var poolFree%s [%d]sync.Pool\n", a.name, a.maxLog-a.minLog)
-	fmt.Fprintf(w, "func (c *Cache) alloc%s(n int) %s {\n", a.name, a.typ)
+	fmt.Fprintf(w, "func (c *Cache) %s%s(n int) %s {\n", simpleTitle("alloc"), a.name, a.typ)
 	fmt.Fprintf(w, "var s %s\n", a.typ)
 	fmt.Fprintf(w, "n2 := n\n")
 	fmt.Fprintf(w, "if n2 < %d { n2 = %d }\n", 1<<a.minLog, 1<<a.minLog)
@@ -179,7 +205,7 @@ func genAllocator(w io.Writer, a allocator) {
 	}
 	fmt.Fprintf(w, "return s\n")
 	fmt.Fprintf(w, "}\n")
-	fmt.Fprintf(w, "func (c *Cache) free%s(s %s) {\n", a.name, a.typ)
+	fmt.Fprintf(w, "func (c *Cache) %s%s(s %s) {\n", simpleTitle("free"), a.name, a.typ)
 	fmt.Fprintf(w, "%s\n", fmt.Sprintf(a.clear, "s"))
 	fmt.Fprintf(w, "b := bits.Len(uint(%s) - 1)\n", fmt.Sprintf(a.capacity, "s"))
 	if a.typ[0] == '*' {
@@ -199,7 +225,7 @@ func genAllocator(w io.Writer, a allocator) {
 	fmt.Fprintf(w, "}\n")
 }
 func genDerived(w io.Writer, d derived, base allocator) {
-	fmt.Fprintf(w, "func (c *Cache) alloc%s(n int) %s {\n", d.name, d.typ)
+	fmt.Fprintf(w, "func (c *Cache) %s%s(n int) %s {\n", simpleTitle("alloc"), d.name, d.typ)
 	if d.typ[:2] != "[]" || base.typ[:2] != "[]" {
 		panic(fmt.Sprintf("bad derived types: %s %s", d.typ, base.typ))
 	}
@@ -207,7 +233,7 @@ func genDerived(w io.Writer, d derived, base allocator) {
 	fmt.Fprintf(w, "var derived %s\n", d.typ[2:])
 	fmt.Fprintf(w, "if unsafe.Sizeof(base)%%unsafe.Sizeof(derived) != 0 { panic(\"bad\") }\n")
 	fmt.Fprintf(w, "scale := unsafe.Sizeof(base)/unsafe.Sizeof(derived)\n")
-	fmt.Fprintf(w, "b := c.alloc%s(int((uintptr(n)+scale-1)/scale))\n", base.name)
+	fmt.Fprintf(w, "b := c.%s%s(int((uintptr(n)+scale-1)/scale))\n", simpleTitle("alloc"), base.name)
 	fmt.Fprintf(w, "s := unsafeheader.Slice {\n")
 	fmt.Fprintf(w, "  Data: unsafe.Pointer(&b[0]),\n")
 	fmt.Fprintf(w, "  Len: n,\n")
@@ -215,7 +241,7 @@ func genDerived(w io.Writer, d derived, base allocator) {
 	fmt.Fprintf(w, "  }\n")
 	fmt.Fprintf(w, "return *(*%s)(unsafe.Pointer(&s))\n", d.typ)
 	fmt.Fprintf(w, "}\n")
-	fmt.Fprintf(w, "func (c *Cache) free%s(s %s) {\n", d.name, d.typ)
+	fmt.Fprintf(w, "func (c *Cache) %s%s(s %s) {\n", simpleTitle("free"), d.name, d.typ)
 	fmt.Fprintf(w, "var base %s\n", base.typ[2:])
 	fmt.Fprintf(w, "var derived %s\n", d.typ[2:])
 	fmt.Fprintf(w, "scale := unsafe.Sizeof(base)/unsafe.Sizeof(derived)\n")
@@ -224,6 +250,6 @@ func genDerived(w io.Writer, d derived, base allocator) {
 	fmt.Fprintf(w, "  Len: int((uintptr(len(s))+scale-1)/scale),\n")
 	fmt.Fprintf(w, "  Cap: int((uintptr(cap(s))+scale-1)/scale),\n")
 	fmt.Fprintf(w, "  }\n")
-	fmt.Fprintf(w, "c.free%s(*(*%s)(unsafe.Pointer(&b)))\n", base.name, base.typ)
+	fmt.Fprintf(w, "c.%s%s(*(*%s)(unsafe.Pointer(&b)))\n", simpleTitle("free"), base.name, base.typ)
 	fmt.Fprintf(w, "}\n")
 }

@@ -6,34 +6,36 @@ package modindex
 
 import (
 	"cmd/go/internal/base"
+	"cmd/go/internal/build"
 	"cmd/go/internal/fsys"
 	"cmd/go/internal/str"
+	"cmd/internal/par"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"go/build"
 	"go/doc"
 	"go/scanner"
 	"go/token"
 	"io/fs"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
 // moduleWalkErr returns filepath.SkipDir if the directory isn't relevant
 // when indexing a module or generating a filehash, ErrNotIndexed,
 // if the module shouldn't be indexed, and nil otherwise.
-func moduleWalkErr(root string, path string, info fs.FileInfo, err error) error {
+func moduleWalkErr(root string, path string, d fs.DirEntry, err error) error {
 	if err != nil {
 		return ErrNotIndexed
 	}
 	// stop at module boundaries
-	if info.IsDir() && path != root {
-		if fi, err := fsys.Stat(filepath.Join(path, "go.mod")); err == nil && !fi.IsDir() {
+	if d.IsDir() && path != root {
+		if info, err := fsys.Stat(filepath.Join(path, "go.mod")); err == nil && !info.IsDir() {
 			return filepath.SkipDir
 		}
 	}
-	if info.Mode()&fs.ModeSymlink != 0 {
+	if d.Type()&fs.ModeSymlink != 0 {
 		if target, err := fsys.Stat(path); err == nil && target.IsDir() {
 			// return an error to make the module hash invalid.
 			// Symlink directories in modules are tricky, so we won't index
@@ -51,30 +53,40 @@ func moduleWalkErr(root string, path string, info fs.FileInfo, err error) error 
 // be indexed because it contains symlinks.
 func indexModule(modroot string) ([]byte, error) {
 	fsys.Trace("indexModule", modroot)
-	var packages []*rawPackage
+	var dirs []string
 
 	// If the root itself is a symlink to a directory,
 	// we want to follow it (see https://go.dev/issue/50807).
 	// Add a trailing separator to force that to happen.
 	root := str.WithFilePathSeparator(modroot)
-	err := fsys.Walk(root, func(path string, info fs.FileInfo, err error) error {
-		if err := moduleWalkErr(root, path, info, err); err != nil {
+	err := fsys.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err := moduleWalkErr(root, path, d, err); err != nil {
 			return err
 		}
 
-		if !info.IsDir() {
+		if !d.IsDir() {
 			return nil
 		}
 		if !strings.HasPrefix(path, root) {
 			panic(fmt.Errorf("path %v in walk doesn't have modroot %v as prefix", path, modroot))
 		}
 		rel := path[len(root):]
-		packages = append(packages, importRaw(modroot, rel))
+		dirs = append(dirs, rel)
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
+
+	packages := make([]*rawPackage, len(dirs))
+	work := par.NewQueue(runtime.GOMAXPROCS(0))
+	for i, rel := range dirs {
+		work.Add(func() {
+			packages[i] = importRaw(modroot, rel)
+		})
+	}
+	<-work.Idle()
+
 	return encodeModuleBytes(packages), nil
 }
 
@@ -104,7 +116,7 @@ type parseError struct {
 
 // parseErrorToString converts the error from parsing the file into a string
 // representation. A nil error is converted to an empty string, and all other
-// errors are converted to a JSON-marshalled parseError struct, with ErrorList
+// errors are converted to a JSON-marshaled parseError struct, with ErrorList
 // set for errors of type scanner.ErrorList, and ErrorString set to the error's
 // string representation for all other errors.
 func parseErrorToString(err error) string {
@@ -112,10 +124,10 @@ func parseErrorToString(err error) string {
 		return ""
 	}
 	var p parseError
-	if e, ok := err.(scanner.ErrorList); ok {
-		p.ErrorList = &e
+	if errlist, ok := err.(scanner.ErrorList); ok {
+		p.ErrorList = &errlist
 	} else {
-		p.ErrorString = e.Error()
+		p.ErrorString = err.Error()
 	}
 	s, err := json.Marshal(p)
 	if err != nil {
@@ -126,7 +138,7 @@ func parseErrorToString(err error) string {
 
 // parseErrorFromString converts a string produced by parseErrorToString back
 // to an error.  An empty string is converted to a nil error, and all
-// other strings are expected to be JSON-marshalled parseError structs.
+// other strings are expected to be JSON-marshaled parseError structs.
 // The two functions are meant to preserve the structure of an
 // error of type scanner.ErrorList in a round trip, but may not preserve the
 // structure of other errors.
@@ -156,6 +168,7 @@ type rawFile struct {
 	ignoreFile           bool   // starts with _ or . or should otherwise always be ignored
 	binaryOnly           bool   // cannot be rebuilt from source (has //go:binary-only-package comment)
 	cgoDirectives        string // the #cgo directive lines in the comment on import "C"
+	cgoBindings          bool   // imports "C" and declares cgo binding pragmas
 	goBuildConstraint    string
 	plusBuildConstraints []string
 	imports              []rawImport
@@ -204,7 +217,7 @@ func importRaw(modroot, reldir string) *rawPackage {
 		if d.IsDir() {
 			continue
 		}
-		if d.Mode()&fs.ModeSymlink != 0 {
+		if d.Type()&fs.ModeSymlink != 0 {
 			if isDir(filepath.Join(absdir, d.Name())) {
 				// Symlinks to directories are not source files.
 				continue
@@ -233,6 +246,7 @@ func importRaw(modroot, reldir string) *rawPackage {
 			goBuildConstraint:    info.goBuildConstraint,
 			plusBuildConstraints: info.plusBuildConstraints,
 			binaryOnly:           info.binaryOnly,
+			cgoBindings:          info.cgoBindings,
 			directives:           info.directives,
 		}
 		if info.parsed != nil {
@@ -275,7 +289,7 @@ func importRaw(modroot, reldir string) *rawPackage {
 // which is the comment on import "C".
 func extractCgoDirectives(doc string) []string {
 	var out []string
-	for _, line := range strings.Split(doc, "\n") {
+	for line := range strings.SplitSeq(doc, "\n") {
 		// Line is
 		//	#cgo [GOOS/GOARCH...] LDFLAGS: stuff
 		//

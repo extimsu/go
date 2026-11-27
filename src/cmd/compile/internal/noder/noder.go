@@ -41,7 +41,6 @@ func LoadPackage(filenames []string) {
 	// Move the entire syntax processing logic into a separate goroutine to avoid blocking on the "sem".
 	go func() {
 		for i, filename := range filenames {
-			filename := filename
 			p := noders[i]
 			sem <- struct{}{}
 			go func() {
@@ -104,9 +103,10 @@ type noder struct {
 	err        chan syntax.Error
 }
 
-// linkname records a //go:linkname directive.
+// linkname records a //go:linkname or //go:linknamestd directive.
 type linkname struct {
 	pos    syntax.Pos
+	std    bool
 	local  string
 	remote string
 }
@@ -162,6 +162,7 @@ var allowedStdPragmas = map[string]bool{
 	"go:cgo_ldflag":         true,
 	"go:cgo_dynamic_linker": true,
 	"go:embed":              true,
+	"go:fix":                true,
 	"go:generate":           true,
 }
 
@@ -171,6 +172,11 @@ type pragmas struct {
 	Pos        []pragmaPos   // position of each individual flag
 	Embeds     []pragmaEmbed
 	WasmImport *WasmImport
+	WasmExport *WasmExport
+}
+
+func (p *pragmas) Nointerface() bool {
+	return p.Flag&ir.Nointerface != 0
 }
 
 // WasmImport stores metadata associated with the //go:wasmimport pragma
@@ -178,6 +184,12 @@ type WasmImport struct {
 	Pos    syntax.Pos
 	Module string
 	Name   string
+}
+
+// WasmExport stores metadata associated with the //go:wasmexport pragma
+type WasmExport struct {
+	Pos  syntax.Pos
+	Name string
 }
 
 type pragmaPos struct {
@@ -203,6 +215,9 @@ func (p *noder) checkUnusedDuringParse(pragma *pragmas) {
 	}
 	if pragma.WasmImport != nil {
 		p.error(syntax.Error{Pos: pragma.WasmImport.Pos, Msg: "misplaced go:wasmimport directive"})
+	}
+	if pragma.WasmExport != nil {
+		p.error(syntax.Error{Pos: pragma.WasmExport.Pos, Msg: "misplaced go:wasmexport directive"})
 	}
 }
 
@@ -238,7 +253,7 @@ func (p *noder) pragma(pos syntax.Pos, blankLine bool, text string, old syntax.P
 			break
 		}
 
-		if buildcfg.GOARCH == "wasm" {
+		if buildcfg.GOARCH == "wasm" || buildcfg.GOARCH == "wasm32" {
 			// Only actually use them if we're compiling to WASM though.
 			pragma.WasmImport = &WasmImport{
 				Pos:    pos,
@@ -246,10 +261,27 @@ func (p *noder) pragma(pos syntax.Pos, blankLine bool, text string, old syntax.P
 				Name:   f[2],
 			}
 		}
-	case strings.HasPrefix(text, "go:linkname "):
+
+	case strings.HasPrefix(text, "go:wasmexport "):
+		f := strings.Fields(text)
+		if len(f) != 2 {
+			// TODO: maybe make the name optional? It was once mentioned on proposal 65199.
+			p.error(syntax.Error{Pos: pos, Msg: "usage: //go:wasmexport exportname"})
+			break
+		}
+
+		if buildcfg.GOARCH == "wasm" || buildcfg.GOARCH == "wasm32" {
+			// Only actually use them if we're compiling to WASM though.
+			pragma.WasmExport = &WasmExport{
+				Pos:  pos,
+				Name: f[1],
+			}
+		}
+
+	case strings.HasPrefix(text, "go:linkname "), strings.HasPrefix(text, "go:linknamestd "):
 		f := strings.Fields(text)
 		if !(2 <= len(f) && len(f) <= 3) {
-			p.error(syntax.Error{Pos: pos, Msg: "usage: //go:linkname localname [linkname]"})
+			p.error(syntax.Error{Pos: pos, Msg: fmt.Sprintf("usage: //%s localname [linkname]", f[0])})
 			break
 		}
 		// The second argument is optional. If omitted, we use
@@ -267,7 +299,7 @@ func (p *noder) pragma(pos syntax.Pos, blankLine bool, text string, old syntax.P
 		} else {
 			panic("missing pkgpath")
 		}
-		p.linknames = append(p.linknames, linkname{pos, f[1], target})
+		p.linknames = append(p.linknames, linkname{pos, f[0] == "go:linknamestd", f[1], target})
 
 	case text == "go:embed", strings.HasPrefix(text, "go:embed "):
 		args, err := parseGoEmbed(text[len("go:embed"):])
@@ -286,7 +318,7 @@ func (p *noder) pragma(pos syntax.Pos, blankLine bool, text string, old syntax.P
 		fields := pragmaFields(text)
 		if len(fields) >= 4 {
 			lib := strings.Trim(fields[3], `"`)
-			if lib != "" && !safeArg(lib) && !isCgoGeneratedFile(pos) {
+			if lib != "" && !safeArg(lib) && (!isCgoGeneratedFile(pos) || buildcfg.GOOS == "windows") {
 				p.error(syntax.Error{Pos: pos, Msg: fmt.Sprintf("invalid library name %q in cgo_import_dynamic directive", lib)})
 			}
 			p.pragcgo(pos, text)
@@ -345,13 +377,25 @@ func isCgoGeneratedFile(pos syntax.Pos) bool {
 // safeArg reports whether arg is a "safe" command-line argument,
 // meaning that when it appears in a command-line, it probably
 // doesn't have some special meaning other than its own name.
-// This is copied from SafeArg in cmd/go/internal/load/pkg.go.
+// This is based on SafeArg in cmd/go/internal/load/pkg.go, but is stricter:
+// it checks every character of name and rejects ".." path traversal.
 func safeArg(name string) bool {
 	if name == "" {
 		return false
 	}
-	c := name[0]
-	return '0' <= c && c <= '9' || 'A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' || c == '.' || c == '_' || c == '/' || c >= utf8.RuneSelf
+	var last byte
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c == '.' && last == '.' {
+			return false
+		}
+		last = c
+		if '0' <= c && c <= '9' || 'A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' || c == '.' || c == '_' || c == '/' || (c == '-' || c == '+') && i > 0 || c == '@' && buildcfg.GOOS != "windows" || c >= utf8.RuneSelf {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // parseGoEmbed parses the text following "//go:embed" to extract the glob patterns.
@@ -430,7 +474,7 @@ func Renameinit() *types.Sym {
 func checkEmbed(decl *syntax.VarDecl, haveEmbed, withinFunc bool) error {
 	switch {
 	case !haveEmbed:
-		return errors.New("go:embed only allowed in Go files that import \"embed\"")
+		return errors.New("go:embed requires import \"embed\" (or import _ \"embed\", if package is not used)")
 	case len(decl.NameList) > 1:
 		return errors.New("go:embed cannot apply to multiple vars")
 	case decl.Values != nil:

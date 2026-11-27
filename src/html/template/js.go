@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"regexp"
 	"strings"
 	"unicode/utf8"
 )
@@ -95,7 +96,10 @@ func nextJSCtx(s []byte, preceding jsCtx) jsCtx {
 		for j > 0 && isJSIdentPart(rune(s[j-1])) {
 			j--
 		}
-		if regexpPrecederKeywords[string(s[j:])] {
+		// An IdentifierName after a property-access dot is a property name,
+		// which precedes a div op.
+		if regexpPrecederKeywords[string(s[j:])] &&
+			!bytes.HasSuffix(bytes.TrimRight(s[:j], jsWhitespace), []byte(".")) {
 			return jsCtxRegexp
 		}
 	}
@@ -105,8 +109,9 @@ func nextJSCtx(s []byte, preceding jsCtx) jsCtx {
 	return jsCtxDivOp
 }
 
-// regexpPrecederKeywords is a set of reserved JS keywords that can precede a
-// regular expression in JS source.
+// regexpPrecederKeywords is a set of JS keywords that can precede a regular
+// expression in JS source. It deliberately treats the context-sensitive
+// keyword yield as a keyword.
 var regexpPrecederKeywords = map[string]bool{
 	"break":      true,
 	"case":       true,
@@ -122,6 +127,7 @@ var regexpPrecederKeywords = map[string]bool{
 	"try":        true,
 	"typeof":     true,
 	"void":       true,
+	"yield":      true,
 }
 
 var jsonMarshalType = reflect.TypeFor[json.Marshaler]()
@@ -143,6 +149,8 @@ func indirectToJSONMarshaler(a any) any {
 	}
 	return v.Interface()
 }
+
+var scriptTagRe = regexp.MustCompile("(?i)<(/?)script")
 
 // jsValEscaper escapes its inputs to a JS Expression (section 11.14) that has
 // neither side-effects nor free variables outside (NaN, Infinity).
@@ -167,17 +175,33 @@ func jsValEscaper(args ...any) string {
 		}
 		a = fmt.Sprint(args...)
 	}
-	// TODO: detect cycles before calling Marshal which loops infinitely on
-	// cyclic data. This may be an unacceptable DoS risk.
 	b, err := json.Marshal(a)
 	if err != nil {
-		// Put a space before comment so that if it is flush against
+		// While the standard JSON marshaler does not include user controlled
+		// information in the error message, if a type has a MarshalJSON method,
+		// the content of the error message is not guaranteed. Since we insert
+		// the error into the template, as part of a comment, we attempt to
+		// prevent the error from either terminating the comment, or the script
+		// block itself.
+		//
+		// In particular we:
+		//   * replace "*/" comment end tokens with "* /", which does not
+		//     terminate the comment
+		//   * replace "<script" and "</script" with "\x3Cscript" and "\x3C/script"
+		//     (case insensitively), and "<!--" with "\x3C!--", which prevents
+		//     confusing script block termination semantics
+		//
+		// We also put a space before the comment so that if it is flush against
 		// a division operator it is not turned into a line comment:
 		//     x/{{y}}
 		// turning into
 		//     x//* error marshaling y:
 		//          second line of error message */null
-		return fmt.Sprintf(" /* %s */null ", strings.ReplaceAll(err.Error(), "*/", "* /"))
+		errStr := err.Error()
+		errStr = string(scriptTagRe.ReplaceAll([]byte(errStr), []byte(`\x3C${1}script`)))
+		errStr = strings.ReplaceAll(errStr, "*/", "* /")
+		errStr = strings.ReplaceAll(errStr, "<!--", `\x3C!--`)
+		return fmt.Sprintf(" /* %s */null ", errStr)
 	}
 
 	// TODO: maybe post-process output to prevent it from containing
@@ -441,6 +465,7 @@ func isJSType(mimeType string) bool {
 	mimeType = strings.TrimSpace(mimeType)
 	switch mimeType {
 	case
+		"",
 		"application/ecmascript",
 		"application/javascript",
 		"application/json",

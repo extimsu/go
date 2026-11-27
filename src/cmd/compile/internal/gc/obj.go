@@ -20,6 +20,7 @@ import (
 	"cmd/internal/objabi"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 )
 
@@ -41,12 +42,41 @@ const (
 	modeLinkerObj
 )
 
+func dumpexport() {
+	if base.Flag.LinkObj == "" {
+		return
+	}
+	dumpobj1(base.Flag.LowerO, modeCompilerObj)
+	if base.Flag.ExportPipe != "" {
+		notifyExport()
+	}
+}
+
+func notifyExport() {
+	f, err := os.OpenFile(base.Flag.ExportPipe, exportPipeOpenFlags, 0)
+	if err != nil {
+		base.FlushErrors()
+		fmt.Fprintf(os.Stderr, "can't open export pipe %s: %v\n", base.Flag.ExportPipe, err)
+		base.ErrorExit()
+	}
+	if _, err := f.Write([]byte{'\n'}); err != nil {
+		f.Close()
+		base.FlushErrors()
+		fmt.Fprintf(os.Stderr, "can't write to export pipe %s: %v\n", base.Flag.ExportPipe, err)
+		base.ErrorExit()
+	}
+	if err := f.Close(); err != nil {
+		base.FlushErrors()
+		fmt.Fprintf(os.Stderr, "can't close export pipe %s: %v\n", base.Flag.ExportPipe, err)
+		base.ErrorExit()
+	}
+}
+
 func dumpobj() {
 	if base.Flag.LinkObj == "" {
 		dumpobj1(base.Flag.LowerO, modeCompilerObj|modeLinkerObj)
 		return
 	}
-	dumpobj1(base.Flag.LowerO, modeCompilerObj)
 	dumpobj1(base.Flag.LinkObj, modeLinkerObj)
 }
 
@@ -57,7 +87,7 @@ func dumpobj1(outfile string, mode int) {
 		fmt.Printf("can't create %s: %v\n", outfile, err)
 		base.ErrorExit()
 	}
-	defer bout.Close()
+
 	bout.WriteString("!<arch>\n")
 
 	if mode&modeCompilerObj != 0 {
@@ -69,6 +99,12 @@ func dumpobj1(outfile string, mode int) {
 		start := startArchiveEntry(bout)
 		dumpLinkerObj(bout)
 		finishArchiveEntry(bout, start, "_go_.o")
+	}
+
+	if err := bout.Close(); err != nil {
+		base.FlushErrors()
+		fmt.Printf("error while writing to file %s: %v\n", outfile, err)
+		base.ErrorExit()
 	}
 }
 
@@ -154,7 +190,7 @@ func dumpGlobal(n *ir.Name) {
 	}
 	types.CalcSize(n.Type())
 	ggloblnod(n)
-	if n.CoverageCounter() || n.CoverageAuxVar() || n.Linksym().Static() {
+	if n.CoverageAuxVar() || n.Linksym().Static() {
 		return
 	}
 	base.Ctxt.DwarfGlobal(types.TypeSymName(n.Type()), n.Linksym())
@@ -253,6 +289,11 @@ func ggloblnod(nam *ir.Name) {
 	linkname := nam.Sym().Linkname
 	name := nam.Sym().Name
 
+	var saveType objabi.SymKind
+	if nam.CoverageAuxVar() {
+		saveType = s.Type
+	}
+
 	// We've skipped linkname'd globals's instrument, so we can skip them here as well.
 	if base.Flag.ASan && linkname == "" && pkginit.InstrumentGlobalsMap[name] != nil {
 		// Write the new size of instrumented global variables that have
@@ -266,8 +307,9 @@ func ggloblnod(nam *ir.Name) {
 	if nam.Libfuzzer8BitCounter() {
 		s.Type = objabi.SLIBFUZZER_8BIT_COUNTER
 	}
-	if nam.CoverageCounter() {
-		s.Type = objabi.SCOVERAGE_COUNTER
+	if nam.CoverageAuxVar() && saveType == objabi.SCOVERAGE_COUNTER {
+		// restore specialized counter type (which Globl call above overwrote)
+		s.Type = saveType
 	}
 	if nam.Sym().Linkname != "" {
 		// Make sure linkname'd symbol is non-package. When a symbol is

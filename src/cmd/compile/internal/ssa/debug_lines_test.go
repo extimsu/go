@@ -7,6 +7,7 @@ package ssa_test
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"flag"
 	"fmt"
 	"internal/testenv"
@@ -15,7 +16,7 @@ import (
 	"reflect"
 	"regexp"
 	"runtime"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -44,7 +45,7 @@ func testGoArch() string {
 
 func hasRegisterABI() bool {
 	switch testGoArch() {
-	case "amd64", "arm64", "loong64", "ppc64", "ppc64le", "riscv":
+	case "amd64", "arm64", "loong64", "ppc64", "ppc64le", "riscv64", "s390x":
 		return true
 	}
 	return false
@@ -66,6 +67,7 @@ func testDebugLinesDefault(t *testing.T, gcflags, file, function string, wantStm
 }
 
 func TestDebugLinesSayHi(t *testing.T) {
+	t.Parallel()
 	// This test is potentially fragile, the goal is that debugging should step properly through "sayhi"
 	// If the blocks are reordered in a way that changes the statement order but execution flows correctly,
 	// then rearrange the expected numbers.  Register abi and not-register-abi also have different sequences,
@@ -75,40 +77,35 @@ func TestDebugLinesSayHi(t *testing.T) {
 }
 
 func TestDebugLinesPushback(t *testing.T) {
+	t.Parallel()
 	unixOnly(t)
 
 	switch testGoArch() {
 	default:
 		t.Skip("skipped for many architectures")
 
-	case "arm64", "amd64": // register ABI
-		fn := "(*List[go.shape.int_0]).PushBack"
-		if true /* was buildcfg.Experiment.Unified */ {
-			// Unified mangles differently
-			fn = "(*List[go.shape.int]).PushBack"
-		}
+	case "arm64", "amd64", "loong64": // register ABI
+		fn := "(*List[go.shape.int]).PushBack"
 		testDebugLines(t, "-N -l", "pushback.go", fn, []int{17, 18, 19, 20, 21, 22, 24}, true)
 	}
 }
 
 func TestDebugLinesConvert(t *testing.T) {
+	t.Parallel()
 	unixOnly(t)
 
 	switch testGoArch() {
 	default:
 		t.Skip("skipped for many architectures")
 
-	case "arm64", "amd64": // register ABI
-		fn := "G[go.shape.int_0]"
-		if true /* was buildcfg.Experiment.Unified */ {
-			// Unified mangles differently
-			fn = "G[go.shape.int]"
-		}
+	case "arm64", "amd64", "loong64": // register ABI
+		fn := "G[go.shape.int]"
 		testDebugLines(t, "-N -l", "convertline.go", fn, []int{9, 10, 11}, true)
 	}
 }
 
 func TestInlineLines(t *testing.T) {
+	t.Parallel()
 	if runtime.GOARCH != "amd64" && *testGoArchFlag == "" {
 		// As of september 2021, works for everything except mips64, but still potentially fragile
 		t.Skip("only runs for amd64 unless -arch explicitly supplied")
@@ -119,7 +116,72 @@ func TestInlineLines(t *testing.T) {
 }
 
 func TestDebugLines_53456(t *testing.T) {
+	t.Parallel()
 	testDebugLinesDefault(t, "-N -l", "b53456.go", "(*T).Inc", []int{15, 16, 17, 18}, true)
+}
+
+func TestDebugLines_81705(t *testing.T) {
+	t.Parallel()
+	unixOnly(t)
+
+	// A switch with no tag must have a statement on its own line
+	// before the cases, and none after all cases fail.
+	testDebugLines(t, "-N -l", "i81705a.go", "main", []int{12, 13, 14, 15, 16}, true)
+}
+
+func TestDebugLines_81705TypeSwitch(t *testing.T) {
+	t.Parallel()
+	unixOnly(t)
+	switch testGoArch() {
+	default:
+		t.Skip("statement marker counts are architecture-specific")
+	case "amd64":
+	}
+
+	// An internal switch generated while lowering a type switch must not
+	// add another statement marker to the source type-switch line.
+	tests := []struct {
+		name      string
+		gcflags   string
+		wantStmts []int
+	}{
+		{"debug", "-N -l", []int{7, 8, 8, 9, 10, 11, 11, 12}},
+		{"optimized", "-l", []int{8, 12, 12, 10}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			testDebugLines(t, test.gcflags, "i81705b.go", "typeSwitch", test.wantStmts, false)
+		})
+	}
+}
+
+func TestDebugLines_74576(t *testing.T) {
+	t.Parallel()
+	unixOnly(t)
+
+	switch testGoArch() {
+	default:
+		// Failed on linux/riscv64 (issue 74669), but conservatively
+		// skip many architectures like several other tests here.
+		t.Skip("skipped for many architectures")
+
+	case "arm64", "amd64", "loong64":
+		tests := []struct {
+			file      string
+			wantStmts []int
+		}{
+			{"i74576a.go", []int{12, 13, 13, 14}},
+			{"i74576b.go", []int{12, 13, 13, 14}},
+			{"i74576c.go", []int{12, 13, 13, 14}},
+		}
+		for _, test := range tests {
+			t.Run(test.file, func(t *testing.T) {
+				t.Parallel()
+				testDebugLines(t, "-N -l", test.file, "main", test.wantStmts, false)
+			})
+		}
+	}
 }
 
 func compileAndDump(t *testing.T, file, function, moreGCFlags string) []byte {
@@ -175,16 +237,16 @@ func compileAndDump(t *testing.T, file, function, moreGCFlags string) []byte {
 }
 
 func sortInlineStacks(x [][]int) {
-	sort.Slice(x, func(i, j int) bool {
-		if len(x[i]) != len(x[j]) {
-			return len(x[i]) < len(x[j])
+	slices.SortFunc(x, func(a, b []int) int {
+		if len(a) != len(b) {
+			return cmp.Compare(len(a), len(b))
 		}
-		for k := range x[i] {
-			if x[i][k] != x[j][k] {
-				return x[i][k] < x[j][k]
+		for k := range a {
+			if a[k] != b[k] {
+				return cmp.Compare(a[k], b[k])
 			}
 		}
-		return false
+		return 0
 	})
 }
 
@@ -230,6 +292,9 @@ func testInlineStack(t *testing.T, file, function string, wantStacks [][]int) {
 // then verifies that the statement-marked lines in that file are the same as those in wantStmts
 // These files must all be short because this is super-fragile.
 // "go build" is run in a temporary directory that is normally deleted, unless -test.v
+//
+// TODO: the tests calling this are somewhat expensive; perhaps more tests can be marked t.Parallel,
+// or perhaps the mechanism here can be made more efficient.
 func testDebugLines(t *testing.T, gcflags, file, function string, wantStmts []int, ignoreRepeats bool) {
 	dumpBytes := compileAndDump(t, file, function, gcflags)
 	dump := bufio.NewScanner(bytes.NewReader(dumpBytes))

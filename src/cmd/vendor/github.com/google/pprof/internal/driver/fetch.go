@@ -77,6 +77,11 @@ func fetchProfiles(s *source, o *plugin.Options) (*profile.Profile, error) {
 		}
 	}
 
+	if s.AllFrames {
+		p.DropFrames = ""
+		p.KeepFrames = ""
+	}
+
 	// Symbolize the merged profile.
 	if err := o.Sym.Symbolize(s.Symbolize, m, p); err != nil {
 		return nil, err
@@ -174,10 +179,7 @@ func chunkedGrab(sources []profileSource, fetch plugin.Fetcher, obj plugin.ObjTo
 	var count int
 
 	for start := 0; start < len(sources); start += chunkSize {
-		end := start + chunkSize
-		if end > len(sources) {
-			end = len(sources)
-		}
+		end := min(start+chunkSize, len(sources))
 		chunkP, chunkMsrc, chunkSave, chunkCount, chunkErr := concurrentGrab(sources[start:end], fetch, obj, ui, tr)
 		switch {
 		case chunkErr != nil:
@@ -428,7 +430,9 @@ mapping:
 				// Llvm buildid protocol: the first two characters of the build id
 				// are used as directory, and the remaining part is in the filename.
 				// e.g. `/ab/cdef0123456.debug`
-				fileNames = append(fileNames, filepath.Join(path, m.BuildID[:2], m.BuildID[2:]+".debug"))
+				if len(m.BuildID) >= 2 {
+					fileNames = append(fileNames, filepath.Join(path, m.BuildID[:2], m.BuildID[2:]+".debug"))
+				}
 			}
 			if m.File != "" {
 				// Try both the basename and the full path, to support the same directory
@@ -492,17 +496,23 @@ mapping:
 func fetch(source string, duration, timeout time.Duration, ui plugin.UI, tr http.RoundTripper) (p *profile.Profile, src string, err error) {
 	var f io.ReadCloser
 
-	if sourceURL, timeout := adjustURL(source, duration, timeout); sourceURL != "" {
-		ui.Print("Fetching profile over HTTP from " + sourceURL)
-		if duration > 0 {
-			ui.Print(fmt.Sprintf("Please wait... (%v)", duration))
+	// First determine whether the source is a file, if not, it will be treated as a URL.
+	if _, err = os.Stat(source); err == nil {
+		if isPerfFile(source) {
+			f, err = convertPerfData(source, ui)
+		} else {
+			f, err = os.Open(source)
 		}
-		f, err = fetchURL(sourceURL, timeout, tr)
-		src = sourceURL
-	} else if isPerfFile(source) {
-		f, err = convertPerfData(source, ui)
 	} else {
-		f, err = os.Open(source)
+		sourceURL, timeout := adjustURL(source, duration, timeout)
+		if sourceURL != "" {
+			ui.Print("Fetching profile over HTTP from " + sourceURL)
+			if duration > 0 {
+				ui.Print(fmt.Sprintf("Please wait... (%v)", duration))
+			}
+			f, err = fetchURL(sourceURL, timeout, tr)
+			src = sourceURL
+		}
 	}
 	if err == nil {
 		defer f.Close()

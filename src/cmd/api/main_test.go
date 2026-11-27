@@ -17,6 +17,7 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"internal/buildcfg"
 	"internal/testenv"
 	"io"
 	"log"
@@ -25,7 +26,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -84,6 +85,89 @@ var contexts = []*build.Context{
 	{GOOS: "openbsd", GOARCH: "amd64"},
 }
 
+// simdContexts are additional contexts in which only the simd packages
+// are scanned. They cover architectures where we want to capture the
+// SIMD API, but whose contexts are not listed above. Simply adding them
+// to contexts would scan all of std and would turn many existing
+// unqualified features into per-context ones.
+var simdContexts = []*build.Context{
+	{GOOS: "js", GOARCH: "wasm"},
+	{GOOS: "linux", GOARCH: "arm64"},
+}
+
+// isSimdPkg reports whether path is one of the simd packages, which are
+// scanned in simdContexts as well as contexts.
+//
+// The API of these packages is qualified by GOARCH rather than by
+// context where possible (see qualifyFeature): their build constraints
+// depend only on GOARCH by design, and listing each architecture's large
+// API once per context would multiply the size of the API files.
+func isSimdPkg(path string) bool {
+	return path == "simd" || strings.HasPrefix(path, "simd/")
+}
+
+// qualifyFeature returns the API lines for feature f (of the form
+// "pkg P, ..."), given the names of the contexts in which f is present
+// and the contexts that scan P.
+//
+// A feature present in every context that scans its package is
+// unqualified.
+//
+// Otherwise, by default, the feature is qualified by every
+// GOOS-GOARCH[-cgo] context in which it is present, as in
+// {"pkg P (linux-amd64), ...", "pkg P (darwin-arm64), ..."}.
+//
+// If byGOARCH is set, the feature is instead qualified just by GOARCH
+// for each GOARCH in whose every context it is present, as in
+// "pkg P (GOARCH=amd64), ...". Such a line means that the feature is
+// present in every context cmd/api checks with that GOARCH; like an
+// unqualified feature, it is re-checked against the current context
+// list. The feature is still qualified by context for the contexts of
+// GOARCHes in which it is only partly present.
+func qualifyFeature(f string, present map[string]bool, scanned []*build.Context, byGOARCH bool) []string {
+	if len(present) == len(scanned) {
+		// Present in every context that scans the package.
+		return []string{f}
+	}
+	pkg, rest, _ := strings.Cut(f, ",")
+	line := func(qual string) string {
+		return fmt.Sprintf("%s (%s),%s", pkg, qual, rest)
+	}
+	var lines []string
+	goarchCovered := make(map[string]bool)
+	if byGOARCH {
+		var goarches []string
+		all := make(map[string]bool) // GOARCH -> present in all its contexts
+		for _, c := range scanned {
+			if _, ok := all[c.GOARCH]; !ok {
+				goarches = append(goarches, c.GOARCH)
+				all[c.GOARCH] = true
+			}
+			if !present[contextName(c)] {
+				all[c.GOARCH] = false
+			}
+		}
+		for _, goarch := range goarches {
+			if all[goarch] {
+				lines = append(lines, line("GOARCH="+goarch))
+				goarchCovered[goarch] = true
+			}
+		}
+	}
+	for _, c := range scanned {
+		if name := contextName(c); present[name] && !goarchCovered[c.GOARCH] {
+			lines = append(lines, line(name))
+		}
+	}
+	return lines
+}
+
+// apiExperiments is a comma-separated GOEXPERIMENT string that is
+// applied on top of the baseline experiments when scanning the API. It
+// lets cmd/api check the API of an experiment before the experiment
+// becomes part of the baseline.
+const apiExperiments = ""
+
 func contextName(c *build.Context) string {
 	s := c.GOOS + "-" + c.GOARCH
 	if c.CgoEnabled {
@@ -114,25 +198,50 @@ func Check(t *testing.T) {
 		nextFiles = next
 	}
 
+	// An apiContext is a build context together with a filter for the
+	// packages to scan in it.
+	type apiContext struct {
+		*build.Context
+		pkgFilter func(pkgPath string) bool
+	}
+	var allContexts []apiContext
 	for _, c := range contexts {
+		allContexts = append(allContexts, apiContext{c, func(string) bool { return true }})
+	}
+	for _, c := range simdContexts {
+		allContexts = append(allContexts, apiContext{c, isSimdPkg})
+	}
+	for _, c := range allContexts {
 		c.Compiler = build.Default.Compiler
+
+		// Include baseline goexperiment.* tool tags, plus apiExperiments.
+		exps, err := buildcfg.ParseGOEXPERIMENT(c.GOOS, c.GOARCH, apiExperiments)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, exp := range exps.Enabled() {
+			c.ToolTags = append(c.ToolTags, "goexperiment."+exp)
+		}
 	}
 
-	walkers := make([]*Walker, len(contexts))
+	walkers := make([]*Walker, len(allContexts))
 	var wg sync.WaitGroup
-	for i, context := range contexts {
-		i, context := i, context
+	for i, c := range allContexts {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			walkers[i] = NewWalker(context, filepath.Join(testenv.GOROOT(t), "src"))
+			walkers[i] = NewWalker(c.Context, filepath.Join(testenv.GOROOT(t), "src"))
 		}()
 	}
 	wg.Wait()
 
 	var featureCtx = make(map[string]map[string]bool) // feature -> context name -> true
-	for _, w := range walkers {
+	for i, w := range walkers {
+		context := allContexts[i]
 		for _, name := range w.stdPackages {
+			if !context.pkgFilter(name) {
+				continue
+			}
 			pkg, err := w.import_(name)
 			if _, nogo := err.(*build.NoGoError); nogo {
 				continue
@@ -152,17 +261,20 @@ func Check(t *testing.T) {
 		}
 	}
 
+	scanned := make(map[string][]*build.Context) // package -> contexts that scan it
 	var features []string
 	for f, cmap := range featureCtx {
-		if len(cmap) == len(contexts) {
-			features = append(features, f)
-			continue
+		pkg, _, _ := strings.Cut(strings.TrimPrefix(f, "pkg "), ",")
+		if _, ok := scanned[pkg]; !ok {
+			for _, c := range allContexts {
+				if c.pkgFilter(pkg) {
+					scanned[pkg] = append(scanned[pkg], c.Context)
+				}
+			}
 		}
-		comma := strings.Index(f, ",")
-		for cname := range cmap {
-			f2 := fmt.Sprintf("%s (%s)%s", f[:comma], cname, f[comma:])
-			features = append(features, f2)
-		}
+		// SIMD packages are sensitive to GOARCH, but not GOOS or cgo.
+		byGOARCH := isSimdPkg(pkg)
+		features = append(features, qualifyFeature(f, cmap, scanned[pkg], byGOARCH)...)
 	}
 
 	bw := bufio.NewWriter(os.Stdout)
@@ -232,8 +344,8 @@ func compareAPI(w io.Writer, features, required, exception []string) (ok bool) {
 	featureSet := set(features)
 	exceptionSet := set(exception)
 
-	sort.Strings(features)
-	sort.Strings(required)
+	slices.Sort(features)
+	slices.Sort(required)
 
 	take := func(sl *[]string) string {
 		s := (*sl)[0]
@@ -378,7 +490,7 @@ func (w *Walker) Features() (fs []string) {
 	for f := range w.features {
 		fs = append(fs, f)
 	}
-	sort.Strings(fs)
+	slices.Sort(fs)
 	return
 }
 
@@ -390,7 +502,7 @@ func (w *Walker) parseFile(dir, file string) (*ast.File, error) {
 		return f, nil
 	}
 
-	f, err := parser.ParseFile(fset, filename, nil, parser.ParseComments)
+	f, err := parser.ParseFile(fset, filename, nil, parser.ParseComments|parser.SkipObjectResolution)
 	if err != nil {
 		return nil, err
 	}
@@ -431,7 +543,7 @@ func tagKey(dir string, context *build.Context, tags []string) string {
 	// an indirect imported package. See https://github.com/golang/go/issues/21181
 	// for more detail.
 	tags = append(tags, context.GOOS, context.GOARCH)
-	sort.Strings(tags)
+	slices.Sort(tags)
 
 	for _, tag := range tags {
 		if ctags[tag] {
@@ -535,7 +647,7 @@ func (w *Walker) loadImports() {
 			}
 		}
 
-		sort.Strings(stdPackages)
+		slices.Sort(stdPackages)
 		imports = listImports{
 			stdPackages: stdPackages,
 			importMap:   importMap,
@@ -564,6 +676,15 @@ func listEnv(c *build.Context) []string {
 		environ = append(environ, "CGO_ENABLED=1")
 	} else {
 		environ = append(environ, "CGO_ENABLED=0")
+	}
+	// Enable apiExperiments, so that go list reports the dependencies
+	// of the packages they enable.
+	if apiExperiments != "" {
+		goexp := os.Getenv("GOEXPERIMENT")
+		if goexp != "" {
+			goexp += ","
+		}
+		environ = append(environ, "GOEXPERIMENT="+goexp+apiExperiments)
 	}
 	return environ
 }
@@ -717,7 +838,7 @@ func sortedMethodNames(typ *types.Interface) []string {
 	for i := range list {
 		list[i] = typ.Method(i).Name()
 	}
-	sort.Strings(list)
+	slices.Sort(list)
 	return list
 }
 
@@ -726,13 +847,13 @@ func sortedMethodNames(typ *types.Interface) []string {
 func (w *Walker) sortedEmbeddeds(typ *types.Interface) []string {
 	n := typ.NumEmbeddeds()
 	list := make([]string, 0, n)
+	var buf bytes.Buffer
 	for i := 0; i < n; i++ {
 		emb := typ.EmbeddedType(i)
 		switch emb := emb.(type) {
 		case *types.Interface:
 			list = append(list, w.sortedEmbeddeds(emb)...)
 		case *types.Union:
-			var buf bytes.Buffer
 			nu := emb.Len()
 			for i := 0; i < nu; i++ {
 				if i > 0 {
@@ -745,9 +866,23 @@ func (w *Walker) sortedEmbeddeds(typ *types.Interface) []string {
 				w.writeType(&buf, term.Type())
 			}
 			list = append(list, buf.String())
+			buf.Reset()
+		default:
+			// A single type term, as in [T P.Type]. Emit the single term
+			// the same way we would if it had been in a union.
+			//
+			// An embedded named interface type is also neither an
+			// *types.Interface nor a *types.Union, but it isn't a type
+			// term: its methods are already in typ's method set, which
+			// the caller prints, so skip it.
+			if !types.IsInterface(emb) {
+				w.writeType(&buf, emb)
+				list = append(list, buf.String())
+				buf.Reset()
+			}
 		}
 	}
-	sort.Strings(list)
+	slices.Sort(list)
 	return list
 }
 
@@ -843,6 +978,9 @@ func (w *Walker) writeType(buf *bytes.Buffer, typ types.Type) {
 		buf.WriteString(s)
 		w.writeType(buf, typ.Elem())
 
+	case *types.Alias:
+		w.writeType(buf, types.Unalias(typ))
+
 	case *types.Named:
 		obj := typ.Obj()
 		pkg := obj.Pkg()
@@ -851,6 +989,16 @@ func (w *Walker) writeType(buf *bytes.Buffer, typ types.Type) {
 			buf.WriteByte('.')
 		}
 		buf.WriteString(typ.Obj().Name())
+		if targs := typ.TypeArgs(); targs.Len() > 0 {
+			buf.WriteByte('[')
+			for i := 0; i < targs.Len(); i++ {
+				if i > 0 {
+					buf.WriteString(", ")
+				}
+				w.writeType(buf, targs.At(i))
+			}
+			buf.WriteByte(']')
+		}
 
 	case *types.TypeParam:
 		// Type parameter names may change, so use a placeholder instead.
@@ -1006,7 +1154,7 @@ func (w *Walker) emitType(obj *types.TypeName) {
 
 func (w *Walker) emitStructType(name string, typ *types.Struct) {
 	typeStruct := fmt.Sprintf("type %s struct", name)
-	w.emitf(typeStruct)
+	w.emitf("%s", typeStruct)
 	defer w.pushScope(typeStruct)()
 
 	for i := 0; i < typ.NumFields(); i++ {
@@ -1045,7 +1193,7 @@ func (w *Walker) emitIfaceType(name string, typ *types.Interface) {
 		if w.isDeprecated(m) {
 			w.emitf("%s //deprecated", m.Name())
 		}
-		w.emitf("%s%s", m.Name(), w.signatureString(m.Type().(*types.Signature)))
+		w.emitf("%s%s", m.Name(), w.signatureString(m.Signature()))
 	}
 
 	if !complete {
@@ -1070,12 +1218,12 @@ func (w *Walker) emitIfaceType(name string, typ *types.Interface) {
 		return
 	}
 
-	sort.Strings(methodNames)
+	slices.Sort(methodNames)
 	w.emitf("type %s interface { %s }", name, strings.Join(methodNames, ", "))
 }
 
 func (w *Walker) emitFunc(f *types.Func) {
-	sig := f.Type().(*types.Signature)
+	sig := f.Signature()
 	if sig.Recv() != nil {
 		panic("method considered a regular function: " + f.String())
 	}
@@ -1141,14 +1289,15 @@ func needApproval(filename string) bool {
 
 func (w *Walker) collectDeprecated() {
 	isDeprecated := func(doc *ast.CommentGroup) bool {
-		if doc != nil {
-			for _, c := range doc.List {
-				if strings.HasPrefix(c.Text, "// Deprecated:") {
-					return true
-				}
-			}
-		}
-		return false
+		// Look for "Deprecated:" (case-sensitive) at the beginning (not middle) of a paragraph.
+		// It's typically found in the last paragraph, but it's not required to be the last one.
+		// The colon is typically followed by a space, but it can also be a newline, as was the
+		// case at https://go.dev/pkg/go/build#AllowBinary for example.
+		//
+		// See https://go.dev/wiki/Deprecated and https://go.dev/ref/mod#go-mod-file-module-deprecation.
+		text := doc.Text()
+		return strings.HasPrefix(text, "Deprecated: ") || strings.Contains(text, "\n\nDeprecated: ") ||
+			strings.HasPrefix(text, "Deprecated:\n") || strings.Contains(text, "\n\nDeprecated:\n")
 	}
 
 	w.deprecated = make(map[token.Pos]bool)

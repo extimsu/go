@@ -7,6 +7,8 @@ package net
 import (
 	"errors"
 	"fmt"
+	"internal/asan"
+	"internal/race"
 	"internal/testenv"
 	"net/netip"
 	"os"
@@ -115,72 +117,83 @@ func TestWriteToUDP(t *testing.T) {
 		t.Skipf("not supported on %s", runtime.GOOS)
 	}
 
-	if !testableNetwork("udp") {
-		t.Skipf("skipping: udp not supported")
-	}
+	for _, network := range []string{"udp4", "udp6"} {
+		t.Run(network, func(t *testing.T) {
+			if !testableNetwork(network) {
+				t.Skipf("skipping: %s not supported", network)
+			}
 
-	c, err := ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
+			c, err := ListenPacket(network, JoinHostPort(loopbackIP(network).String(), "0"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
 
-	testWriteToConn(t, c.LocalAddr().String())
-	testWriteToPacketConn(t, c.LocalAddr().String())
+			testWriteToConn(t, network, c.LocalAddr().String())
+			testWriteToPacketConn(t, network, c.LocalAddr().String())
+		})
+	}
 }
 
-func testWriteToConn(t *testing.T, raddr string) {
-	c, err := Dial("udp", raddr)
+func testWriteToConn(t *testing.T, network, raddr string) {
+	c, err := Dial(network, raddr)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
 
-	ra, err := ResolveUDPAddr("udp", raddr)
+	ra, err := ResolveUDPAddr(network, raddr)
 	if err != nil {
 		t.Fatal(err)
+	}
+	rap := ra.AddrPort()
+
+	assertErrWriteToConnected := func(t *testing.T, err error) {
+		t.Helper()
+		if e, ok := err.(*OpError); !ok || e.Err != ErrWriteToConnected {
+			t.Errorf("got %v; want ErrWriteToConnected", err)
+		}
 	}
 
 	b := []byte("CONNECTED-MODE SOCKET")
+	_, err = c.(*UDPConn).WriteToUDPAddrPort(b, rap)
+	assertErrWriteToConnected(t, err)
 	_, err = c.(*UDPConn).WriteToUDP(b, ra)
-	if err == nil {
-		t.Fatal("should fail")
-	}
-	if err != nil && err.(*OpError).Err != ErrWriteToConnected {
-		t.Fatalf("should fail as ErrWriteToConnected: %v", err)
-	}
+	assertErrWriteToConnected(t, err)
 	_, err = c.(*UDPConn).WriteTo(b, ra)
-	if err == nil {
-		t.Fatal("should fail")
-	}
-	if err != nil && err.(*OpError).Err != ErrWriteToConnected {
-		t.Fatalf("should fail as ErrWriteToConnected: %v", err)
-	}
+	assertErrWriteToConnected(t, err)
 	_, err = c.Write(b)
 	if err != nil {
-		t.Fatal(err)
+		t.Errorf("c.Write(b) = %v; want nil", err)
 	}
 	_, _, err = c.(*UDPConn).WriteMsgUDP(b, nil, ra)
-	if err == nil {
-		t.Fatal("should fail")
-	}
-	if err != nil && err.(*OpError).Err != ErrWriteToConnected {
-		t.Fatalf("should fail as ErrWriteToConnected: %v", err)
-	}
-	_, _, err = c.(*UDPConn).WriteMsgUDP(b, nil, nil)
+	assertErrWriteToConnected(t, err)
+	n, oobn, err := c.(*UDPConn).WriteMsgUDP(b, nil, nil)
 	if err != nil {
-		t.Fatal(err)
+		t.Errorf("c.WriteMsgUDP(b, nil, nil) = %v; want nil", err)
+	}
+	if n != len(b) || oobn != 0 {
+		t.Errorf("c.WriteMsgUDP(b, nil, nil) = %d, %d; want %d, 0", n, oobn, len(b))
+	}
+	_, _, err = c.(*UDPConn).WriteMsgUDPAddrPort(b, nil, rap)
+	assertErrWriteToConnected(t, err)
+	n, oobn, err = c.(*UDPConn).WriteMsgUDPAddrPort(b, nil, netip.AddrPort{})
+	if err != nil {
+		t.Errorf("c.WriteMsgUDPAddrPort(b, nil, netip.AddrPort{}) = %v; want nil", err)
+	}
+	if n != len(b) || oobn != 0 {
+		t.Errorf("c.WriteMsgUDPAddrPort(b, nil, netip.AddrPort{}) = %d, %d; want %d, 0", n, oobn, len(b))
 	}
 }
 
-func testWriteToPacketConn(t *testing.T, raddr string) {
-	c, err := ListenPacket("udp", "127.0.0.1:0")
+func testWriteToPacketConn(t *testing.T, network, raddr string) {
+	c, err := ListenPacket(network, JoinHostPort(loopbackIP(network).String(), "0"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer c.Close()
 
-	ra, err := ResolveUDPAddr("udp", raddr)
+	ra, err := ResolveUDPAddr(network, raddr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,9 +218,19 @@ func testWriteToPacketConn(t *testing.T, raddr string) {
 	if err != nil && err.(*OpError).Err != errMissingAddress {
 		t.Fatalf("should fail as errMissingAddress: %v", err)
 	}
-	_, _, err = c.(*UDPConn).WriteMsgUDP(b, nil, ra)
+	n, oobn, err := c.(*UDPConn).WriteMsgUDP(b, nil, ra)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if n != len(b) || oobn != 0 {
+		t.Errorf("c.WriteMsgUDP(b, nil, ra) = %d, %d; want %d, 0", n, oobn, len(b))
+	}
+	n, oobn, err = c.(*UDPConn).WriteMsgUDPAddrPort(b, nil, ra.AddrPort())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(b) || oobn != 0 {
+		t.Errorf("c.WriteMsgUDPAddrPort(b, nil, ra.AddrPort()) = %d, %d; want %d, 0", n, oobn, len(b))
 	}
 }
 
@@ -340,7 +363,7 @@ func TestUDPZeroBytePayload(t *testing.T) {
 	switch runtime.GOOS {
 	case "plan9":
 		t.Skipf("not supported on %s", runtime.GOOS)
-	case "darwin", "ios":
+	case "ios":
 		testenv.SkipFlaky(t, 29225)
 	}
 	if !testableNetwork("udp") {
@@ -489,9 +512,18 @@ func TestAllocs(t *testing.T) {
 	case "plan9", "js", "wasip1":
 		// These implementations have not been optimized.
 		t.Skipf("skipping on %v", runtime.GOOS)
+	case "windows":
+		if race.Enabled {
+			// The Windows implementation make use of sync.Pool,
+			// which randomly drops cached items when race is enabled.
+			t.Skip("skipping test in race")
+		}
 	}
 	if !testableNetwork("udp4") {
 		t.Skipf("skipping: udp4 not available")
+	}
+	if asan.Enabled {
+		t.Skip("test allocates more with -asan; see #70079")
 	}
 
 	// Optimizations are required to remove the allocs.
@@ -700,4 +732,152 @@ func TestIPv6WriteMsgUDPAddrPortTargetAddrIPVersion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestIPv4WriteMsgUDPAddrPortTargetAddrIPVersion verifies that
+// WriteMsgUDPAddrPort accepts IPv4 and IPv4-mapped IPv6 destination addresses,
+// and rejects IPv6 destination addresses on a "udp4" connection.
+func TestIPv4WriteMsgUDPAddrPortTargetAddrIPVersion(t *testing.T) {
+	switch runtime.GOOS {
+	case "plan9":
+		t.Skipf("not supported on %s", runtime.GOOS)
+	}
+
+	if !testableNetwork("udp4") {
+		t.Skipf("skipping: udp4 not available")
+	}
+
+	conn, err := ListenUDP("udp4", &UDPAddr{IP: IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	daddr4 := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), 12345)
+	daddr4in6 := netip.AddrPortFrom(netip.MustParseAddr("::ffff:127.0.0.1"), 12345)
+	daddr6 := netip.AddrPortFrom(netip.MustParseAddr("::1"), 12345)
+	buf := make([]byte, 8)
+
+	if _, _, err = conn.WriteMsgUDPAddrPort(buf, nil, daddr4); err != nil {
+		t.Errorf("conn.WriteMsgUDPAddrPort(buf, nil, daddr4) failed: %v", err)
+	}
+
+	if _, _, err = conn.WriteMsgUDPAddrPort(buf, nil, daddr4in6); err != nil {
+		t.Errorf("conn.WriteMsgUDPAddrPort(buf, nil, daddr4in6) failed: %v", err)
+	}
+
+	if _, _, err = conn.WriteMsgUDPAddrPort(buf, nil, daddr6); err == nil {
+		t.Errorf("conn.WriteMsgUDPAddrPort(buf, nil, daddr6) should have failed, but got no error")
+	}
+}
+
+// TestReadWriteMsgUDPAddrPortEmptyCmsg verifies that ReadMsgUDPAddrPort and
+// WriteMsgUDPAddrPort won't fail when the cmsg buffer (the oob parameter) is
+// non-nil but empty.
+//
+// This is a regression test for https://golang.org/issue/77875.
+func TestReadWriteMsgUDPAddrPortEmptyCmsg(t *testing.T) {
+	switch runtime.GOOS {
+	case "plan9":
+		t.Skipf("not supported on %s", runtime.GOOS)
+	}
+
+	if !testableNetwork("udp4") {
+		t.Skipf("skipping: udp4 not available")
+	}
+
+	conn, err := ListenUDP("udp4", &UDPAddr{IP: IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	buf := make([]byte, 8)
+	cmsgBuf := make([]byte, 8)[:0]
+	daddr := conn.LocalAddr().(*UDPAddr).AddrPort()
+
+	_, cmsgn, err := conn.WriteMsgUDPAddrPort(buf, cmsgBuf, daddr)
+	if err != nil {
+		t.Fatalf("WriteMsgUDPAddrPort failed: %v", err)
+	}
+	if cmsgn != 0 {
+		t.Errorf("WriteMsgUDPAddrPort wrote %d cmsg bytes; want 0", cmsgn)
+	}
+
+	_, cmsgn, _, _, err = conn.ReadMsgUDPAddrPort(buf, cmsgBuf)
+	if err != nil {
+		t.Fatalf("ReadMsgUDPAddrPort failed: %v", err)
+	}
+	if cmsgn != 0 {
+		t.Errorf("ReadMsgUDPAddrPort read %d cmsg bytes; want 0", cmsgn)
+	}
+}
+
+// TestDualStackUDPBroadcast verifies that a dual-stack UDP socket can send
+// a broadcast message to an IPv4 broadcast address.
+func TestDualStackUDPBroadcast(t *testing.T) {
+	switch runtime.GOOS {
+	case "plan9":
+		t.Skipf("not supported on %s", runtime.GOOS)
+	}
+	if !supportsIPv4map() {
+		t.Skip("dual-stack IPv6 sockets not supported")
+	}
+	mustHaveExternalNetwork(t)
+
+	conn, err := ListenUDP("udp", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	addr := netip.AddrPortFrom(netip.MustParseAddr("255.255.255.255"), 12345)
+	if _, err := conn.WriteToUDPAddrPort([]byte{0}, addr); err != nil {
+		if isUnreachableError(err) {
+			t.Skipf("broadcast route not available: %v", err)
+		}
+		t.Errorf("WriteToUDPAddrPort failed: %v", err)
+	}
+}
+
+// TestUDPReadMsgZeroNOnError verifies that ReadMsgUDP and ReadMsgUDPAddrPort
+// return n=0 on error, such as a canceled read.
+func TestUDPReadMsgZeroNOnError(t *testing.T) {
+	switch runtime.GOOS {
+	case "plan9":
+		t.Skipf("not supported on %s", runtime.GOOS)
+	}
+
+	if !testableNetwork("udp4") {
+		t.Skipf("skipping: udp4 not available")
+	}
+
+	conn, err := ListenUDP("udp4", &UDPAddr{IP: IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	checkReturn := func(t *testing.T, name string, n, cmsgn int, err error) {
+		t.Helper()
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Errorf("%s got err=%#v, want os.ErrDeadlineExceeded", name, err)
+		}
+		if n != 0 {
+			t.Errorf("%s got n=%d, want 0", name, n)
+		}
+		if cmsgn != 0 {
+			t.Errorf("%s got cmsgn=%d, want 0", name, cmsgn)
+		}
+	}
+
+	buf := make([]byte, 8)
+
+	conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+	n, cmsgn, _, _, err := conn.ReadMsgUDP(buf, nil)
+	checkReturn(t, "ReadMsgUDP()", n, cmsgn, err)
+
+	conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
+	n, cmsgn, _, _, err = conn.ReadMsgUDPAddrPort(buf, nil)
+	checkReturn(t, "ReadMsgUDPAddrPort()", n, cmsgn, err)
 }

@@ -7,12 +7,14 @@ package types
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 
 	"cmd/compile/internal/base"
-	"cmd/internal/notsha256"
+	"cmd/internal/hash"
 )
 
 // BuiltinPkg is a fake package that declares the universe block.
@@ -183,7 +185,7 @@ var BasicTypeNames = []string{
 }
 
 var fmtBufferPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return new(bytes.Buffer)
 	},
 }
@@ -217,6 +219,14 @@ func (t *Type) String() string {
 	return tconv(t, 0, fmtGo)
 }
 
+var (
+	linkStringmu sync.Mutex // protects linkStrings
+	linkStrings  = map[*Type]string{}
+
+	nameStringmu sync.Mutex // protects nameStrings
+	nameStrings  = map[*Type]string{}
+)
+
 // LinkString returns a string description of t, suitable for use in
 // link symbols.
 //
@@ -225,7 +235,23 @@ func (t *Type) String() string {
 // t2.LinkString()) is true. Thus it's safe to use as a map key to
 // implement a type-identity-keyed map.
 func (t *Type) LinkString() string {
-	return tconv(t, 0, fmtTypeID)
+	linkStringmu.Lock()
+	s, ok := linkStrings[t]
+	linkStringmu.Unlock()
+	if ok {
+		return s
+	}
+
+	maxLen := base.Debug.MaxShapeLen
+	if maxLen == 0 {
+		maxLen = 500
+	}
+	s = t.limitString(fmtTypeID, maxLen)
+
+	linkStringmu.Lock()
+	linkStrings[t] = s
+	linkStringmu.Unlock()
+	return s
 }
 
 // NameString generates a user-readable, mostly unique string
@@ -237,7 +263,36 @@ func (t *Type) LinkString() string {
 // identifiers. It also does not distinguish function-scope defined
 // types from package-scoped defined types or from each other.
 func (t *Type) NameString() string {
-	return tconv(t, 0, fmtTypeIDName)
+	nameStringmu.Lock()
+	s, ok := nameStrings[t]
+	nameStringmu.Unlock()
+	if ok {
+		return s
+	}
+
+	// NameStrings cannot be hash-shortened.
+	s = t.limitString(fmtTypeIDName, 0)
+
+	nameStringmu.Lock()
+	nameStrings[t] = s
+	nameStringmu.Unlock()
+	return s
+}
+
+func (t *Type) limitString(mode fmtMode, maxLen int) string {
+	buf := fmtBufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer fmtBufferPool.Put(buf)
+
+	tconv2(buf, t, 0, mode, nil)
+
+	if t != nil && t.Sym() == nil && maxLen > 0 && buf.Len() > maxLen {
+		var hexBuf [hash.Size32 * 2]byte
+		h := hash.Sum32(buf.Bytes())
+		hex.Encode(hexBuf[:], h[:])
+		return InternString(hexBuf[:])
+	}
+	return InternString(buf.Bytes())
 }
 
 func tconv(t *Type, verb rune, mode fmtMode) string {
@@ -430,10 +485,11 @@ func tconv2(b *bytes.Buffer, t *Type, verb rune, mode fmtMode, visited map[*Type
 			case IsExported(f.Sym.Name):
 				sconv2(b, f.Sym, 'S', mode)
 			default:
+				smode := mode
 				if mode != fmtTypeIDName {
-					mode = fmtTypeID
+					smode = fmtTypeID
 				}
-				sconv2(b, f.Sym, 'v', mode)
+				sconv2(b, f.Sym, 'v', smode)
 			}
 			tconv2(b, f.Type, 'S', mode, visited)
 		}
@@ -471,11 +527,11 @@ func tconv2(b *bytes.Buffer, t *Type, verb rune, mode fmtMode, visited map[*Type
 	case TSTRUCT:
 		if m := t.StructType().Map; m != nil {
 			mt := m.MapType()
-			// Format the bucket struct for map[x]y as map.bucket[x]y.
+			// Format the bucket struct for map[x]y as map.group[x]y.
 			// This avoids a recursive print that generates very long names.
 			switch t {
-			case mt.Bucket:
-				b.WriteString("map.bucket[")
+			case mt.Group:
+				b.WriteString("map.group[")
 			default:
 				base.Fatalf("unknown internal map type")
 			}
@@ -640,11 +696,21 @@ func SplitVargenSuffix(name string) (base, suffix string) {
 	return name, ""
 }
 
+// SplitMethSuffix returns name split into a defining type name and a .m
+// suffix, if any.
+func SplitMethSuffix(name string) (tname, suffix string) {
+	i := strings.LastIndex(name, ".")
+	if i >= 0 {
+		return name[:i], name[i:]
+	}
+	return name, ""
+}
+
 // TypeHash computes a hash value for type t to use in type switch statements.
 func TypeHash(t *Type) uint32 {
 	p := t.LinkString()
 
-	// Using SHA256 is overkill, but reduces accidental collisions.
-	h := notsha256.Sum256([]byte(p))
+	// Using a cryptographic hash is overkill but minimizes accidental collisions.
+	h := hash.Sum32([]byte(p))
 	return binary.LittleEndian.Uint32(h[:4])
 }

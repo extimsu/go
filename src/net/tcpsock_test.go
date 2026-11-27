@@ -475,6 +475,9 @@ func TestTCPReadWriteAllocs(t *testing.T) {
 		t.Skipf("not supported on %s", runtime.GOOS)
 	}
 
+	// Optimizations are required to remove the allocs.
+	testenv.SkipIfOptimizationOff(t)
+
 	ln, err := Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -509,7 +512,7 @@ func TestTCPReadWriteAllocs(t *testing.T) {
 		}
 	})
 	if allocs > 0 {
-		t.Fatalf("got %v; want 0", allocs)
+		t.Errorf("got %v; want 0", allocs)
 	}
 
 	var bufwrt [128]byte
@@ -531,7 +534,7 @@ func TestTCPReadWriteAllocs(t *testing.T) {
 		}
 	})
 	if allocs > 0 {
-		t.Fatalf("got %v; want 0", allocs)
+		t.Errorf("got %v; want 0", allocs)
 	}
 }
 
@@ -775,8 +778,8 @@ func TestDialTCPDefaultKeepAlive(t *testing.T) {
 	defer ln.Close()
 
 	got := time.Duration(-1)
-	testHookSetKeepAlive = func(d time.Duration) { got = d }
-	defer func() { testHookSetKeepAlive = func(time.Duration) {} }()
+	testHookSetKeepAlive = func(cfg KeepAliveConfig) { got = cfg.Idle }
+	defer func() { testHookSetKeepAlive = func(KeepAliveConfig) {} }()
 
 	c, err := DialTCP("tcp", nil, ln.Addr().(*TCPAddr))
 	if err != nil {
@@ -784,8 +787,8 @@ func TestDialTCPDefaultKeepAlive(t *testing.T) {
 	}
 	defer c.Close()
 
-	if got != defaultTCPKeepAlive {
-		t.Errorf("got keepalive %v; want %v", got, defaultTCPKeepAlive)
+	if got != 0 {
+		t.Errorf("got keepalive %v; want %v", got, defaultTCPKeepAliveIdle)
 	}
 }
 

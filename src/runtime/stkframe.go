@@ -7,7 +7,7 @@ package runtime
 import (
 	"internal/abi"
 	"internal/goarch"
-	"runtime/internal/sys"
+	"internal/runtime/sys"
 	"unsafe"
 )
 
@@ -107,9 +107,9 @@ func (frame *stkframe) argMapInternal() (argMap bitvector, hasReflectStackObj bo
 
 		minSP := frame.fp
 		if !usesLR {
-			// The CALL itself pushes a word.
+			// The CALL itself pushes a return PC slot.
 			// Undo that adjustment.
-			minSP -= goarch.PtrSize
+			minSP -= retPCSize
 		}
 		if arg0 >= minSP {
 			// The function hasn't started yet.
@@ -135,7 +135,8 @@ func (frame *stkframe) argMapInternal() (argMap bitvector, hasReflectStackObj bo
 		// Reflect will update this value after it copies
 		// in the return values.
 		retValid := *(*bool)(unsafe.Pointer(arg0 + 4*goarch.PtrSize))
-		if mv.fn != f.entry() {
+		fnPC := funcValuePC(mv.fn)
+		if fnPC != f.entry() {
 			print("runtime: confused by ", funcname(f), "\n")
 			throw("reflect mismatch")
 		}
@@ -234,7 +235,7 @@ func (frame *stkframe) getStackMap(debug bool) (locals, args bitvector, objs []s
 	}
 
 	// stack objects.
-	if (GOARCH == "amd64" || GOARCH == "arm64" || GOARCH == "loong64" || GOARCH == "ppc64" || GOARCH == "ppc64le" || GOARCH == "riscv64") &&
+	if (GOARCH == "amd64" || GOARCH == "arm64" || GOARCH == "loong64" || GOARCH == "ppc64" || GOARCH == "ppc64le" || GOARCH == "riscv64" || GOARCH == "s390x") &&
 		unsafe.Sizeof(abi.RegArgs{}) > 0 && isReflect {
 		// For reflect.makeFuncStub and reflect.methodValueCall,
 		// we need to fake the stack object record.
@@ -259,20 +260,17 @@ func (frame *stkframe) getStackMap(debug bool) (locals, args bitvector, objs []s
 	return
 }
 
-var methodValueCallFrameObjs [1]stackObjectRecord // initialized in stackobjectinit
+var methodValueCallFrameObjs [1]stackObjectRecord // initialized in stkobjinit
 
 func stkobjinit() {
 	var abiRegArgsEface any = abi.RegArgs{}
 	abiRegArgsType := efaceOf(&abiRegArgsEface)._type
-	if abiRegArgsType.Kind_&kindGCProg != 0 {
-		throw("abiRegArgsType needs GC Prog, update methodValueCallFrameObjs")
-	}
 	// Set methodValueCallFrameObjs[0].gcdataoff so that
 	// stackObjectRecord.gcdata() will work correctly with it.
 	ptr := uintptr(unsafe.Pointer(&methodValueCallFrameObjs[0]))
 	var mod *moduledata
 	for datap := &firstmoduledata; datap != nil; datap = datap.next {
-		if datap.gofunc <= ptr && ptr < datap.end {
+		if datap.noptrbss <= ptr && ptr < datap.enoptrbss {
 			mod = datap
 			break
 		}
@@ -283,7 +281,7 @@ func stkobjinit() {
 	methodValueCallFrameObjs[0] = stackObjectRecord{
 		off:       -int32(alignUp(abiRegArgsType.Size_, 8)), // It's always the highest address local.
 		size:      int32(abiRegArgsType.Size_),
-		_ptrdata:  int32(abiRegArgsType.PtrBytes),
-		gcdataoff: uint32(uintptr(unsafe.Pointer(abiRegArgsType.GCData)) - mod.rodata),
+		ptrBytes:  int32(abiRegArgsType.PtrBytes),
+		gcdataoff: uint32(uintptr(unsafe.Pointer(getGCMask(abiRegArgsType))) - mod.rodata),
 	}
 }

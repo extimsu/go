@@ -14,7 +14,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	_ "unsafe" // for linkname
 )
+
+// TODO: This should be a distinguishable error (ErrMessageTooLarge)
+// to allow mime/multipart and net/http to detect it.
+var errMessageTooLarge = errors.New("message too large")
 
 // A Reader implements convenience methods for reading requests
 // or responses from a text protocol network connection.
@@ -36,26 +41,32 @@ func NewReader(r *bufio.Reader) *Reader {
 // ReadLine reads a single line from r,
 // eliding the final \n or \r\n from the returned string.
 func (r *Reader) ReadLine() (string, error) {
-	line, err := r.readLineSlice()
+	line, err := r.readLineSlice(-1)
 	return string(line), err
 }
 
 // ReadLineBytes is like [Reader.ReadLine] but returns a []byte instead of a string.
 func (r *Reader) ReadLineBytes() ([]byte, error) {
-	line, err := r.readLineSlice()
+	line, err := r.readLineSlice(-1)
 	if line != nil {
 		line = bytes.Clone(line)
 	}
 	return line, err
 }
 
-func (r *Reader) readLineSlice() ([]byte, error) {
+// readLineSlice reads a single line from r,
+// up to lim bytes long (or unlimited if lim is less than 0),
+// eliding the final \r or \r\n from the returned string.
+func (r *Reader) readLineSlice(lim int64) ([]byte, error) {
 	r.closeDot()
 	var line []byte
 	for {
 		l, more, err := r.R.ReadLine()
 		if err != nil {
 			return nil, err
+		}
+		if lim >= 0 && int64(len(line))+int64(len(l)) > lim {
+			return nil, errMessageTooLarge
 		}
 		// Avoid the copy if the first call produced a full line.
 		if line == nil && !more {
@@ -88,7 +99,7 @@ func (r *Reader) readLineSlice() ([]byte, error) {
 //
 // Empty lines are never continued.
 func (r *Reader) ReadContinuedLine() (string, error) {
-	line, err := r.readContinuedLineSlice(noValidation)
+	line, err := r.readContinuedLineSlice(-1, noValidation)
 	return string(line), err
 }
 
@@ -99,17 +110,18 @@ func trim(s []byte) []byte {
 	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
 		i++
 	}
-	n := len(s)
-	for n > i && (s[n-1] == ' ' || s[n-1] == '\t') {
+	s = s[i:]
+	n := len(s) - 1
+	for n >= 0 && (s[n] == ' ' || s[n] == '\t') {
 		n--
 	}
-	return s[i:n]
+	return s[:n+1]
 }
 
 // ReadContinuedLineBytes is like [Reader.ReadContinuedLine] but
 // returns a []byte instead of a string.
 func (r *Reader) ReadContinuedLineBytes() ([]byte, error) {
-	line, err := r.readContinuedLineSlice(noValidation)
+	line, err := r.readContinuedLineSlice(-1, noValidation)
 	if line != nil {
 		line = bytes.Clone(line)
 	}
@@ -120,13 +132,14 @@ func (r *Reader) ReadContinuedLineBytes() ([]byte, error) {
 // returning a byte slice with all lines. The validateFirstLine function
 // is run on the first read line, and if it returns an error then this
 // error is returned from readContinuedLineSlice.
-func (r *Reader) readContinuedLineSlice(validateFirstLine func([]byte) error) ([]byte, error) {
+// It reads up to lim bytes of data (or unlimited if lim is less than 0).
+func (r *Reader) readContinuedLineSlice(lim int64, validateFirstLine func([]byte) error) ([]byte, error) {
 	if validateFirstLine == nil {
 		return nil, fmt.Errorf("missing validateFirstLine func")
 	}
 
 	// Read the first line.
-	line, err := r.readLineSlice()
+	line, err := r.readLineSlice(lim)
 	if err != nil {
 		return nil, err
 	}
@@ -154,13 +167,21 @@ func (r *Reader) readContinuedLineSlice(validateFirstLine func([]byte) error) ([
 	// copy the slice into buf.
 	r.buf = append(r.buf[:0], trim(line)...)
 
+	if lim < 0 {
+		lim = math.MaxInt64
+	}
+	lim -= int64(len(r.buf))
+
 	// Read continuation lines.
 	for r.skipSpace() > 0 {
-		line, err := r.readLineSlice()
-		if err != nil {
-			break
-		}
 		r.buf = append(r.buf, ' ')
+		if int64(len(r.buf)) >= lim {
+			return nil, errMessageTooLarge
+		}
+		line, err := r.readLineSlice(lim - int64(len(r.buf)))
+		if err != nil {
+			return nil, err
+		}
 		r.buf = append(r.buf, trim(line)...)
 	}
 	return r.buf, nil
@@ -194,13 +215,13 @@ func (r *Reader) readCodeLine(expectCode int) (code int, continued bool, message
 
 func parseCodeLine(line string, expectCode int) (code int, continued bool, message string, err error) {
 	if len(line) < 4 || line[3] != ' ' && line[3] != '-' {
-		err = ProtocolError("short response: " + line)
+		err = ProtocolError(fmt.Sprintf("short response: %q", line))
 		return
 	}
 	continued = line[3] == '-'
 	code, err = strconv.Atoi(line[0:3])
 	if err != nil || code < 100 {
-		err = ProtocolError("invalid response code: " + line)
+		err = ProtocolError(fmt.Sprintf("invalid response code: %q", line))
 		return
 	}
 	message = line[4:]
@@ -232,7 +253,7 @@ func parseCodeLine(line string, expectCode int) (code int, continued bool, messa
 func (r *Reader) ReadCodeLine(expectCode int) (code int, message string, err error) {
 	code, continued, message, err := r.readCodeLine(expectCode)
 	if err == nil && continued {
-		err = ProtocolError("unexpected multi-line response: " + message)
+		err = ProtocolError(fmt.Sprintf("unexpected multi-line response: %q", message))
 	}
 	return
 }
@@ -264,8 +285,10 @@ func (r *Reader) ReadCodeLine(expectCode int) (code int, message string, err err
 //
 // An expectCode <= 0 disables the check of the status code.
 func (r *Reader) ReadResponse(expectCode int) (code int, message string, err error) {
-	code, continued, message, err := r.readCodeLine(expectCode)
+	code, continued, first, err := r.readCodeLine(expectCode)
 	multi := continued
+	var messageBuilder strings.Builder
+	messageBuilder.WriteString(first)
 	for continued {
 		line, err := r.ReadLine()
 		if err != nil {
@@ -276,12 +299,15 @@ func (r *Reader) ReadResponse(expectCode int) (code int, message string, err err
 		var moreMessage string
 		code2, continued, moreMessage, err = parseCodeLine(line, 0)
 		if err != nil || code2 != code {
-			message += "\n" + strings.TrimRight(line, "\r\n")
+			messageBuilder.WriteByte('\n')
+			messageBuilder.WriteString(strings.TrimRight(line, "\r\n"))
 			continued = true
 			continue
 		}
-		message += "\n" + moreMessage
+		messageBuilder.WriteByte('\n')
+		messageBuilder.WriteString(moreMessage)
 	}
+	message = messageBuilder.String()
 	if err != nil && multi && message != "" {
 		// replace one line error message with all lines (full message)
 		err = &Error{code, message}
@@ -482,9 +508,23 @@ func (r *Reader) ReadMIMEHeader() (MIMEHeader, error) {
 	return readMIMEHeader(r, math.MaxInt64, math.MaxInt64)
 }
 
+// readMIMEHeader should be an internal detail,
+// but widely used packages access it using linkname.
+// Notable members of the hall of shame include:
+//   - github.com/qtgolang/SunnyNet
+//
+// Do not remove or change the type signature.
+// See go.dev/issue/67401.
+//
+//go:linkname readMIMEHeader
+
 // readMIMEHeader is a version of ReadMIMEHeader which takes a limit on the header size.
-// It is called by the mime/multipart package.
+// It is called by the mime/multipart and net/http package.
 func readMIMEHeader(r *Reader, maxMemory, maxHeaders int64) (MIMEHeader, error) {
+	if maxMemory < 0 {
+		return nil, errMessageTooLarge
+	}
+
 	// Avoid lots of small slice allocations later by allocating one
 	// large one ahead of time which we'll cut up into smaller
 	// slices. If this isn't big enough later, we allocate small ones.
@@ -499,23 +539,18 @@ func readMIMEHeader(r *Reader, maxMemory, maxHeaders int64) (MIMEHeader, error) 
 
 	m := make(MIMEHeader, hint)
 
-	// Account for 400 bytes of overhead for the MIMEHeader, plus 200 bytes per entry.
-	// Benchmarking map creation as of go1.20, a one-entry MIMEHeader is 416 bytes and large
-	// MIMEHeaders average about 200 bytes per entry.
-	maxMemory -= 400
-	const mapEntryOverhead = 200
-
 	// The first line cannot start with a leading space.
 	if buf, err := r.R.Peek(1); err == nil && (buf[0] == ' ' || buf[0] == '\t') {
-		line, err := r.readLineSlice()
+		const errorLimit = 80 // arbitrary limit on how much of the line we'll quote
+		line, err := r.readLineSlice(errorLimit)
 		if err != nil {
 			return m, err
 		}
-		return m, ProtocolError("malformed MIME header initial line: " + string(line))
+		return m, ProtocolError(fmt.Sprintf("malformed MIME header initial line: %q", line))
 	}
 
 	for {
-		kv, err := r.readContinuedLineSlice(mustHaveFieldNameColon)
+		kv, err := r.readContinuedLineSlice(maxMemory, mustHaveFieldNameColon)
 		if len(kv) == 0 {
 			return m, err
 		}
@@ -523,28 +558,21 @@ func readMIMEHeader(r *Reader, maxMemory, maxHeaders int64) (MIMEHeader, error) 
 		// Key ends at first colon.
 		k, v, ok := bytes.Cut(kv, colon)
 		if !ok {
-			return m, ProtocolError("malformed MIME header line: " + string(kv))
+			return m, ProtocolError(fmt.Sprintf("malformed MIME header line: %q", kv))
 		}
 		key, ok := canonicalMIMEHeaderKey(k)
 		if !ok {
-			return m, ProtocolError("malformed MIME header line: " + string(kv))
+			return m, ProtocolError(fmt.Sprintf("malformed MIME header line: %q", kv))
 		}
 		for _, c := range v {
 			if !validHeaderValueByte(c) {
-				return m, ProtocolError("malformed MIME header line: " + string(kv))
+				return m, ProtocolError(fmt.Sprintf("malformed MIME header line: %q", kv))
 			}
-		}
-
-		// As per RFC 7230 field-name is a token, tokens consist of one or more chars.
-		// We could return a ProtocolError here, but better to be liberal in what we
-		// accept, so if we get an empty key, skip it.
-		if key == "" {
-			continue
 		}
 
 		maxHeaders--
 		if maxHeaders < 0 {
-			return nil, errors.New("message too large")
+			return nil, errMessageTooLarge
 		}
 
 		// Skip initial spaces in value.
@@ -552,14 +580,16 @@ func readMIMEHeader(r *Reader, maxMemory, maxHeaders int64) (MIMEHeader, error) 
 
 		vv := m[key]
 		if vv == nil {
+			// Account for per-entry overhead.
+			// 200 bytes is based on benchmarks circa Go 1.20.
+			const mapEntryOverhead = 200
+
 			maxMemory -= int64(len(key))
 			maxMemory -= mapEntryOverhead
 		}
 		maxMemory -= int64(len(value))
 		if maxMemory < 0 {
-			// TODO: This should be a distinguishable error (ErrMessageTooLarge)
-			// to allow mime/multipart to detect it.
-			return m, errors.New("message too large")
+			return m, errMessageTooLarge
 		}
 		if vv == nil && len(strs) > 0 {
 			// More than likely this will be a single-element key.
@@ -627,8 +657,8 @@ func (r *Reader) upcomingHeaderKeys() (n int) {
 // the rest are converted to lowercase. For example, the
 // canonical key for "accept-encoding" is "Accept-Encoding".
 // MIME header keys are assumed to be ASCII only.
-// If s contains a space or invalid header field bytes, it is
-// returned without modifications.
+// If s contains a space or invalid header field bytes as
+// defined by RFC 9112, it is returned without modifications.
 func CanonicalMIMEHeaderKey(s string) string {
 	// Quick check for canonical encoding.
 	upper := true
@@ -725,6 +755,10 @@ func validHeaderValueByte(c byte) bool {
 // ReadMIMEHeader accepts header keys containing spaces, but does not
 // canonicalize them.
 func canonicalMIMEHeaderKey(a []byte) (_ string, ok bool) {
+	if len(a) == 0 {
+		return "", false
+	}
+
 	// See if a looks like a header key. If not, return it unchanged.
 	noCanon := false
 	for _, c := range a {
@@ -806,6 +840,7 @@ func initCommonHeader() {
 		"Mime-Version",
 		"Pragma",
 		"Received",
+		"Referer",
 		"Return-Path",
 		"Server",
 		"Set-Cookie",

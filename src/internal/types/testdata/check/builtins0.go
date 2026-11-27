@@ -9,6 +9,7 @@ package builtins
 import "unsafe"
 
 func f0() {}
+func g0[P any](P) {}
 
 func append1() {
 	var b byte
@@ -80,6 +81,24 @@ func append3() {
 	_ = append(ff /* ERROR "must be a slice" */ ()) // TODO(gri) better error message
 }
 
+func append4() {
+	e1 := 42
+	e2 := 42
+	append(bad /* ERROR "undefined" */, e1)
+	append(nil /* ERROR "must be a slice" */, e2)
+}
+
+func append5() {
+	var s []func(int)
+	_ = append(s, g0)
+}
+
+func append6() {
+	var s [][]int
+	_ = append(s, {})
+	_ = append(s, {{1}, {2}, {3}}...)
+}
+
 func cap1() {
 	var a [10]bool
 	var p *[20]int
@@ -100,7 +119,10 @@ func cap1() {
 
 	var s [][]byte
 	_ = cap(s)
-	_ = cap(s... /* ERROR "invalid use of ..." */ )
+	_ = cap(s... /* ERROR "invalid use of ... with built-in cap" */ )
+
+	var x int
+	_ = cap(x /* ERROR "invalid argument: x (variable of type int) for built-in cap" */ )
 }
 
 func cap2() {
@@ -257,9 +279,9 @@ func complex2() {
 func copy1() {
 	copy() // ERROR "not enough arguments"
 	copy("foo") // ERROR "not enough arguments"
-	copy([ /* ERROR "copy expects slice arguments" */ ...]int{}, []int{})
-	copy([ /* ERROR "copy expects slice arguments" */ ]int{}, [...]int{})
-	copy([ /* ERROR "different element types" */ ]int8{}, "foo")
+	copy([ /* ERROR "invalid copy: argument must be a slice; have [...]int{} (value of type [0]int)" */ ...]int{}, []int{})
+	copy([]int{}, [ /* ERROR "invalid copy: argument must be a slice; have [...]int{} (value of type [0]int)" */ ...]int{})
+	copy([ /* ERROR "invalid copy: arguments []int8{} (value of type []int8) and \"foo\" (untyped string constant) have different element types int8 and byte" */ ]int8{}, "foo")
 
 	// spec examples
 	var a = [...]int{0, 1, 2, 3, 4, 5, 6, 7}
@@ -272,9 +294,9 @@ func copy1() {
 
 	var t [][]int
 	copy(t, t)
-	copy(t /* ERROR "copy expects slice arguments" */ , nil)
-	copy(nil /* ERROR "copy expects slice arguments" */ , t)
-	copy(nil /* ERROR "copy expects slice arguments" */ , nil)
+	copy(t, nil /* ERROR "invalid copy: argument must be a slice; have untyped nil" */ )
+	copy(nil /* ERROR "invalid copy: argument must be a slice; have untyped nil" */ , t)
+	copy(nil /* ERROR "invalid copy: argument must be a slice; have untyped nil" */ , nil)
 	copy(t... /* ERROR "invalid use of ..." */ )
 }
 
@@ -286,6 +308,13 @@ func copy2() {
 	copy(f1()) // ERROR "not enough arguments"
 	copy(f2())
 	copy(f3()) // ERROR "too many arguments"
+}
+
+func copy3() {
+	s1 := []int{42}
+	s2 := []int{42}
+	copy(bad /* ERROR "undefined" */, s1)
+	copy(nil /* ERROR "must be a slice" */, s2)
 }
 
 func delete1() {
@@ -310,6 +339,18 @@ func delete2() {
 	delete(f1()) // ERROR "not enough arguments"
 	delete(f2())
 	delete(f3()) // ERROR "too many arguments"
+}
+
+func delete3() {
+	k1 := 42
+	k2 := 42
+	delete(bad /* ERROR "undefined" */, k1)
+	delete(nil /* ERROR "nil is not a map" */, k2)
+}
+
+func delete4() {
+	var m map[func/* ERROR "invalid map key type" */(int)]int
+	delete(m, g0) // should still infer the type argument to g0
 }
 
 func imag1() {
@@ -385,7 +426,7 @@ func len1() {
 	var t string
 	var hash map[interface{}][]*[10]int
 	const n = len /* ERROR "not constant" */ (hash[recover()][len(t)])
-	assert(n == 10) // ok because n has unknown value and no error is reported
+	assert(n /* ERROR "invalid operand" */ == 10)
 	var ch <-chan int
 	const nn = len /* ERROR "not constant" */ (hash[<-ch][len(t)])
 
@@ -512,7 +553,7 @@ func max1() {
 	_ = max(s)
 	_ = max(x, x)
 	_ = max(x, x, x, x, x)
-	var _ int = max /* ERROR "cannot use max(m) (value of type myint) as int value" */ (m)
+	var _ int = max /* ERROR "cannot use max(m) (value of int type myint) as int value" */ (m)
 	_ = max(x, m /* ERROR "invalid argument: mismatched types int (previous argument) and myint (type of m)" */ , x)
 
 	_ = max(1, x)
@@ -566,7 +607,7 @@ func min1() {
 	_ = min(s)
 	_ = min(x, x)
 	_ = min(x, x, x, x, x)
-	var _ int = min /* ERROR "cannot use min(m) (value of type myint) as int value" */ (m)
+	var _ int = min /* ERROR "cannot use min(m) (value of int type myint) as int value" */ (m)
 	_ = min(x, m /* ERROR "invalid argument: mismatched types int (previous argument) and myint (type of m)" */ , x)
 
 	_ = min(1, x)
@@ -606,24 +647,58 @@ func min2() {
 	)
 }
 
+
 func new1() {
-	_ = new() // ERROR "not enough arguments"
+	_ = new()     // ERROR "not enough arguments"
 	_ = new(1, 2) // ERROR "too many arguments"
-	_ = new("foo" /* ERROR "not a type" */)
-	p := new(float64)
+	_ = new(unsafe /* ERROR "use of package unsafe not in selector" */ )
+
 	_ = new(struct{ x, y int })
+	p := new(float64)
 	q := new(*float64)
 	_ = *p == **q
-	new /* ERROR "not used" */ (int)
-        _ = &new /* ERROR "cannot take address" */ (int)
 
-	_ = new(int... /* ERROR "invalid use of ..." */ )
+	type G[P any] struct{}
+	_ = new(G[int])
+	_ = new(G /* ERROR "cannot use generic type G without instantiation" */ )
+
+	new /* ERROR "not used" */ (int)
+	_ = &new /* ERROR "cannot take address" */ (int)
+	_ = new(int... /* ERROR "invalid use of ..." */)
+	_ = new(f0 /* ERROR "f0() (no value) used as value or type" */ ())
+	_ = new(len /* ERROR "len (built-in) must be called" */)
+	_ = new(1 /* ERROR "argument to new (overflows)" */ << 70)
 }
 
 func new2() {
-	f1 := func() (x []int) { return }
-	_ = new(f0 /* ERROR "not a type" */ ())
-	_ = new(f1 /* ERROR "not a type" */ ())
+	// new(expr), added in go1.26
+	f1 := func() []int { panic(0) }
+	f2 := func() (int, int) { panic(0) }
+	var (
+		_ *[]int        = new(f1())
+		_ *func() []int = new(f1)
+		_ *bool         = new(false)
+		_ *bool         = new(1 < 2)
+		_ *int          = new(123)
+		_ *float64      = new(1.0)
+		_ *uint         = new(uint(3))
+		_ *rune         = new('a')
+		_ *string       = new("A")
+		_ *struct{}     = new(struct{}{})
+		_ *any          = new(any)
+
+		_ = new(f2 /* ERRORx "multiple-value.*in single-value context" */ ())
+		_ = new(1 << /* ERROR "constant shift overflow" */ 1000)
+		_ = new(1e10000 /* ERROR "cannot use 1e10000 (untyped float constant 1e+10000) as float64 value in argument to new (overflows)" */ )
+		_ = new(nil /* ERROR "use of untyped nil in argument to new" */ )
+		_ = new(comparable /* ERROR "cannot use type comparable outside a type constraint" */ )
+		_ = new(new /* ERROR "new (built-in) must be called" */ )
+		_ = new(panic /* ERROR "panic(0) (no value) used as value or type" */ (0))
+
+		// from issue 43125
+		_ = new(-1)
+		_ = new(1 + 1)
+	)
 }
 
 func panic1() {
@@ -1033,6 +1108,11 @@ func assert1() {
 	assert /* ERROR "failed" */ (false)
 	_ = assert(true)
 
+	// The following declaration produces an invalid operand c.
+	// Make sure assert(c) produces an error even for invalid operands.
+	const c = 'a' == "A" /* ERROR "mismatched types untyped rune and untyped string" */
+	assert(c /* ERROR "invalid operand" */ )
+
 	var s []byte
 	assert(s... /* ERROR "invalid use of ..." */ )
 }
@@ -1040,7 +1120,7 @@ func assert1() {
 func assert2() {
 	f1 := func() (x bool) { return }
 	f2 := func() (x bool) { return }
-	assert(f0 /* ERROR "used as value" */ ())
+	assert(f0 /* ERROR "used as value" */ /* ERROR "boolean constant" */ ())
 	assert(f1 /* ERROR "boolean constant" */ ())
 	assert(f2 /* ERROR "boolean constant" */ ())
 }

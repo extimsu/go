@@ -5,6 +5,7 @@
 package pprof
 
 import (
+	"internal/profilerecord"
 	"io"
 	"math"
 	"runtime"
@@ -12,7 +13,7 @@ import (
 )
 
 // writeHeapProto writes the current heap profile in protobuf format to w.
-func writeHeapProto(w io.Writer, p []runtime.MemProfileRecord, rate int64, defaultSampleType string) error {
+func writeHeapProto(w io.Writer, p []profilerecord.MemProfileRecord, rate int64, defaultSampleType string) error {
 	b := newProfileBuilder(w)
 	b.pbValueType(tagProfile_PeriodType, "space", "bytes")
 	b.pb.int64Opt(tagProfile_Period, rate)
@@ -27,43 +28,36 @@ func writeHeapProto(w io.Writer, p []runtime.MemProfileRecord, rate int64, defau
 	values := []int64{0, 0, 0, 0}
 	var locs []uint64
 	for _, r := range p {
-		hideRuntime := true
-		for tries := 0; tries < 2; tries++ {
-			stk := r.Stack()
-			// For heap profiles, all stack
-			// addresses are return PCs, which is
-			// what appendLocsForStack expects.
-			if hideRuntime {
-				for i, addr := range stk {
-					if f := runtime.FuncForPC(addr); f != nil && strings.HasPrefix(f.Name(), "runtime.") {
-						continue
-					}
-					// Found non-runtime. Show any runtime uses above it.
-					stk = stk[i:]
-					break
-				}
-			}
-			locs = b.appendLocsForStack(locs[:0], stk)
-			if len(locs) > 0 {
-				break
-			}
-			hideRuntime = false // try again, and show all frames next time.
-		}
+		locs = b.appendLocsForStackWithoutRuntime(locs[:0], r.Stack)
 
-		values[0], values[1] = scaleHeapSample(r.AllocObjects, r.AllocBytes, rate)
-		values[2], values[3] = scaleHeapSample(r.InUseObjects(), r.InUseBytes(), rate)
-		var blockSize int64
-		if r.AllocObjects > 0 {
-			blockSize = r.AllocBytes / r.AllocObjects
-		}
+		values[0], values[1] = scaleHeapSample(r.AllocObjects, r.ObjectSize, rate)
+		values[2], values[3] = scaleHeapSample(r.InUseObjects(), r.ObjectSize, rate)
 		b.pbSample(values, locs, func() {
-			if blockSize != 0 {
-				b.pbLabel(tagSample_Label, "bytes", "", blockSize)
-			}
+			b.pbLabel(tagSample_Label, "bytes", "", r.ObjectSize)
 		})
 	}
-	b.build()
-	return nil
+	return b.build()
+}
+
+// appendLocsForStackWithoutRuntime appends locations for a stack, hiding
+// runtime leaf frames unless the stack contains only runtime frames.
+func (b *profileBuilder) appendLocsForStackWithoutRuntime(locs []uint64, stk []uintptr) []uint64 {
+	origStk := stk
+	for i, addr := range stk {
+		if f := runtime.FuncForPC(addr); f != nil && (strings.HasPrefix(f.Name(), "runtime.") || strings.HasPrefix(f.Name(), "internal/runtime/")) {
+			continue
+		}
+		stk = stk[i:]
+		break
+	}
+	n := len(locs)
+	locs = b.appendLocsForStack(locs, stk)
+	if len(locs) == n {
+		// The stack was empty after filtering out runtime leaf frames,
+		// so just add the original stack
+		locs = b.appendLocsForStack(locs, origStk)
+	}
+	return locs
 }
 
 // scaleHeapSample adjusts the data from a heap Sample to
@@ -75,19 +69,18 @@ func writeHeapProto(w io.Writer, p []runtime.MemProfileRecord, rate int64, defau
 // which samples to collect, based on the desired average collection
 // rate R. The probability of a sample of size S to appear in that
 // profile is 1-exp(-S/R).
-func scaleHeapSample(count, size, rate int64) (int64, int64) {
-	if count == 0 || size == 0 {
+func scaleHeapSample(count, avgSize, rate int64) (int64, int64) {
+	if count == 0 || avgSize == 0 {
 		return 0, 0
 	}
 
 	if rate <= 1 {
 		// if rate==1 all samples were collected so no adjustment is needed.
 		// if rate<1 treat as unknown and skip scaling.
-		return count, size
+		return count, count * avgSize
 	}
 
-	avgSize := float64(size) / float64(count)
-	scale := 1 / (1 - math.Exp(-avgSize/float64(rate)))
+	scale := 1 / (1 - math.Exp(-float64(avgSize)/float64(rate)))
 
-	return int64(float64(count) * scale), int64(float64(size) * scale)
+	return int64(float64(count) * scale), int64(float64(count*avgSize) * scale)
 }

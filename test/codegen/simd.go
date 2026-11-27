@@ -1,0 +1,696 @@
+// asmcheck
+
+// Copyright 2025 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+// These tests check code generation of simd peephole optimizations.
+
+//go:build goexperiment.simdstable && amd64
+
+package codegen
+
+import (
+	"math"
+	"simd/archsimd"
+)
+
+func vptest1() bool {
+	v1 := archsimd.LoadUint64x2([]uint64{0, 1})
+	v2 := archsimd.LoadUint64x2([]uint64{0, 0})
+	// amd64:`VPTEST (.*)(.*)$`
+	// amd64:`SETCS (.*)$`
+	return v1.AndNot(v2).IsZero()
+}
+
+func vptest2() bool {
+	v1 := archsimd.LoadUint64x2([]uint64{0, 1})
+	v2 := archsimd.LoadUint64x2([]uint64{0, 0})
+	// amd64:`VPTEST (.*)(.*)$`
+	// amd64:`SETEQ (.*)$`
+	return v1.And(v2).IsZero()
+}
+
+type Args2 struct {
+	V0 archsimd.Uint8x32
+	V1 archsimd.Uint8x32
+	x  string
+}
+
+//go:noinline
+func simdStructNoSpill(a Args2) archsimd.Uint8x32 {
+	// amd64:-`VMOVDQU .*$`
+	return a.V0.Xor(a.V1)
+}
+
+func simdStructWrapperNoSpill(a Args2) archsimd.Uint8x32 {
+	// amd64:-`VMOVDQU .*$`
+	a.x = "test"
+	return simdStructNoSpill(a)
+}
+
+//go:noinline
+func simdArrayNoSpill(a [1]Args2) archsimd.Uint8x32 {
+	// amd64:-`VMOVDQU .*$`
+	return a[0].V0.Xor(a[0].V1)
+}
+
+func simdArrayWrapperNoSpill(a [1]Args2) archsimd.Uint8x32 {
+	// amd64:-`VMOVDQU .*$`
+	a[0].x = "test"
+	return simdArrayNoSpill(a)
+}
+
+func simdFeatureGuardedMaskOpt() archsimd.Int16x16 {
+	var x, y archsimd.Int16x16
+	if archsimd.X86.AVX512() {
+		mask := archsimd.Mask16x16FromBits(5)
+		return x.Add(y).Masked(mask) // amd64:`VPADDW.Z .*$`
+	}
+	mask := archsimd.Mask16x16FromBits(5)
+	return x.Add(y).Masked(mask) // amd64/v1:`VPAND .*$` amd64/v3:`VPAND .*$`
+}
+
+func simdMaskedMerge() archsimd.Int16x16 {
+	var x, y archsimd.Int16x16
+	if archsimd.X86.AVX512() {
+		mask := archsimd.Mask16x16FromBits(5)
+		return x.Add(y).IfElse(mask, x) // amd64:-`VPBLENDVB .*$`
+	}
+	mask := archsimd.Mask16x16FromBits(5)
+	return x.Add(y).IfElse(mask, x) // amd64/v1:`VPBLENDVB .*$` amd64/v3:`VPBLENDVB .*$`
+}
+
+func simdIfElseVPBLENDM(x, y archsimd.Int32x4, bits uint8) archsimd.Int32x4 {
+	if archsimd.X86.AVX512() {
+		// Check that 128/256-bit IfElse with an AVX-512 K-mask blends directly with VPBLENDM.
+		// amd64:`KMOVB` `VPBLENDMD X[0-9]+, X[0-9]+, K[1-7], X[0-9]+` -`VPMOVM2D` -`VPBLENDVB`
+		return x.IfElse(archsimd.Mask32x4FromBits(bits), y)
+	}
+	// amd64/v1:`VPBLENDVB` amd64/v3:`VPBLENDVB`
+	return x.IfElse(archsimd.Mask32x4FromBits(bits), y)
+}
+
+func simdFloat32x8Masked(x, y archsimd.Float32x8) archsimd.Float32x8 {
+	if archsimd.X86.AVX512() {
+		// Check that Masked folds into a zeroing AVX-512 op.
+		mask := x.Less(y)
+		// amd64:`VADDPS.Z .*$` -`VANDPS` -`VPAND`
+		return x.Add(y).Masked(mask)
+	}
+	// Check that we produce the AVX1 floating-point AND, not the AVX2 integer AND.
+	mask := x.Less(y)
+	// amd64/v1:`VANDPS .*$` -`VPAND` amd64/v3:`VANDPS .*$` -`VPAND`
+	return x.Add(y).Masked(mask)
+}
+
+func simdFloat64x4Masked(x, y archsimd.Float64x4) archsimd.Float64x4 {
+	if archsimd.X86.AVX512() {
+		// Check that Masked folds into a zeroing AVX-512 op.
+		mask := x.Less(y)
+		// amd64:`VADDPD.Z .*$` -`VANDPD` -`VPAND`
+		return x.Add(y).Masked(mask)
+	}
+	// Check that we produce the AVX1 floating-point AND, not the AVX2 integer AND.
+	mask := x.Less(y)
+	// amd64/v1:`VANDPD .*$` -`VPAND` amd64/v3:`VANDPD .*$` -`VPAND`
+	return x.Add(y).Masked(mask)
+}
+
+func simdFloat32x8IfElse(x, y archsimd.Float32x8) archsimd.Float32x8 {
+	if archsimd.X86.AVX512() {
+		// Check that a comparison mask feeds directly into a merging AVX-512 op.
+		mask := x.Less(y)
+		// amd64:`VADDPS .*, K[1-7], .*$` -`VBLENDVPS` -`VPBLEND`
+		return x.Add(y).IfElse(mask, x)
+	}
+	// Check that we produce the AVX1 floating-point blend, not the AVX2 integer blend.
+	mask := x.Less(y)
+	// amd64/v1:`VBLENDVPS .*$` -`VPBLENDVB` amd64/v3:`VBLENDVPS .*$` -`VPBLENDVB`
+	return x.Add(y).IfElse(mask, x)
+}
+
+func simdFloat64x4IfElse(x, y archsimd.Float64x4) archsimd.Float64x4 {
+	if archsimd.X86.AVX512() {
+		// Check that a comparison mask feeds directly into a merging AVX-512 op.
+		mask := x.Less(y)
+		// amd64:`VADDPD .*, K[1-7], .*$` -`VBLENDVPD` -`VPBLEND`
+		return x.Add(y).IfElse(mask, x)
+	}
+	// Check that we produce the AVX1 floating-point blend, not the AVX2 integer blend.
+	mask := x.Less(y)
+	// amd64/v1:`VBLENDVPD .*$` -`VPBLENDVB` amd64/v3:`VBLENDVPD .*$` -`VPBLENDVB`
+	return x.Add(y).IfElse(mask, x)
+}
+
+func simdCompareToKMaskMerge(x, y, dst, a, b archsimd.Int32x8) archsimd.Int32x8 {
+	if !archsimd.X86.AVX512() {
+		return dst
+	}
+	// Check that a 256-bit comparison used as a merge mask compares into a K-mask
+	// and folds into a merging AVX-512 op.
+	// amd64:`VPCMPD \$6, Y[0-9]+, Y[0-9]+, K[1-7]` `VPADDD Y[0-9]+, Y[0-9]+, K[1-7], Y[0-9]+` -`VPCMPGTD` -`VPBLEND`
+	return x.Add(y).IfElse(a.Less(b), dst)
+}
+
+func simdMaskLogic256(a, b, c, d archsimd.Float32x8) archsimd.Mask32x8 {
+	x, y := a.Less(b), c.Equal(d)
+	if archsimd.X86.AVX2() {
+		// Check that with AVX2, 256-bit mask logic uses the integer
+		// instructions, which the mask optimizations understand.
+		// amd64:`VPANDN` `VPAND Y` `VPOR` `VPXOR` -`VANDNPS` -`VANDPS` -`VORPS` -`VXORPS`
+		return x.AndNot(y).Or(x.And(y).Xor(y))
+	}
+	// Check that without AVX2, 256-bit mask logic uses the AVX1 floating-point
+	// instructions, not the AVX2 integer ones.
+	// amd64/v1:`VANDNPS` `VANDPS` `VORPS` `VXORPS` -`VPAND` -`VPOR` -`VPXOR`
+	return x.AndNot(y).Or(x.And(y).Xor(y))
+}
+
+func simdHiInt32x8(x archsimd.Int32x8) archsimd.Int32x4 {
+	if archsimd.X86.AVX2() {
+		// Check that with AVX2, Hi on a 256-bit integer vector uses the
+		// integer extract.
+		// amd64:`VEXTRACTI128` -`VEXTRACTF128`
+		return x.Hi()
+	}
+	// Check that without AVX2, it uses the AVX1 floating-point extract.
+	// amd64/v1:`VEXTRACTF128` -`VEXTRACTI128`
+	return x.Hi()
+}
+
+func simdSetHiInt32x8(x archsimd.Int32x8, y archsimd.Int32x4) archsimd.Int32x8 {
+	if archsimd.X86.AVX2() {
+		// Check that with AVX2, SetHi on a 256-bit integer vector uses the
+		// integer insert.
+		// amd64:`VINSERTI128` -`VINSERTF128`
+		return x.SetHi(y)
+	}
+	// Check that without AVX2, it uses the AVX1 floating-point insert.
+	// amd64/v1:`VINSERTF128` -`VINSERTI128`
+	return x.SetHi(y)
+}
+
+func simdKMaskLogic512(x, y, a, b, c, d, e, f archsimd.Int32x16) archsimd.Int32x16 {
+	// Check that logic on three 512-bit comparison masks stays in K registers,
+	// rather than moving them to vectors for a ternary logic operation and
+	// back.
+	// amd64:`KANDW` `KORW` `VPBLENDMD` -`VPTERNLOGD` -`VPMOVM2D` -`VPMOVD2M`
+	return x.IfElse(a.Less(b).And(c.Less(d)).Or(e.Less(f)), y)
+}
+
+func simdCompareToKMaskAndIfElse(x, y, a, b, c, d archsimd.Float64x4) archsimd.Float64x4 {
+	if !archsimd.X86.AVX512() {
+		return y
+	}
+	// Check that an And of two 256-bit comparisons used as an IfElse mask compares
+	// into K-masks, combines them with KANDB, and blends with VPBLENDMQ.
+	// amd64:`VCMPPD \$[01], Y[0-9]+, Y[0-9]+, K[1-7]` `KANDB` `VPBLENDMQ Y[0-9]+, Y[0-9]+, K[1-7], Y[0-9]+` -`VANDPD` -`VBLENDVPD`
+	return x.IfElse(a.Less(b).And(c.Equal(d)), y)
+}
+
+func simdAbsInt64x2(x archsimd.Int64x2) archsimd.Uint64x2 {
+	if archsimd.X86.AVX512() {
+		// Check that the AVX emulation is turned back into VPABSQ when AVX-512 is known.
+		// amd64:`VPABSQ X[0-9]+, X[0-9]+` -`VPCMPGTQ`
+		return x.Abs()
+	}
+	// amd64/v1:`VPCMPGTQ` -`VPABSQ` amd64/v3:`VPCMPGTQ` -`VPABSQ`
+	return x.Abs()
+}
+
+func simdAbsInt64x4(x archsimd.Int64x4) archsimd.Uint64x4 {
+	if archsimd.X86.AVX512() {
+		// Check that the AVX2 emulation is turned back into VPABSQ when AVX-512 is known.
+		// amd64:`VPABSQ Y[0-9]+, Y[0-9]+` -`VPCMPGTQ`
+		return x.Abs()
+	}
+	// amd64/v1:`VPCMPGTQ` -`VPABSQ` amd64/v3:`VPCMPGTQ` -`VPABSQ`
+	return x.Abs()
+}
+
+func simdShiftAllRightInt64x2(x archsimd.Int64x2, s uint64) archsimd.Int64x2 {
+	if archsimd.X86.AVX512() {
+		// Check that the AVX emulation is turned back into VPSRAQ when AVX-512 is known.
+		// amd64:`VPSRAQ X[0-9]+, X[0-9]+, X[0-9]+` -`VPCMPGTQ` -`VPSRLQ` -`CMOVQHI`
+		return x.ShiftAllRight(s)
+	}
+	// amd64/v1:`VPCMPGTQ` `VPSRLQ` -`VPSRAQ` amd64/v3:`VPCMPGTQ` `VPSRLQ` -`VPSRAQ`
+	return x.ShiftAllRight(s)
+}
+
+func simdShiftAllRightInt64x4(x archsimd.Int64x4, s uint64) archsimd.Int64x4 {
+	if archsimd.X86.AVX512() {
+		// Check that the AVX2 emulation is turned back into VPSRAQ when AVX-512 is known.
+		// amd64:`VPSRAQ X[0-9]+, Y[0-9]+, Y[0-9]+` -`VPCMPGTQ` -`VPSRLQ` -`CMOVQHI`
+		return x.ShiftAllRight(s)
+	}
+	// amd64/v1:`VPCMPGTQ` `VPSRLQ` -`VPSRAQ` amd64/v3:`VPCMPGTQ` `VPSRLQ` -`VPSRAQ`
+	return x.ShiftAllRight(s)
+}
+
+func simdShiftAllRightConstInt64x2(x archsimd.Int64x2) archsimd.Int64x2 {
+	if archsimd.X86.AVX512() {
+		// amd64:`VPSRAQ \$5, X[0-9]+, X[0-9]+` -`VPCMPGTQ` -`VPSRLQ`
+		return x.ShiftAllRight(5)
+	}
+	// amd64/v1:`VPCMPGTQ` `VPSRLQ \$5` -`VPSRAQ` amd64/v3:`VPCMPGTQ` `VPSRLQ \$5` -`VPSRAQ`
+	return x.ShiftAllRight(5)
+}
+
+func simdShiftAllRightConstInt64x4(x archsimd.Int64x4) archsimd.Int64x4 {
+	if archsimd.X86.AVX512() {
+		// amd64:`VPSRAQ \$63, Y[0-9]+, Y[0-9]+` -`VPCMPGTQ` -`VPSRLQ`
+		return x.ShiftAllRight(63)
+	}
+	// amd64/v1:`VPCMPGTQ` `VPSRLQ \$63` -`VPSRAQ` amd64/v3:`VPCMPGTQ` `VPSRLQ \$63` -`VPSRAQ`
+	return x.ShiftAllRight(63)
+}
+
+var nan = math.NaN()
+var floats64s = []float64{0, 1, 2, nan, 4, nan, 6, 7, 8, 9, 10, 11, nan, 13, 14, 15}
+var sinkInt64s = make([]int64, 100)
+
+func simdIsNaN() {
+	x := archsimd.LoadFloat64x4(floats64s)
+	y := archsimd.LoadFloat64x4(floats64s[4:])
+	a := x.IsNaN()
+	b := y.IsNaN()
+	// amd64:"VCMPPD [$]3," -"VPOR" -"VORPS"
+	c := a.Or(b)
+	c.ToInt64x4().Store(sinkInt64s)
+}
+
+func simdIsNaN512() {
+	x := archsimd.LoadFloat64x8(floats64s)
+	y := archsimd.LoadFloat64x8(floats64s[8:])
+	a := x.IsNaN()
+	b := y.IsNaN()
+	// amd64:"VCMPPD [$]3," -"VPOR"
+	c := a.Or(b)
+	c.ToInt64x8().Store(sinkInt64s)
+}
+
+func sftImmVPSRL() archsimd.Uint32x4 {
+	var x archsimd.Uint32x4
+	// amd64:`VPSRLD \$1, .*$`
+	return x.ShiftAllRight(1)
+}
+
+func sftImmZeroMasked(x archsimd.Int16x32, bits uint32) archsimd.Int16x32 {
+	// Check that a zero-masked shift by 0 still zeroes masked-off lanes instead of folding to x.
+	mask := archsimd.Mask16x32FromBits(bits)
+	// amd64:`VMOVDQU16\.Z` -`VPSLLW`
+	return x.ShiftAllLeft(0).Masked(mask)
+}
+
+func sftImmZeroMerge(x, dst archsimd.Int16x32, bits uint32) archsimd.Int16x32 {
+	// Check that a merge-masked shift by 0 folds to a blend instead of shifting by 0.
+	mask := archsimd.Mask16x32FromBits(bits)
+	// amd64:`VPBLENDMW` -`VPSLLW`
+	return x.ShiftAllLeft(0).IfElse(mask, dst)
+}
+
+func sftImmMerge(x, y archsimd.Uint64x8, m archsimd.Mask64x8) archsimd.Uint64x8 {
+	// amd64:`VPSLLQ \$2, Z[0-9]+, K[1-7], Z[0-9]+` -`VPBLENDMQ`
+	return x.ShiftAllLeft(2).IfElse(m, y)
+}
+
+func aLtbLtc8_avx512(a, b, c archsimd.Int8x64) archsimd.Mask8x64 {
+	// the vector length implies AVX512 implies the mask operations.
+	// amd64:`KANDQ`
+	return a.Less(b).And(b.Less(c))
+}
+
+func aLtbORbLtc8_avx512(a, b, c archsimd.Int8x64) archsimd.Mask8x64 {
+	// the vector length implies AVX512 implies the mask operations.
+	// amd64:`KORQ`
+	return a.Less(b).Or(b.Less(c))
+}
+
+func aLtbLtc64_avx512(a, b, c archsimd.Int64x8) archsimd.Mask64x8 {
+	// the vector length implies AVX512 implies the mask operations.
+	// amd64:`KANDB`
+	return a.Less(b).And(b.Less(c))
+}
+
+func aLtbORbLtc64_avx512(a, b, c archsimd.Int64x8) archsimd.Mask64x8 {
+	// the vector length implies AVX512 implies the mask operations.
+	// amd64:`KORB`
+	return a.Less(b).Or(b.Less(c))
+}
+
+func maskEq8_avx512(a, b, c, d archsimd.Int8x64) archsimd.Mask8x64 {
+	// amd64:`KXNORQ` -`KXORQ` -`KNOTQ`
+	return a.Less(b).Xor(c.Less(d)).Not()
+}
+
+func maskEq64_avx512(a, b, c, d archsimd.Int64x8) archsimd.Mask64x8 {
+	// amd64:`KXNORB` -`KXORB` -`KNOTB`
+	return a.Less(b).Xor(c.Less(d)).Not()
+}
+
+var globalSlice = []uint32{1, 2, 3, 4, 5, 6, 7, 8}
+
+func simdMemoryOperandMerge() archsimd.Uint32x4 {
+	a := archsimd.BroadcastUint32x4(1)
+	// amd64:`VPADDD \([A-Z]+\), X\d, X\d`
+	a = a.Add(archsimd.LoadUint32x4(globalSlice[0:4]))
+	// amd64:`VPADDD 16\([A-Z]+\), X\d, X\d`
+	a = a.Add(archsimd.LoadUint32x4(globalSlice[4:8]))
+	return a
+}
+
+func simdZeroingUsesVEX(x archsimd.Uint64x8) uint64 {
+	// The SIMD-typed value in this function implies AVX is present,
+	// so the zeroing of t must not use legacy-SSE encodings, which
+	// would incur AVX-SSE transition penalties (issue 80835).
+	// amd64:`VMOVUPS X15` -`\bMOVUPS`
+	var t [8]uint64
+	acc := archsimd.LoadUint64x8(t[:])
+	acc = acc.Add(x)
+	acc.Store(t[:])
+	var n uint64
+	for _, v := range t {
+		n += v
+	}
+	return n
+}
+
+func simdShiftScalarUsesVEX(x archsimd.Uint64x2, n uint64) archsimd.Uint64x2 {
+	// The scalar shift count must be moved to a vector register with
+	// a VEX encoding, not a legacy-SSE MOVQ (issue 80835).
+	// amd64:`VMOVQ` -`\bMOVQ [A-Z]+, X`
+	return x.ShiftAllLeft(n)
+}
+
+func simdMoveUsesVEX(x archsimd.Uint64x8, p *[8]uint64) uint64 {
+	// The 64-byte array copy is a lowered Move; its 16-byte chunks
+	// must use VEX encodings here (issue 80835).
+	var t [8]uint64
+	acc := archsimd.LoadUint64x8(t[:])
+	acc = acc.Add(x)
+	acc.Store(t[:])
+	// amd64:`VMOVUPS \([A-Z0-9]+\), X14` -`\bMOVUPS`
+	*p = t
+	return p[0]
+}
+
+func simdMove16UsesVEX(x archsimd.Uint64x2, d, s *[16]byte) uint64 {
+	// The 16-byte block copy is lowered to MOVOload/MOVOstore, which
+	// must use VEX encodings here (issue 80835).
+	// amd64:`VMOVUPS \([A-Z0-9]+\), X` -`\bMOVUPS`
+	*d = *s
+	t := x.Add(x)
+	var out [2]uint64
+	t.Store(out[:])
+	return out[0]
+}
+
+//go:noinline
+func simdOpaque() {}
+
+func simdSpillUsesVEX(a, b archsimd.Uint64x2) archsimd.Uint64x2 {
+	// x is live across the call, so it is spilled and reloaded; both
+	// must use VEX encodings here (issue 80835).
+	// amd64:`VMOVUPS [^,]*\(SP\), X` -`\bMOVUPS`
+	x := a.Add(b)
+	simdOpaque()
+	return x.Add(x)
+}
+
+func simdShuffleCopyUsesVEX(a, b archsimd.Uint64x2, n int) archsimd.Uint64x2 {
+	// The swap makes regalloc place shuffle copies in the block
+	// splitting the loop back edge; they must use VEX encodings here.
+	// This also relies on split-edge blocks inheriting the CPU
+	// features of their edge (issue 80835).
+	x, y := a, b
+	// amd64:`VMOVUPS X[0-9]+, X[0-9]+` -`\bMOVUPS`
+	for i := 0; i < n; i++ {
+		x, y = y, x
+	}
+	return x.Add(y)
+}
+
+func simdMaskSpillUsesK(z archsimd.Float32x8, m archsimd.Mask32x8, n int) archsimd.Float32x8 {
+	// The closure keeps the mask itself live across the call, so it is
+	// spilled. It must be reloaded straight into a K register, rather
+	// than into a general purpose one and moved from there.
+	_ = func() {
+		z = z.Compress(m)
+		simdOpaque()
+		// amd64:`KMOVQ [^,]*\(SP\), K[0-7]`
+		for range n {
+			// amd64:-`KMOVQ [A-Z]+, K[0-7]`
+			z = z.Compress(m)
+		}
+	}
+	return z
+}
+
+// 128-bit broadcasts need only AVX: without AVX2 they use AVX shuffles, and
+// with AVX2 (known from GOAMD64 or a feature check) they use VPBROADCAST.
+
+func broadcast128Int8(x int8) archsimd.Int8x16 {
+	// amd64/v1:`VPSHUFB` -`VPBROADCASTB`
+	// amd64/v3:`VPBROADCASTB` -`VPSHUFB`
+	return archsimd.BroadcastInt8x16(x)
+}
+
+func broadcast128Int16(x int16) archsimd.Int16x8 {
+	// amd64/v1:`VPUNPCKLWD` `VPSHUFD \$0,` -`VPBROADCASTW`
+	// amd64/v3:`VPBROADCASTW` -`VPSHUFD`
+	return archsimd.BroadcastInt16x8(x)
+}
+
+func broadcast128Int32(x int32) archsimd.Int32x4 {
+	// amd64/v1:`VPSHUFD \$0,` -`VPBROADCASTD`
+	// amd64/v3:`VPBROADCASTD` -`VPSHUFD`
+	return archsimd.BroadcastInt32x4(x)
+}
+
+func broadcast128Float32(x float32) archsimd.Float32x4 {
+	// amd64/v1:`VPSHUFD \$0,` -`VBROADCASTSS`
+	// amd64/v3:`VBROADCASTSS` -`VPSHUFD`
+	return archsimd.BroadcastFloat32x4(x)
+}
+
+func broadcast128Int64(x int64) archsimd.Int64x2 {
+	// amd64/v1:`VPSHUFD \$68,` -`VPBROADCASTQ`
+	// amd64/v3:`VPBROADCASTQ` -`VPSHUFD`
+	return archsimd.BroadcastInt64x2(x)
+}
+
+func broadcast128AVX2Checked(x int32) archsimd.Int32x4 {
+	if archsimd.X86.AVX2() {
+		// amd64:`VPBROADCASTD` -`VPSHUFD`
+		return archsimd.BroadcastInt32x4(x)
+	}
+	return archsimd.Int32x4{}
+}
+
+func broadcast128MulToShift(x archsimd.Int32x4) archsimd.Int32x4 {
+	// amd64:`VPSLLD \$3,` -`VPMULLD`
+	return x.Mul(archsimd.BroadcastInt32x4(8))
+}
+
+// == and != on 256- and 512-bit vectors and masks. VPXOR on 256-bit vectors
+// requires AVX2, so without it, == uses the AVX1 floating-point XOR instead.
+// GOAMD64=v3 guarantees AVX2.
+
+func eqInt16x16(x, y archsimd.Int16x16) bool {
+	// amd64:`VPTEST` `SETEQ` -`CALL`
+	// amd64/v1,amd64/v2:`VXORPS Y` -`VPXOR` amd64/v3,amd64/v4:`VPXOR Y` -`VXORPS`
+	return x == y
+}
+
+func eqInt16x16AVX2(x, y archsimd.Int16x16) bool {
+	if archsimd.X86.AVX2() {
+		// amd64:`VPXOR Y` `VPTEST` `SETEQ` -`VXORPS` -`CALL`
+		return x == y
+	}
+	return false
+}
+
+func eqMask32x8(a, b, c, d archsimd.Float32x8) bool {
+	// amd64:`VPTEST` `SETEQ` -`CALL`
+	// amd64/v1,amd64/v2:`VXORPS Y` -`VPXOR` amd64/v3,amd64/v4:`VPXOR Y` -`VXORPS`
+	return a.Less(b) == c.Equal(d)
+}
+
+func eqFloat32x8(x, y archsimd.Float32x8) bool {
+	// amd64:`VCMPPS` `VPTEST` `SETEQ` -`CALL`
+	return x == y
+}
+
+func eqInt64x8(x, y archsimd.Int64x8) bool {
+	// amd64:`VPCMPQ` `KMOVB` `TESTB` `SETEQ` -`CALL`
+	return x == y
+}
+
+func neFloat64x8(x, y archsimd.Float64x8) bool {
+	// amd64:`VCMPPD` `KMOVB` `TESTB` `SETNE` -`CALL`
+	return x != y
+}
+
+func eqMask8x64(x, y archsimd.Mask8x64) bool {
+	// amd64:`VPCMPQ` `KMOVB` `TESTB` `SETEQ` -`CALL`
+	return x == y
+}
+
+// A zero vector is in X15, which ops can read directly, even as their first
+// input.
+
+func zeroFirstInput(y archsimd.Int32x8) archsimd.Int32x8 {
+	// amd64:`VPSUBD Y[0-9]+, Y15, Y[0-9]+` -`VMOVDQU`
+	return archsimd.Int32x8{}.Sub(y)
+}
+
+func zeroFirstInput512(y archsimd.Int32x16) archsimd.Int32x16 {
+	// amd64:`VPSUBD Z[0-9]+, Z15, Z[0-9]+` -`VMOVDQU`
+	return archsimd.Int32x16{}.Sub(y)
+}
+
+// Merged memory operands for VPTERNLOGD/VPTERNLOGQ (issue #82745).
+
+var (
+	ternD128A, ternD128B, ternD128C [4]int32
+	ternD256A, ternD256B, ternD256C [8]int32
+	ternD512A, ternD512B, ternD512C [16]int32
+	ternQ128A, ternQ128B, ternQ128C [2]int64
+	ternQ256A, ternQ256B, ternQ256C [4]int64
+	ternQ512A, ternQ512B, ternQ512C [8]int64
+)
+
+func ternlogD128Load() {
+	if archsimd.X86.AVX512() {
+		a, b, c := archsimd.LoadInt32x4Array(&ternD128A), archsimd.LoadInt32x4Array(&ternD128B), archsimd.LoadInt32x4Array(&ternD128C)
+		// amd64:`VPTERNLOGD \$150, .*\(SB\), X[0-9]+, X[0-9]+`
+		a.Xor(b).Xor(c).StoreArray(&ternD128A)
+	}
+}
+
+func ternlogD256Load() {
+	if archsimd.X86.AVX512() {
+		a, b, c := archsimd.LoadInt32x8Array(&ternD256A), archsimd.LoadInt32x8Array(&ternD256B), archsimd.LoadInt32x8Array(&ternD256C)
+		// amd64:`VPTERNLOGD \$150, .*\(SB\), Y[0-9]+, Y[0-9]+`
+		a.Xor(b).Xor(c).StoreArray(&ternD256A)
+	}
+}
+
+func ternlogD512Load() {
+	a, b, c := archsimd.LoadInt32x16Array(&ternD512A), archsimd.LoadInt32x16Array(&ternD512B), archsimd.LoadInt32x16Array(&ternD512C)
+	// amd64:`VPTERNLOGD \$150, .*\(SB\), Z[0-9]+, Z[0-9]+`
+	a.Xor(b).Xor(c).StoreArray(&ternD512A)
+}
+
+func ternlogD512LoadPtr(x, y, z *[16]int32) archsimd.Int32x16 {
+	a, b, c := archsimd.LoadInt32x16Array(x), archsimd.LoadInt32x16Array(y), archsimd.LoadInt32x16Array(z)
+	// amd64:`VPTERNLOGD \$[0-9]+, \([A-Z0-9]+\), Z[0-9]+, Z[0-9]+`
+	return a.AndNot(b).Xor(c)
+}
+
+func ternlogQ128Load() {
+	if archsimd.X86.AVX512() {
+		a, b, c := archsimd.LoadInt64x2Array(&ternQ128A), archsimd.LoadInt64x2Array(&ternQ128B), archsimd.LoadInt64x2Array(&ternQ128C)
+		// amd64:`VPTERNLOGQ \$150, .*\(SB\), X[0-9]+, X[0-9]+`
+		a.Xor(b).Xor(c).StoreArray(&ternQ128A)
+	}
+}
+
+func ternlogQ256Load() {
+	if archsimd.X86.AVX512() {
+		a, b, c := archsimd.LoadInt64x4Array(&ternQ256A), archsimd.LoadInt64x4Array(&ternQ256B), archsimd.LoadInt64x4Array(&ternQ256C)
+		// amd64:`VPTERNLOGQ \$150, .*\(SB\), Y[0-9]+, Y[0-9]+`
+		a.Xor(b).Xor(c).StoreArray(&ternQ256A)
+	}
+}
+
+func ternlogQ512Load() {
+	a, b, c := archsimd.LoadInt64x8Array(&ternQ512A), archsimd.LoadInt64x8Array(&ternQ512B), archsimd.LoadInt64x8Array(&ternQ512C)
+	// amd64:`VPTERNLOGQ \$150, .*\(SB\), Z[0-9]+, Z[0-9]+`
+	a.Xor(b).Xor(c).StoreArray(&ternQ512A)
+}
+
+func simdBreakFalseDep(a archsimd.Int8x64, m archsimd.Mask8x64) archsimd.Int8x64 {
+	// amd64:`VPXORD X\d, X\d`
+	// amd64:`VPEXPANDB\.Z Z\d, K\d, Z\d`
+	return a.Expand(m).Add(a)
+}
+
+// GOAMD64=v4 guarantees AVX-512 and GOAMD64=v3 guarantees AVX2, so checks for
+// them fold away, whether or not the code branches on them.
+
+func simdHasAVX512() bool {
+	// amd64/v4:`MOVL \$1, AX` -`.*internal/cpu.X86`
+	// amd64/v3:`MOVBLZX internal/cpu.X86`
+	return archsimd.X86.AVX512()
+}
+
+func simdHasAVX2() bool {
+	// amd64/v3:`MOVL \$1, AX` -`.*internal/cpu.X86`
+	// amd64/v2:`MOVBLZX internal/cpu.X86`
+	return archsimd.X86.AVX2()
+}
+
+func simdIfAVX2() int {
+	// amd64/v3:-`.*internal/cpu.X86` amd64/v2:`CMPB internal/cpu.X86`
+	if archsimd.X86.AVX2() {
+		return 1
+	}
+	return 2
+}
+
+func simdIfNotAVX2() int {
+	// amd64/v3:-`.*internal/cpu.X86` amd64/v2:`CMPB internal/cpu.X86`
+	if !archsimd.X86.AVX2() {
+		return 1
+	}
+	return 2
+}
+
+//go:noinline
+func simdSlow() int { return 4 }
+
+func simdIfAVX512() int {
+	// amd64/v4:-`.*internal/cpu.X86` -`CALL` amd64/v3:`CMPB internal/cpu.X86`
+	if archsimd.X86.AVX512() {
+		return 3
+	}
+	return simdSlow()
+}
+
+func reduceMinUint16x8(x archsimd.Uint16x8) uint16 {
+	// amd64:`VPHMINPOSUW`
+	return x.ReduceMin()
+}
+
+func reduceMaxUint16x8(x archsimd.Uint16x8) uint16 {
+	// amd64:`VPHMINPOSUW`
+	return x.ReduceMax()
+}
+
+func reduceMinUint8x16(x archsimd.Uint8x16) uint8 {
+	// amd64:`VPSRLW \$8,` `VPMINUB` `VPHMINPOSUW`
+	return x.ReduceMin()
+}
+
+func reduceMaxUint8x16(x archsimd.Uint8x16) uint8 {
+	// amd64:`VPSRLW \$8,` `VPMINUB` `VPHMINPOSUW`
+	return x.ReduceMax()
+}
+
+func reduceMinFloat32x8(x archsimd.Float32x8) float32 {
+	// amd64:`VMINPS` `VCMPPS \$3,` -`CALL`
+	return x.ReduceMin()
+}
+
+func reduceMaxFloat64x4(x archsimd.Float64x4) float64 {
+	// amd64:`VMAXPD` `VCMPPD \$3,` `VPMAXSD` -`CALL`
+	return x.ReduceMax()
+}
+
+func reduceMinFloat64x2(x archsimd.Float64x2) float64 {
+	// amd64:`VMINPD` `VPOR` -`VCMPPD` -`CALL`
+	return x.ReduceMin()
+}

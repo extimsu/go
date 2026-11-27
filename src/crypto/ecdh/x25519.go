@@ -5,8 +5,12 @@
 package ecdh
 
 import (
-	"crypto/internal/edwards25519/field"
-	"crypto/internal/randutil"
+	"bytes"
+	"crypto/internal/fips140/edwards25519"
+	"crypto/internal/fips140/edwards25519/field"
+	"crypto/internal/fips140only"
+	"crypto/internal/rand"
+	"crypto/subtle"
 	"errors"
 	"io"
 )
@@ -32,45 +36,47 @@ func (c *x25519Curve) String() string {
 	return "X25519"
 }
 
-func (c *x25519Curve) GenerateKey(rand io.Reader) (*PrivateKey, error) {
+func (c *x25519Curve) GenerateKey(r io.Reader) (*PrivateKey, error) {
+	if fips140only.Enforced() {
+		return nil, errors.New("crypto/ecdh: use of X25519 is not allowed in FIPS 140-only mode")
+	}
+	r = rand.CustomReader(r)
 	key := make([]byte, x25519PrivateKeySize)
-	randutil.MaybeReadByte(rand)
-	if _, err := io.ReadFull(rand, key); err != nil {
+	if _, err := io.ReadFull(r, key); err != nil {
 		return nil, err
 	}
 	return c.NewPrivateKey(key)
 }
 
 func (c *x25519Curve) NewPrivateKey(key []byte) (*PrivateKey, error) {
+	if fips140only.Enforced() {
+		return nil, errors.New("crypto/ecdh: use of X25519 is not allowed in FIPS 140-only mode")
+	}
 	if len(key) != x25519PrivateKeySize {
 		return nil, errors.New("crypto/ecdh: invalid private key size")
 	}
+	publicKey := make([]byte, x25519PublicKeySize)
+	x25519ScalarBaseMult(publicKey, key)
+	// We don't check for the all-zero public key here because the scalar is
+	// never zero because of clamping, and the basepoint is not the identity in
+	// the prime-order subgroup(s).
 	return &PrivateKey{
 		curve:      c,
-		privateKey: append([]byte{}, key...),
+		privateKey: bytes.Clone(key),
+		publicKey:  &PublicKey{curve: c, publicKey: publicKey},
 	}, nil
 }
 
-func (c *x25519Curve) privateKeyToPublicKey(key *PrivateKey) *PublicKey {
-	if key.curve != c {
-		panic("crypto/ecdh: internal error: converting the wrong key type")
-	}
-	k := &PublicKey{
-		curve:     key.curve,
-		publicKey: make([]byte, x25519PublicKeySize),
-	}
-	x25519Basepoint := [32]byte{9}
-	x25519ScalarMult(k.publicKey, key.privateKey, x25519Basepoint[:])
-	return k
-}
-
 func (c *x25519Curve) NewPublicKey(key []byte) (*PublicKey, error) {
+	if fips140only.Enforced() {
+		return nil, errors.New("crypto/ecdh: use of X25519 is not allowed in FIPS 140-only mode")
+	}
 	if len(key) != x25519PublicKeySize {
 		return nil, errors.New("crypto/ecdh: invalid public key")
 	}
 	return &PublicKey{
 		curve:     c,
-		publicKey: append([]byte{}, key...),
+		publicKey: bytes.Clone(key),
 	}, nil
 }
 
@@ -83,6 +89,40 @@ func (c *x25519Curve) ecdh(local *PrivateKey, remote *PublicKey) ([]byte, error)
 	return out, nil
 }
 
+func x25519ScalarBaseMult(dst, scalar []byte) {
+	// If BytesMontgomery is available (FIPS 140-3 module v1.28.0+), it's faster
+	// to use edwards25519's precomputed fixed-base scalar multiplication and
+	// then map to Montgomery form.
+	//
+	// We don't need to worry about handling the twist (which X25519 does, and
+	// edwards25519 doesn't) because the basepoint is not on the twist.
+	// Likewise, we don't need to worry about Scalar.SetBytesWithClamping
+	// reducing modulo the prime order of the curve because the basepoint is in
+	// the prime-order subgroup and doesn't need cofactor clearing.
+	p := new(edwards25519.Point)
+	if p, ok := any(p).(interface {
+		BytesMontgomery() []byte
+		ScalarBaseMult(scalar *edwards25519.Scalar) *edwards25519.Point
+	}); ok {
+		var err error
+		subtle.WithDataIndependentTiming(func() {
+			var s *edwards25519.Scalar
+			s, err = edwards25519.NewScalar().SetBytesWithClamping(scalar)
+			if err != nil {
+				return
+			}
+			p.ScalarBaseMult(s)
+			copy(dst, p.BytesMontgomery())
+		})
+		if err != nil {
+			panic("crypto/ecdh: internal error: invalid scalar length")
+		}
+	} else {
+		x25519Basepoint := [32]byte{9}
+		x25519ScalarMult(dst, scalar, x25519Basepoint[:])
+	}
+}
+
 func x25519ScalarMult(dst, scalar, point []byte) {
 	var e [32]byte
 
@@ -92,45 +132,56 @@ func x25519ScalarMult(dst, scalar, point []byte) {
 	e[31] |= 64
 
 	var x1, x2, z2, x3, z3, tmp0, tmp1 field.Element
-	x1.SetBytes(point[:])
-	x2.One()
-	x3.Set(&x1)
-	z3.One()
+	subtle.WithDataIndependentTiming(func() {
+		x1.SetBytes(point[:])
+		x2.One()
+		x3.Set(&x1)
+		z3.One()
 
-	swap := 0
-	for pos := 254; pos >= 0; pos-- {
-		b := e[pos/8] >> uint(pos&7)
-		b &= 1
-		swap ^= int(b)
+		swap := 0
+		for pos := 254; pos >= 0; pos-- {
+			b := e[pos/8] >> uint(pos&7)
+			b &= 1
+			swap ^= int(b)
+			x2.Swap(&x3, swap)
+			z2.Swap(&z3, swap)
+			swap = int(b)
+
+			tmp0.Subtract(&x3, &z3)
+			tmp1.Subtract(&x2, &z2)
+			x2.Add(&x2, &z2)
+			z2.Add(&x3, &z3)
+			z3.Multiply(&tmp0, &x2)
+			z2.Multiply(&z2, &tmp1)
+			tmp0.Square(&tmp1)
+			tmp1.Square(&x2)
+			x3.Add(&z3, &z2)
+			z2.Subtract(&z3, &z2)
+			x2.Multiply(&tmp1, &tmp0)
+			tmp1.Subtract(&tmp1, &tmp0)
+			z2.Square(&z2)
+
+			z3.Mult32(&tmp1, 121666)
+			x3.Square(&x3)
+			tmp0.Add(&tmp0, &z3)
+			z3.Multiply(&x1, &z2)
+			z2.Multiply(&tmp1, &tmp0)
+		}
+
 		x2.Swap(&x3, swap)
 		z2.Swap(&z3, swap)
-		swap = int(b)
 
-		tmp0.Subtract(&x3, &z3)
-		tmp1.Subtract(&x2, &z2)
-		x2.Add(&x2, &z2)
-		z2.Add(&x3, &z3)
-		z3.Multiply(&tmp0, &x2)
-		z2.Multiply(&z2, &tmp1)
-		tmp0.Square(&tmp1)
-		tmp1.Square(&x2)
-		x3.Add(&z3, &z2)
-		z2.Subtract(&z3, &z2)
-		x2.Multiply(&tmp1, &tmp0)
-		tmp1.Subtract(&tmp1, &tmp0)
-		z2.Square(&z2)
+		z2.Invert(&z2)
+		x2.Multiply(&x2, &z2)
+		copy(dst[:], x2.Bytes())
+	})
+}
 
-		z3.Mult32(&tmp1, 121666)
-		x3.Square(&x3)
-		tmp0.Add(&tmp0, &z3)
-		z3.Multiply(&x1, &z2)
-		z2.Multiply(&tmp1, &tmp0)
+// isZero reports whether x is all zeroes in constant time.
+func isZero(x []byte) bool {
+	var acc byte
+	for _, b := range x {
+		acc |= b
 	}
-
-	x2.Swap(&x3, swap)
-	z2.Swap(&z3, swap)
-
-	z2.Invert(&z2)
-	x2.Multiply(&x2, &z2)
-	copy(dst[:], x2.Bytes())
+	return acc == 0
 }

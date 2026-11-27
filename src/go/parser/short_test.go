@@ -114,6 +114,29 @@ var valids = []string{
 	`package p; type I1[T any] interface{}; type I2[T any] interface{ I1[T] }`,
 	`package p; type _ interface { N[T] }`,
 	`package p; type T[P any] = T0`,
+
+	// go.dev/issue/83203: accepted by the parser, but mostly not valid Go
+	`package p; var _ = func()(T)[x]`,
+	`package p; var _ = func()(T)[x:y]`,
+	`package p; var _ = func()(p.T)[x]`,
+	`package p; var _ = func()(T).m`,
+	`package p; var _ = func()(T).(U)`,
+	`package p; var _ = func()(*T).m`,
+	`package p; var _ = func()()[x]`,
+	`package p; var _ = func()() * x`,
+	`package p; var _ = func() func()(T)[x]`,
+	`package p; var _ = []func()(T)[x]`,
+	`package p; var _ = chan func()()(x)`,
+	`package p; func _() { func()() <- x }`,
+	`package p; var _ = x * func()() * y`,
+	`package p; var _ = x + x * func()() * y`,
+	`package p; var _ = func()(p.T).m`,
+	`package p; var _ = func()(p.T).(U)`,
+	`package p; var _ = func()(T[int])[x]`,
+	`package p; var _ = func()(struct{})[x]`,
+	`package p; var _ = func()(T, U)[x]`,
+	`package p; var _ = func()(T) * x`,
+	`package p; var _ = []func()(T)(x)`,
 }
 
 func TestValid(t *testing.T) {
@@ -190,6 +213,14 @@ var invalids = []string{
 	`package p; func f() { if true {} else ; /* ERROR "expected if statement or block" */ }`,
 	`package p; func f() { if true {} else defer /* ERROR "expected if statement or block" */ f() }`,
 
+	// variadic parameter lists
+	`package p; func f(a, b ... /* ERROR "can only use ... with final parameter" */ int)`,
+	`package p; func f(a ... /* ERROR "can only use ... with final parameter" */ int, b int)`,
+	`package p; func f(... /* ERROR "can only use ... with final parameter" */ int, int)`,
+	`package p; func f() (... /* ERROR "invalid use of ..." */ int)`,
+	`package p; func f() (a, b ... /* ERROR "invalid use of ..." */ int)`,
+	`package p; func f[T ... /* ERROR "invalid use of ..." */ C]()() {}`,
+
 	// generic code
 	`package p; type _[_ any] int; var _ = T[] /* ERROR "expected operand" */ {}`,
 	`package p; var _ func[ /* ERROR "must have no type parameters" */ T any](T)`,
@@ -199,11 +230,15 @@ var invalids = []string{
 
 	`package p; func _[type /* ERROR "found 'type'" */ P, *Q interface{}]()`,
 
-	`package p; func (T) _[ /* ERROR "must have no type parameters" */ A, B any](a A) B`,
-	`package p; func (T) _[ /* ERROR "must have no type parameters" */ A, B C](a A) B`,
-	`package p; func (T) _[ /* ERROR "must have no type parameters" */ A, B C[A, B]](a A) B`,
+	`package p; func (T) _[A, B any](a A) B`,
+	`package p; func (T) _[A, B C](a A) B`,
+	`package p; func (T) _[A, B C[A, B]](a A) B`,
 
 	`package p; func(*T[e, e /* ERROR "e redeclared" */ ]) _()`,
+
+	// go.dev/issue/70957
+	`package p; func f() {goto; /* ERROR "expected 'IDENT', found ';'" */ }`,
+	`package p; func f() {goto} /* ERROR "expected 'IDENT', found '}'" */ }`,
 }
 
 func TestInvalid(t *testing.T) {

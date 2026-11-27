@@ -134,7 +134,20 @@ var stringTests = [][2]string{
 	dup("package p; type _ chan<- <-chan int"),
 	dup("package p; type _ chan<- chan<- int"),
 
-	// TODO(gri) expand
+	// go.dev/issues/69206
+	dup("package p; type _[P C] int"),
+	{"package p; type _[P (C),] int", "package p; type _[P C] int"},
+	{"package p; type _[P ((C)),] int", "package p; type _[P C] int"},
+	{"package p; type _[P, Q ((C))] int", "package p; type _[P, Q C] int"},
+
+	// go.dev/issues/81633
+	{"package p; import ()", "package p"},
+	{"package p; const ()", "package p"},
+	{"package p; type ()", "package p"},
+	{"package p; var ()", "package p"},
+	{"package p; func _() { const () }", "package p; func _() { }"},
+	{"package p; func _() { type () }", "package p; func _() { }"},
+	{"package p; func _() { var () }", "package p; func _() { }"},
 }
 
 func TestPrintString(t *testing.T) {

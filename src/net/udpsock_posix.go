@@ -152,10 +152,7 @@ func (c *UDPConn) writeToAddrPort(b []byte, addr netip.AddrPort) (int, error) {
 		}
 		return c.fd.writeToInet4(b, &sa)
 	case syscall.AF_INET6:
-		sa, err := addrPortToSockaddrInet6(addr)
-		if err != nil {
-			return 0, err
-		}
+		sa := addrPortToSockaddrInet6(addr)
 		return c.fd.writeToInet6(b, &sa)
 	default:
 		return 0, &AddrError{Err: "invalid address family", Addr: addr.Addr().String()}
@@ -186,17 +183,22 @@ func (c *UDPConn) writeMsgAddrPort(b, oob []byte, addr netip.AddrPort) (n, oobn 
 
 	switch c.fd.family {
 	case syscall.AF_INET:
-		sa, err := addrPortToSockaddrInet4(addr)
-		if err != nil {
-			return 0, 0, err
+		var sap *syscall.SockaddrInet4
+		if addr.IsValid() {
+			sa, err := addrPortToSockaddrInet4(addr)
+			if err != nil {
+				return 0, 0, err
+			}
+			sap = &sa
 		}
-		return c.fd.writeMsgInet4(b, oob, &sa)
+		return c.fd.writeMsgInet4(b, oob, sap)
 	case syscall.AF_INET6:
-		sa, err := addrPortToSockaddrInet6(addr)
-		if err != nil {
-			return 0, 0, err
+		var sap *syscall.SockaddrInet6
+		if addr.IsValid() {
+			sa := addrPortToSockaddrInet6(addr)
+			sap = &sa
 		}
-		return c.fd.writeMsgInet6(b, oob, &sa)
+		return c.fd.writeMsgInet6(b, oob, sap)
 	default:
 		return 0, 0, &AddrError{Err: "invalid address family", Addr: addr.Addr().String()}
 	}
@@ -205,7 +207,7 @@ func (c *UDPConn) writeMsgAddrPort(b, oob []byte, addr netip.AddrPort) (n, oobn 
 func (sd *sysDialer) dialUDP(ctx context.Context, laddr, raddr *UDPAddr) (*UDPConn, error) {
 	ctrlCtxFn := sd.Dialer.ControlContext
 	if ctrlCtxFn == nil && sd.Dialer.Control != nil {
-		ctrlCtxFn = func(cxt context.Context, network, address string, c syscall.RawConn) error {
+		ctrlCtxFn = func(ctx context.Context, network, address string, c syscall.RawConn) error {
 			return sd.Dialer.Control(network, address, c)
 		}
 	}
@@ -217,9 +219,9 @@ func (sd *sysDialer) dialUDP(ctx context.Context, laddr, raddr *UDPAddr) (*UDPCo
 }
 
 func (sl *sysListener) listenUDP(ctx context.Context, laddr *UDPAddr) (*UDPConn, error) {
-	var ctrlCtxFn func(cxt context.Context, network, address string, c syscall.RawConn) error
+	var ctrlCtxFn func(ctx context.Context, network, address string, c syscall.RawConn) error
 	if sl.ListenConfig.Control != nil {
-		ctrlCtxFn = func(cxt context.Context, network, address string, c syscall.RawConn) error {
+		ctrlCtxFn = func(ctx context.Context, network, address string, c syscall.RawConn) error {
 			return sl.ListenConfig.Control(network, address, c)
 		}
 	}
@@ -231,9 +233,9 @@ func (sl *sysListener) listenUDP(ctx context.Context, laddr *UDPAddr) (*UDPConn,
 }
 
 func (sl *sysListener) listenMulticastUDP(ctx context.Context, ifi *Interface, gaddr *UDPAddr) (*UDPConn, error) {
-	var ctrlCtxFn func(cxt context.Context, network, address string, c syscall.RawConn) error
+	var ctrlCtxFn func(ctx context.Context, network, address string, c syscall.RawConn) error
 	if sl.ListenConfig.Control != nil {
-		ctrlCtxFn = func(cxt context.Context, network, address string, c syscall.RawConn) error {
+		ctrlCtxFn = func(ctx context.Context, network, address string, c syscall.RawConn) error {
 			return sl.ListenConfig.Control(network, address, c)
 		}
 	}

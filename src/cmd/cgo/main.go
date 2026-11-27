@@ -17,23 +17,29 @@ import (
 	"go/printer"
 	"go/token"
 	"internal/buildcfg"
+	"internal/platform"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 
 	"cmd/internal/edit"
-	"cmd/internal/notsha256"
+	"cmd/internal/hash"
 	"cmd/internal/objabi"
+	"cmd/internal/par"
+	"cmd/internal/telemetry/counter"
 )
 
 // A Package collects information about the package we're going to write.
 type Package struct {
 	PackageName string // name of package
 	PackagePath string
+	fset        *token.FileSet
 	PtrSize     int64
 	IntSize     int64
 	GccOptions  []string
@@ -46,10 +52,9 @@ type Package struct {
 	GoFiles     []string        // list of Go files
 	GccFiles    []string        // list of gcc output files
 	Preamble    string          // collected preamble for _cgo_export.h
-	typedefs    map[string]bool // type names that appear in the types of the objects we're interested in
-	typedefList []typedefInfo
 	noCallbacks map[string]bool // C function names with #cgo nocallback directive
 	noEscapes   map[string]bool // C function names with #cgo noescape directive
+	genFiles    []*File         // input files for -gen-binding
 }
 
 // A typedefInfo is an element on Package.typedefList: a typedef name
@@ -61,18 +66,24 @@ type typedefInfo struct {
 
 // A File collects information about a single Go input file.
 type File struct {
-	AST         *ast.File           // parsed AST
-	Comments    []*ast.CommentGroup // comments from file
-	Package     string              // Package name
-	Preamble    string              // C preamble (doc comment on import "C")
-	Ref         []*Ref              // all references to C.xxx in AST
-	Calls       []*Call             // all calls to C.xxx in AST
-	ExpFunc     []*ExpFunc          // exported functions for this file
-	Name        map[string]*Name    // map from Go name to Name
-	NamePos     map[*Name]token.Pos // map from Name to position of the first reference
-	NoCallbacks map[string]bool     // C function names that with #cgo nocallback directive
-	NoEscapes   map[string]bool     // C function names that with #cgo noescape directive
+	AST         *ast.File                  // parsed AST
+	Comments    []*ast.CommentGroup        // comments from file
+	Package     string                     // Package name
+	Preamble    string                     // C preamble (doc comment on import "C")
+	Ref         []*Ref                     // all references to C.xxx in AST
+	Calls       []*Call                    // all calls to C.xxx in AST
+	Lits        []*Lit                     // all  C.xxx{...} literals in AST
+	LitMap      map[*ast.CompositeLit]*Lit // composite literals can be rewritten in TWO WAYS, use this to find and mark done.
+	ExpFunc     []*ExpFunc                 // exported functions for this file
+	Name        map[string]*Name           // map from Go name to Name
+	NamePos     map[*Name]token.Pos        // map from Name to position of the first reference
+	NoCallbacks map[string]bool            // C function names with #cgo nocallback directive
+	NoEscapes   map[string]bool            // C function names with #cgo noescape directive
 	Edit        *edit.Buffer
+
+	debugs []*debug // debug data from iterations of gccDebug. Initialized by File.loadDebug.
+
+	gen *genBindingFile // input for -gen-binding
 }
 
 func (f *File) offset(p token.Pos) int {
@@ -80,7 +91,7 @@ func (f *File) offset(p token.Pos) int {
 }
 
 func nameKeys(m map[string]*Name) []string {
-	var ks []string
+	ks := make([]string, 0, len(m))
 	for k := range m {
 		ks = append(ks, k)
 	}
@@ -93,6 +104,12 @@ type Call struct {
 	Call     *ast.CallExpr
 	Deferred bool
 	Done     bool
+}
+
+// A Lit refers to a composite literal of a C.xxx type in the AST.
+type Lit struct {
+	Lit  *ast.CompositeLit
+	Done bool
 }
 
 // A Ref refers to an expression of the form C.xxx in the AST.
@@ -144,7 +161,7 @@ type ExpFunc struct {
 // A TypeRepr contains the string representation of a type.
 type TypeRepr struct {
 	Repr       string
-	FormatArgs []interface{}
+	FormatArgs []any
 }
 
 // A Type collects information about a type in both the C and Go worlds.
@@ -158,11 +175,36 @@ type Type struct {
 	BadPointer bool // this pointer type should be represented as a uintptr (deprecated)
 }
 
+func (t *Type) fuzzyMatch(t2 *Type) bool {
+	if t == nil || t2 == nil {
+		return false
+	}
+	return t.Size == t2.Size && t.Align == t2.Align
+}
+
 // A FuncType collects information about a function type in both the C and Go worlds.
 type FuncType struct {
 	Params []*Type
 	Result *Type
 	Go     *ast.FuncType
+}
+
+func (t *FuncType) fuzzyMatch(t2 *FuncType) bool {
+	if t == nil || t2 == nil {
+		return false
+	}
+	if !t.Result.fuzzyMatch(t2.Result) {
+		return false
+	}
+	if len(t.Params) != len(t2.Params) {
+		return false
+	}
+	for i := range t.Params {
+		if !t.Params[i].fuzzyMatch(t2.Params[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 func usage() {
@@ -242,6 +284,13 @@ var objDir = flag.String("objdir", "", "object directory")
 var importPath = flag.String("importpath", "", "import path of package being built (for comments in generated files)")
 var exportHeader = flag.String("exportheader", "", "where to write export header if any exported functions")
 
+var binding = flag.Bool("binding", false, "generate code for //cgo: binding pragmas without a C compiler")
+
+var genBinding = flag.Bool("gen-binding", false, "generate a Go binding file from the //cgo: pragmas in a package's Go files and their C headers")
+
+var ldflags = flag.String("ldflags", "", "flags to pass to C linker")
+var ldflagsSet bool
+
 var gccgo = flag.Bool("gccgo", false, "generate files for use with gccgo")
 var gccgoprefix = flag.String("gccgoprefix", "", "-fgo-prefix option used with gccgo")
 var gccgopkgpath = flag.String("gccgopkgpath", "", "-fgo-pkgpath option used with gccgo")
@@ -255,8 +304,11 @@ var goarch, goos, gomips, gomips64 string
 var gccBaseCmd []string
 
 func main() {
+	counter.Open()
 	objabi.AddVersionFlag() // -V
 	objabi.Flagparse(usage)
+	counter.Inc("cgo/invocations")
+	counter.CountFlags("cgo/flag:", *flag.CommandLine)
 
 	if *gccgoDefineCgoIncomplete {
 		if !*gccgo {
@@ -279,11 +331,15 @@ func main() {
 		return
 	}
 
-	if *godefs {
+	if *godefs || *genBinding {
 		// Generating definitions pulled from header files,
 		// to be checked into Go repositories.
 		// Line numbers are just noise.
 		conf.Mode &^= printer.SourcePos
+	}
+
+	if *objDir == "" {
+		*objDir = "_obj"
 	}
 
 	args := flag.Args()
@@ -309,16 +365,61 @@ func main() {
 	copy(osArgs, os.Args[:])
 	goFiles := args[i:]
 
-	for _, arg := range args[:i] {
-		if arg == "-fsanitize=thread" {
-			tsanProlog = yesTsanProlog
+	p := newPackage(args[:i], fset)
+
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "ldflags" {
+			ldflagsSet = true
 		}
-		if arg == "-fsanitize=memory" {
-			msanProlog = yesMsanProlog
+	})
+
+	// Record linker flags for external linking.
+	if *ldflags != "" {
+		args, err := splitQuoted(*ldflags)
+		if err != nil {
+			fatalf("bad -ldflags option: %q (%s)", *ldflags, err)
 		}
+		p.addToFlag("LDFLAGS", args)
 	}
 
-	p := newPackage(args[:i])
+	// For backward compatibility for Bazel, record CGO_LDFLAGS
+	// from the environment for external linking.
+	// This should not happen with cmd/go, which removes CGO_LDFLAGS
+	// from the environment when invoking cgo.
+	// This can be removed when we no longer need to support
+	// older versions of Bazel. See issue #66456 and
+	// https://github.com/bazelbuild/rules_go/issues/3979.
+	if envFlags := os.Getenv("CGO_LDFLAGS"); envFlags != "" {
+		args, err := splitQuoted(envFlags)
+		if err != nil {
+			fatalf("bad CGO_LDFLAGS: %q (%s)", envFlags, err)
+		}
+		p.addToFlag("LDFLAGS", args)
+	}
+
+	if *genBinding && (*binding || *godefs) {
+		fatalf("-gen-binding cannot be combined with -binding or -godefs")
+	}
+
+	if *binding {
+		if !buildcfg.Experiment.CgoBindings {
+			fatalf("-binding requires GOEXPERIMENT=cgobindings")
+		}
+		if !platform.CgoSupported(goos, goarch) || platform.Broken(goos, goarch) {
+			fatalf("-binding is not supported on %s/%s", goos, goarch)
+		}
+		p.processBinding(goFiles)
+		return
+	}
+
+	if *genBinding {
+		if !buildcfg.Experiment.CgoBindings {
+			fatalf("-gen-binding requires GOEXPERIMENT=cgobindings")
+		}
+		if !platform.CgoSupported(goos, goarch) || platform.Broken(goos, goarch) {
+			fatalf("-gen-binding is not supported on %s/%s", goos, goarch)
+		}
+	}
 
 	// We need a C compiler to be available. Check this.
 	var err error
@@ -328,22 +429,15 @@ func main() {
 		os.Exit(2)
 	}
 
-	// Record CGO_LDFLAGS from the environment for external linking.
-	if ldflags := os.Getenv("CGO_LDFLAGS"); ldflags != "" {
-		args, err := splitQuoted(ldflags)
-		if err != nil {
-			fatalf("bad CGO_LDFLAGS: %q (%s)", ldflags, err)
-		}
-		p.addToFlag("LDFLAGS", args)
-	}
-
 	// Need a unique prefix for the global C symbols that
 	// we use to coordinate between gcc and ourselves.
 	// We already put _cgo_ at the beginning, so the main
 	// concern is other cgo wrappers for the same functions.
-	// Use the beginning of the notsha256 of the input to disambiguate.
-	h := notsha256.New()
+	// Use the beginning of the 16 bytes hash of the input to disambiguate.
+	h := hash.New32()
 	io.WriteString(h, *importPath)
+	var once sync.Once
+	q := par.NewQueue(runtime.GOMAXPROCS(0))
 	fs := make([]*File, len(goFiles))
 	for i, input := range goFiles {
 		if *srcDir != "" {
@@ -356,6 +450,11 @@ func main() {
 		if aname, err := filepath.Abs(input); err == nil {
 			input = aname
 		}
+		if *genBinding {
+			// As when cmd/go runs cgo, let the preamble include headers
+			// from the directory of the Go file.
+			p.addToFlag("CFLAGS", []string{"-I", filepath.Dir(input)})
+		}
 
 		b, err := os.ReadFile(input)
 		if err != nil {
@@ -365,35 +464,55 @@ func main() {
 			fatalf("%s", err)
 		}
 
-		// Apply trimpath to the file path. The path won't be read from after this point.
-		input, _ = objabi.ApplyRewrites(input, *trimpath)
-		if strings.ContainsAny(input, "\r\n") {
-			// ParseGo, (*Package).writeOutput, and printer.Fprint in SourcePos mode
-			// all emit line directives, which don't permit newlines in the file path.
-			// Bail early if we see anything newline-like in the trimmed path.
-			fatalf("input path contains newline character: %q", input)
-		}
-		goFiles[i] = input
+		origDir := filepath.Dir(input)
+		q.Add(func() {
+			// Apply trimpath to the file path. The path won't be read from after this point.
+			input, _ = objabi.ApplyRewrites(input, *trimpath)
+			if strings.ContainsAny(input, "\r\n") {
+				// ParseGo, (*Package).writeOutput, and printer.Fprint in SourcePos mode
+				// all emit line directives, which don't permit newlines in the file path.
+				// Bail early if we see anything newline-like in the trimmed path.
+				fatalf("input path contains newline character: %q", input)
+			}
+			goFiles[i] = input
 
-		f := new(File)
-		f.Edit = edit.NewBuffer(b)
-		f.ParseGo(input, b)
-		f.ProcessCgoDirectives()
-		fs[i] = f
+			f := new(File)
+			if *genBinding && !genBindingImportsC(input, b) {
+				// A Go file of the package that does not use cgo.
+				// It may declare Go names bound by the pragmas.
+				f.useGenBindingPragmas(input, origDir, b)
+				fs[i] = f
+				return
+			}
+			f.Edit = edit.NewBuffer(b)
+			f.LitMap = make(map[*ast.CompositeLit]*Lit)
+			f.ParseGo(input, b)
+			if *genBinding {
+				f.useGenBindingPragmas(input, origDir, b)
+			}
+			f.ProcessCgoDirectives(p)
+			gccIsClang := f.loadDefines(p.GccOptions)
+			once.Do(func() {
+				p.GccIsClang = gccIsClang
+			})
+
+			fs[i] = f
+
+			f.loadDebug(p)
+		})
 	}
+
+	<-q.Idle()
 
 	cPrefix = fmt.Sprintf("_%x", h.Sum(nil)[0:6])
 
-	if *objDir == "" {
-		// make sure that _obj directory exists, so that we can write
-		// all the output files there.
-		os.Mkdir("_obj", 0777)
-		*objDir = "_obj"
-	}
-	*objDir += string(filepath.Separator)
-
 	for i, input := range goFiles {
 		f := fs[i]
+		if f.AST == nil {
+			// A -gen-binding input file that does not import "C".
+			p.genFiles = append(p.genFiles, f)
+			continue
+		}
 		p.Translate(f)
 		for _, cref := range f.Ref {
 			switch cref.Context {
@@ -413,6 +532,8 @@ func main() {
 		p.Record(f)
 		if *godefs {
 			os.Stdout.WriteString(p.godefs(f, osArgs))
+		} else if *genBinding {
+			p.genFiles = append(p.genFiles, f)
 		} else {
 			p.writeOutput(f, input)
 		}
@@ -437,6 +558,17 @@ func main() {
 		}
 	}
 
+	if *genBinding {
+		if nerrors > 0 {
+			os.Exit(2)
+		}
+		p.writeBinding(os.Stdout)
+		if nerrors > 0 {
+			os.Exit(2)
+		}
+		return
+	}
+
 	if !*godefs {
 		p.writeDefs()
 	}
@@ -447,7 +579,7 @@ func main() {
 
 // newPackage returns a new Package that will invoke
 // gcc with the additional arguments specified in args.
-func newPackage(args []string) *Package {
+func newPackage(args []string, fset *token.FileSet) *Package {
 	goarch = runtime.GOARCH
 	if s := os.Getenv("GOARCH"); s != "" {
 		goarch = s
@@ -473,6 +605,7 @@ func newPackage(args []string) *Package {
 	os.Setenv("LC_ALL", "C")
 
 	p := &Package{
+		fset:        fset,
 		PtrSize:     ptrSize,
 		IntSize:     intSize,
 		Written:     make(map[string]bool),
@@ -494,30 +627,52 @@ func (p *Package) Record(f *File) {
 	if p.Name == nil {
 		p.Name = f.Name
 	} else {
+		// Merge the new file's names in with the existing names.
 		for k, v := range f.Name {
 			if p.Name[k] == nil {
+				// Never seen before, just save it.
 				p.Name[k] = v
-			} else if p.incompleteTypedef(p.Name[k].Type) {
+			} else if p.incompleteTypedef(p.Name[k].Type) && p.Name[k].FuncType == nil {
+				// Old one is incomplete, just use new one.
 				p.Name[k] = v
-			} else if p.incompleteTypedef(v.Type) {
+			} else if p.incompleteTypedef(v.Type) && v.FuncType == nil {
+				// New one is incomplete, just use old one.
 				// Nothing to do.
 			} else if _, ok := nameToC[k]; ok {
 				// Names we predefine may appear inconsistent
 				// if some files typedef them and some don't.
 				// Issue 26743.
 			} else if !reflect.DeepEqual(p.Name[k], v) {
-				error_(token.NoPos, "inconsistent definitions for C.%s", fixGo(k))
+				// We don't require strict func type equality, because some functions
+				// can have things like typedef'd arguments that are equivalent to
+				// the standard arguments. e.g.
+				//     int usleep(unsigned);
+				//     int usleep(useconds_t);
+				// So we just check size/alignment of arguments. At least that
+				// avoids problems like those in #67670 and #67699.
+				ok := false
+				ft1 := p.Name[k].FuncType
+				ft2 := v.FuncType
+				if ft1.fuzzyMatch(ft2) {
+					// Retry DeepEqual with the FuncType field cleared.
+					x1 := *p.Name[k]
+					x2 := *v
+					x1.FuncType = nil
+					x2.FuncType = nil
+					if reflect.DeepEqual(&x1, &x2) {
+						ok = true
+					}
+				}
+				if !ok {
+					error_(token.NoPos, "inconsistent definitions for C.%s", fixGo(k))
+				}
 			}
 		}
 	}
 
 	// merge nocallback & noescape
-	for k, v := range f.NoCallbacks {
-		p.noCallbacks[k] = v
-	}
-	for k, v := range f.NoEscapes {
-		p.noEscapes[k] = v
-	}
+	maps.Copy(p.noCallbacks, f.NoCallbacks)
+	maps.Copy(p.noEscapes, f.NoEscapes)
 
 	if f.ExpFunc != nil {
 		p.ExpFunc = append(p.ExpFunc, f.ExpFunc...)

@@ -8,14 +8,13 @@ import (
 	"encoding/binary"
 	"fmt"
 	"internal/abi"
-	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 
 	"cmd/compile/internal/base"
 	"cmd/compile/internal/bitvec"
-	"cmd/compile/internal/compare"
 	"cmd/compile/internal/ir"
 	"cmd/compile/internal/objw"
 	"cmd/compile/internal/rttype"
@@ -23,7 +22,6 @@ import (
 	"cmd/compile/internal/typebits"
 	"cmd/compile/internal/typecheck"
 	"cmd/compile/internal/types"
-	"cmd/internal/gcprog"
 	"cmd/internal/obj"
 	"cmd/internal/objabi"
 	"cmd/internal/src"
@@ -55,28 +53,10 @@ type typeSig struct {
 	mtype *types.Type
 }
 
-// Builds a type representing a Bucket structure for
-// the given map type. This type is not visible to users -
-// we include only enough information to generate a correct GC
-// program for it.
-// Make sure this stays in sync with runtime/map.go.
-//
-//	A "bucket" is a "struct" {
-//	      tophash [BUCKETSIZE]uint8
-//	      keys [BUCKETSIZE]keyType
-//	      elems [BUCKETSIZE]elemType
-//	      overflow *bucket
-//	    }
-const (
-	BUCKETSIZE  = abi.MapBucketCount
-	MAXKEYSIZE  = abi.MapMaxKeyBytes
-	MAXELEMSIZE = abi.MapMaxElemBytes
-)
-
 func commonSize() int { return int(rttype.Type.Size()) } // Sizeof(runtime._type{})
 
 func uncommonSize(t *types.Type) int { // Sizeof(runtime.uncommontype{})
-	if t.Sym() == nil && len(methods(t)) == 0 {
+	if t.TFlag()&abi.TFlagUncommon == 0 {
 		return 0
 	}
 	return int(rttype.UncommonType.Size())
@@ -85,230 +65,6 @@ func uncommonSize(t *types.Type) int { // Sizeof(runtime.uncommontype{})
 func makefield(name string, t *types.Type) *types.Field {
 	sym := (*types.Pkg)(nil).Lookup(name)
 	return types.NewField(src.NoXPos, sym, t)
-}
-
-// MapBucketType makes the map bucket type given the type of the map.
-func MapBucketType(t *types.Type) *types.Type {
-	if t.MapType().Bucket != nil {
-		return t.MapType().Bucket
-	}
-
-	keytype := t.Key()
-	elemtype := t.Elem()
-	types.CalcSize(keytype)
-	types.CalcSize(elemtype)
-	if keytype.Size() > MAXKEYSIZE {
-		keytype = types.NewPtr(keytype)
-	}
-	if elemtype.Size() > MAXELEMSIZE {
-		elemtype = types.NewPtr(elemtype)
-	}
-
-	field := make([]*types.Field, 0, 5)
-
-	// The first field is: uint8 topbits[BUCKETSIZE].
-	arr := types.NewArray(types.Types[types.TUINT8], BUCKETSIZE)
-	field = append(field, makefield("topbits", arr))
-
-	arr = types.NewArray(keytype, BUCKETSIZE)
-	arr.SetNoalg(true)
-	keys := makefield("keys", arr)
-	field = append(field, keys)
-
-	arr = types.NewArray(elemtype, BUCKETSIZE)
-	arr.SetNoalg(true)
-	elems := makefield("elems", arr)
-	field = append(field, elems)
-
-	// If keys and elems have no pointers, the map implementation
-	// can keep a list of overflow pointers on the side so that
-	// buckets can be marked as having no pointers.
-	// Arrange for the bucket to have no pointers by changing
-	// the type of the overflow field to uintptr in this case.
-	// See comment on hmap.overflow in runtime/map.go.
-	otyp := types.Types[types.TUNSAFEPTR]
-	if !elemtype.HasPointers() && !keytype.HasPointers() {
-		otyp = types.Types[types.TUINTPTR]
-	}
-	overflow := makefield("overflow", otyp)
-	field = append(field, overflow)
-
-	// link up fields
-	bucket := types.NewStruct(field[:])
-	bucket.SetNoalg(true)
-	types.CalcSize(bucket)
-
-	// Check invariants that map code depends on.
-	if !types.IsComparable(t.Key()) {
-		base.Fatalf("unsupported map key type for %v", t)
-	}
-	if BUCKETSIZE < 8 {
-		base.Fatalf("bucket size %d too small for proper alignment %d", BUCKETSIZE, 8)
-	}
-	if uint8(keytype.Alignment()) > BUCKETSIZE {
-		base.Fatalf("key align too big for %v", t)
-	}
-	if uint8(elemtype.Alignment()) > BUCKETSIZE {
-		base.Fatalf("elem align %d too big for %v, BUCKETSIZE=%d", elemtype.Alignment(), t, BUCKETSIZE)
-	}
-	if keytype.Size() > MAXKEYSIZE {
-		base.Fatalf("key size too large for %v", t)
-	}
-	if elemtype.Size() > MAXELEMSIZE {
-		base.Fatalf("elem size too large for %v", t)
-	}
-	if t.Key().Size() > MAXKEYSIZE && !keytype.IsPtr() {
-		base.Fatalf("key indirect incorrect for %v", t)
-	}
-	if t.Elem().Size() > MAXELEMSIZE && !elemtype.IsPtr() {
-		base.Fatalf("elem indirect incorrect for %v", t)
-	}
-	if keytype.Size()%keytype.Alignment() != 0 {
-		base.Fatalf("key size not a multiple of key align for %v", t)
-	}
-	if elemtype.Size()%elemtype.Alignment() != 0 {
-		base.Fatalf("elem size not a multiple of elem align for %v", t)
-	}
-	if uint8(bucket.Alignment())%uint8(keytype.Alignment()) != 0 {
-		base.Fatalf("bucket align not multiple of key align %v", t)
-	}
-	if uint8(bucket.Alignment())%uint8(elemtype.Alignment()) != 0 {
-		base.Fatalf("bucket align not multiple of elem align %v", t)
-	}
-	if keys.Offset%keytype.Alignment() != 0 {
-		base.Fatalf("bad alignment of keys in bmap for %v", t)
-	}
-	if elems.Offset%elemtype.Alignment() != 0 {
-		base.Fatalf("bad alignment of elems in bmap for %v", t)
-	}
-
-	// Double-check that overflow field is final memory in struct,
-	// with no padding at end.
-	if overflow.Offset != bucket.Size()-int64(types.PtrSize) {
-		base.Fatalf("bad offset of overflow in bmap for %v, overflow.Offset=%d, bucket.Size()-int64(types.PtrSize)=%d",
-			t, overflow.Offset, bucket.Size()-int64(types.PtrSize))
-	}
-
-	t.MapType().Bucket = bucket
-
-	bucket.StructType().Map = t
-	return bucket
-}
-
-var hmapType *types.Type
-
-// MapType returns a type interchangeable with runtime.hmap.
-// Make sure this stays in sync with runtime/map.go.
-func MapType() *types.Type {
-	if hmapType != nil {
-		return hmapType
-	}
-
-	// build a struct:
-	// type hmap struct {
-	//    count      int
-	//    flags      uint8
-	//    B          uint8
-	//    noverflow  uint16
-	//    hash0      uint32
-	//    buckets    unsafe.Pointer
-	//    oldbuckets unsafe.Pointer
-	//    nevacuate  uintptr
-	//    extra      unsafe.Pointer // *mapextra
-	// }
-	// must match runtime/map.go:hmap.
-	fields := []*types.Field{
-		makefield("count", types.Types[types.TINT]),
-		makefield("flags", types.Types[types.TUINT8]),
-		makefield("B", types.Types[types.TUINT8]),
-		makefield("noverflow", types.Types[types.TUINT16]),
-		makefield("hash0", types.Types[types.TUINT32]),      // Used in walk.go for OMAKEMAP.
-		makefield("buckets", types.Types[types.TUNSAFEPTR]), // Used in walk.go for OMAKEMAP.
-		makefield("oldbuckets", types.Types[types.TUNSAFEPTR]),
-		makefield("nevacuate", types.Types[types.TUINTPTR]),
-		makefield("extra", types.Types[types.TUNSAFEPTR]),
-	}
-
-	n := ir.NewDeclNameAt(src.NoXPos, ir.OTYPE, ir.Pkgs.Runtime.Lookup("hmap"))
-	hmap := types.NewNamed(n)
-	n.SetType(hmap)
-	n.SetTypecheck(1)
-
-	hmap.SetUnderlying(types.NewStruct(fields))
-	types.CalcSize(hmap)
-
-	// The size of hmap should be 48 bytes on 64 bit
-	// and 28 bytes on 32 bit platforms.
-	if size := int64(8 + 5*types.PtrSize); hmap.Size() != size {
-		base.Fatalf("hmap size not correct: got %d, want %d", hmap.Size(), size)
-	}
-
-	hmapType = hmap
-	return hmap
-}
-
-var hiterType *types.Type
-
-// MapIterType returns a type interchangeable with runtime.hiter.
-// Make sure this stays in sync with runtime/map.go.
-func MapIterType() *types.Type {
-	if hiterType != nil {
-		return hiterType
-	}
-
-	hmap := MapType()
-
-	// build a struct:
-	// type hiter struct {
-	//    key         unsafe.Pointer // *Key
-	//    elem        unsafe.Pointer // *Elem
-	//    t           unsafe.Pointer // *MapType
-	//    h           *hmap
-	//    buckets     unsafe.Pointer
-	//    bptr        unsafe.Pointer // *bmap
-	//    overflow    unsafe.Pointer // *[]*bmap
-	//    oldoverflow unsafe.Pointer // *[]*bmap
-	//    startBucket uintptr
-	//    offset      uint8
-	//    wrapped     bool
-	//    B           uint8
-	//    i           uint8
-	//    bucket      uintptr
-	//    checkBucket uintptr
-	// }
-	// must match runtime/map.go:hiter.
-	fields := []*types.Field{
-		makefield("key", types.Types[types.TUNSAFEPTR]),  // Used in range.go for TMAP.
-		makefield("elem", types.Types[types.TUNSAFEPTR]), // Used in range.go for TMAP.
-		makefield("t", types.Types[types.TUNSAFEPTR]),
-		makefield("h", types.NewPtr(hmap)),
-		makefield("buckets", types.Types[types.TUNSAFEPTR]),
-		makefield("bptr", types.Types[types.TUNSAFEPTR]),
-		makefield("overflow", types.Types[types.TUNSAFEPTR]),
-		makefield("oldoverflow", types.Types[types.TUNSAFEPTR]),
-		makefield("startBucket", types.Types[types.TUINTPTR]),
-		makefield("offset", types.Types[types.TUINT8]),
-		makefield("wrapped", types.Types[types.TBOOL]),
-		makefield("B", types.Types[types.TUINT8]),
-		makefield("i", types.Types[types.TUINT8]),
-		makefield("bucket", types.Types[types.TUINTPTR]),
-		makefield("checkBucket", types.Types[types.TUINTPTR]),
-	}
-
-	// build iterator struct holding the above fields
-	n := ir.NewDeclNameAt(src.NoXPos, ir.OTYPE, ir.Pkgs.Runtime.Lookup("hiter"))
-	hiter := types.NewNamed(n)
-	n.SetType(hiter)
-	n.SetTypecheck(1)
-
-	hiter.SetUnderlying(types.NewStruct(fields))
-	types.CalcSize(hiter)
-	if hiter.Size() != int64(12*types.PtrSize) {
-		base.Fatalf("hash_iter size not correct %d %d", hiter.Size(), 12*types.PtrSize)
-	}
-
-	hiterType = hiter
-	return hiter
 }
 
 // methods returns the methods of the non-interface type t, sorted by name.
@@ -385,7 +141,7 @@ func imethods(t *types.Type) []*typeSig {
 		}
 		if n := len(methods); n > 0 {
 			last := methods[n-1]
-			if !last.name.Less(f.Sym) {
+			if types.CompareSyms(last.name, f.Sym) >= 0 {
 				base.Fatalf("sigcmp vs sortinter %v %v", last.name, f.Sym)
 			}
 		}
@@ -427,6 +183,7 @@ func dimportpath(p *types.Pkg) {
 	ot := dnameData(s, 0, p.Path, "", nil, false, false)
 	objw.Global(s, int32(ot), obj.DUPOK|obj.RODATA)
 	s.Set(obj.AttrContentAddressable, true)
+	s.Align = 1
 	p.Pathsym = s
 }
 
@@ -551,6 +308,7 @@ func dname(name, tag string, pkg *types.Pkg, exported, embedded bool) *obj.LSym 
 	ot := dnameData(s, 0, name, tag, pkg, exported, embedded)
 	objw.Global(s, int32(ot), obj.DUPOK|obj.RODATA)
 	s.Set(obj.AttrContentAddressable, true)
+	s.Align = 1
 	return s
 }
 
@@ -625,38 +383,40 @@ func typePkg(t *types.Type) *types.Pkg {
 
 func dmethodptrOff(c rttype.Cursor, x *obj.LSym) {
 	c.WriteInt32(0)
-	r := c.Reloc()
-	r.Sym = x
-	r.Type = objabi.R_METHODOFF
+	c.Reloc(obj.Reloc{Type: objabi.R_METHODOFF, Sym: x})
 }
 
-var kinds = []int{
-	types.TINT:        objabi.KindInt,
-	types.TUINT:       objabi.KindUint,
-	types.TINT8:       objabi.KindInt8,
-	types.TUINT8:      objabi.KindUint8,
-	types.TINT16:      objabi.KindInt16,
-	types.TUINT16:     objabi.KindUint16,
-	types.TINT32:      objabi.KindInt32,
-	types.TUINT32:     objabi.KindUint32,
-	types.TINT64:      objabi.KindInt64,
-	types.TUINT64:     objabi.KindUint64,
-	types.TUINTPTR:    objabi.KindUintptr,
-	types.TFLOAT32:    objabi.KindFloat32,
-	types.TFLOAT64:    objabi.KindFloat64,
-	types.TBOOL:       objabi.KindBool,
-	types.TSTRING:     objabi.KindString,
-	types.TPTR:        objabi.KindPtr,
-	types.TSTRUCT:     objabi.KindStruct,
-	types.TINTER:      objabi.KindInterface,
-	types.TCHAN:       objabi.KindChan,
-	types.TMAP:        objabi.KindMap,
-	types.TARRAY:      objabi.KindArray,
-	types.TSLICE:      objabi.KindSlice,
-	types.TFUNC:       objabi.KindFunc,
-	types.TCOMPLEX64:  objabi.KindComplex64,
-	types.TCOMPLEX128: objabi.KindComplex128,
-	types.TUNSAFEPTR:  objabi.KindUnsafePointer,
+var kinds = []abi.Kind{
+	types.TINT:        abi.Int,
+	types.TUINT:       abi.Uint,
+	types.TINT8:       abi.Int8,
+	types.TUINT8:      abi.Uint8,
+	types.TINT16:      abi.Int16,
+	types.TUINT16:     abi.Uint16,
+	types.TINT32:      abi.Int32,
+	types.TUINT32:     abi.Uint32,
+	types.TINT64:      abi.Int64,
+	types.TUINT64:     abi.Uint64,
+	types.TUINTPTR:    abi.Uintptr,
+	types.TFLOAT32:    abi.Float32,
+	types.TFLOAT64:    abi.Float64,
+	types.TBOOL:       abi.Bool,
+	types.TSTRING:     abi.String,
+	types.TPTR:        abi.Pointer,
+	types.TSTRUCT:     abi.Struct,
+	types.TINTER:      abi.Interface,
+	types.TCHAN:       abi.Chan,
+	types.TMAP:        abi.Map,
+	types.TARRAY:      abi.Array,
+	types.TSLICE:      abi.Slice,
+	types.TFUNC:       abi.Func,
+	types.TCOMPLEX64:  abi.Complex64,
+	types.TCOMPLEX128: abi.Complex128,
+	types.TUNSAFEPTR:  abi.UnsafePointer,
+}
+
+func ABIKindOfType(t *types.Type) abi.Kind {
+	return kinds[t.Kind()]
 }
 
 var (
@@ -679,8 +439,10 @@ func dcommontype(c rttype.Cursor, t *types.Type) {
 		sptr = writeType(tptr)
 	}
 
-	gcsym, useGCProg, ptrdata := dgcsym(t, true)
-	delete(gcsymset, t)
+	gcsym, onDemand, ptrdata := dgcsym(t, true, true)
+	if !onDemand {
+		delete(gcsymset, t)
+	}
 
 	// ../../../../reflect/type.go:/^type.rtype
 	// actual type structure
@@ -701,17 +463,6 @@ func dcommontype(c rttype.Cursor, t *types.Type) {
 	c.Field("PtrBytes").WriteUintptr(uint64(ptrdata))
 	c.Field("Hash").WriteUint32(types.TypeHash(t))
 
-	var tflag abi.TFlag
-	if uncommonSize(t) != 0 {
-		tflag |= abi.TFlagUncommon
-	}
-	if t.Sym() != nil && t.Sym().Name != "" {
-		tflag |= abi.TFlagNamed
-	}
-	if compare.IsRegularMemory(t) {
-		tflag |= abi.TFlagRegularMemory
-	}
-
 	exported := false
 	p := t.NameString()
 	// If we're writing out type T,
@@ -719,9 +470,8 @@ func dcommontype(c rttype.Cursor, t *types.Type) {
 	// Use the string "*T"[1:] for "T", so that the two
 	// share storage. This is a cheap way to reduce the
 	// amount of space taken up by reflect strings.
-	if !strings.HasPrefix(p, "*") {
+	if t.TFlag()&abi.TFlagExtraStar != 0 {
 		p = "*" + p
-		tflag |= abi.TFlagExtraStar
 		if t.Sym() != nil {
 			exported = types.IsExported(t.Sym().Name)
 		}
@@ -731,11 +481,7 @@ func dcommontype(c rttype.Cursor, t *types.Type) {
 		}
 	}
 
-	if tflag != abi.TFlag(uint8(tflag)) {
-		// this should optimize away completely
-		panic("Unexpected change in size of abi.TFlag")
-	}
-	c.Field("TFlag").WriteUint8(uint8(tflag))
+	c.Field("TFlag").WriteUint8(uint8(t.TFlag()))
 
 	// runtime (and common sense) expects alignment to be a power of two.
 	i := int(uint8(t.Alignment()))
@@ -749,14 +495,7 @@ func dcommontype(c rttype.Cursor, t *types.Type) {
 	c.Field("Align_").WriteUint8(uint8(t.Alignment()))
 	c.Field("FieldAlign_").WriteUint8(uint8(t.Alignment()))
 
-	i = kinds[t.Kind()]
-	if types.IsDirectIface(t) {
-		i |= objabi.KindDirectIface
-	}
-	if useGCProg {
-		i |= objabi.KindGCProg
-	}
-	c.Field("Kind_").WriteUint8(uint8(i))
+	c.Field("Kind_").WriteUint8(uint8(ABIKindOfType(t)))
 
 	c.Field("Equal").WritePtr(eqfunc)
 	c.Field("GCData").WritePtr(gcsym)
@@ -811,19 +550,23 @@ func TypeLinksymLookup(name string) *obj.LSym {
 
 func TypeLinksym(t *types.Type) *obj.LSym {
 	lsym := TypeSym(t).Linksym()
+	setTypeInfo(lsym, t)
+	return lsym
+}
+
+func setTypeInfo(lsym *obj.LSym, t *types.Type) {
 	signatmu.Lock()
 	if lsym.Extra == nil {
 		ti := lsym.NewTypeInfo()
 		ti.Type = t
 	}
 	signatmu.Unlock()
-	return lsym
 }
 
 // TypePtrAt returns an expression that evaluates to the
 // *runtime._type value for t.
-func TypePtrAt(pos src.XPos, t *types.Type) *ir.AddrExpr {
-	return typecheck.LinksymAddr(pos, TypeLinksym(t), types.Types[types.TUINT8])
+func TypePtrAt(curfunc *ir.Func, pos src.XPos, t *types.Type) *ir.AddrExpr {
+	return typecheck.LinksymAddr(curfunc, pos, TypeLinksym(t), types.Types[types.TUINT8])
 }
 
 // ITabLsym returns the LSym representing the itab for concrete type typ implementing
@@ -834,11 +577,21 @@ func TypePtrAt(pos src.XPos, t *types.Type) *ir.AddrExpr {
 // it may sometimes, but not always, be a type that can't implement the specified
 // interface.
 func ITabLsym(typ, iface *types.Type) *obj.LSym {
+	return itabLsym(typ, iface, true)
+}
+
+func itabLsym(typ, iface *types.Type, allowNonImplement bool) *obj.LSym {
 	s, existed := ir.Pkgs.Itab.LookupOK(typ.LinkString() + "," + iface.LinkString())
 	lsym := s.Linksym()
+	signatmu.Lock()
+	if lsym.Extra == nil {
+		ii := lsym.NewItabInfo()
+		ii.Type = typ
+	}
+	signatmu.Unlock()
 
 	if !existed {
-		writeITab(lsym, typ, iface, true)
+		writeITab(lsym, typ, iface, allowNonImplement)
 	}
 	return lsym
 }
@@ -846,15 +599,9 @@ func ITabLsym(typ, iface *types.Type) *obj.LSym {
 // ITabAddrAt returns an expression that evaluates to the
 // *runtime.itab value for concrete type typ implementing interface
 // iface.
-func ITabAddrAt(pos src.XPos, typ, iface *types.Type) *ir.AddrExpr {
-	s, existed := ir.Pkgs.Itab.LookupOK(typ.LinkString() + "," + iface.LinkString())
-	lsym := s.Linksym()
-
-	if !existed {
-		writeITab(lsym, typ, iface, false)
-	}
-
-	return typecheck.LinksymAddr(pos, lsym, types.Types[types.TUINT8])
+func ITabAddrAt(curfunc *ir.Func, pos src.XPos, typ, iface *types.Type) *ir.AddrExpr {
+	lsym := itabLsym(typ, iface, false)
+	return typecheck.LinksymAddr(curfunc, pos, lsym, types.Types[types.TUINT8])
 }
 
 // needkeyupdate reports whether map updates with t as a key
@@ -949,11 +696,37 @@ func writeType(t *types.Type) *obj.LSym {
 	}
 
 	if s.Siggen() {
+		// The descriptor has already been written. If it was written for a
+		// noalg instance of the same type, it left out the algorithms this
+		// instance needs, so fill them in, including TFlagRegularMemory.
+		if lsym.WeakDef() && !types.TypeHasNoAlg(t) {
+			if eqfunc := geneq(t); eqfunc != nil {
+				objw.SymPtr(lsym, int(rttype.Type.OffsetOf("Equal")), eqfunc, 0)
+			}
+			if types.AlgType(t) == types.AMEM {
+				off := int(rttype.Type.OffsetOf("TFlag"))
+				objw.Uint8(lsym, off, lsym.P[off]|uint8(abi.TFlagRegularMemory))
+			}
+			// The noalg instance was also marked weak and left out of the
+			// typelinks table. Redo those decisions for the descriptor we
+			// have now.
+			setAlgAttrs(lsym, t)
+		}
 		return lsym
 	}
 	s.SetSiggen(true)
 
+	if !tbase.HasShape() {
+		setTypeInfo(lsym, t) // ensure lsym.Extra is set
+	}
+
 	if !NeedEmit(tbase) {
+		u := t
+		for u.IsPtr() {
+			u = u.Elem()
+		}
+		typecheck.CalcMethods(types.ReceiverBaseType(u))
+
 		if i := typecheck.BaseTypeIndex(t); i >= 0 {
 			lsym.Pkg = tbase.Sym().Pkg.Prefix
 			lsym.SymIdx = int32(i)
@@ -987,6 +760,9 @@ func writeType(t *types.Type) *obj.LSym {
 	// +--------------------------------+                            - D
 	// | method list, if any            |   dextratype
 	// +--------------------------------+                            - E
+
+	// internal/abi.Type.DescriptorSize is aware of this type layout,
+	// and must be changed if the layout change.
 
 	// UncommonType section is included if we have a name or a method.
 	extra := t.Sym() != nil || len(methods(t)) != 0
@@ -1111,53 +887,7 @@ func writeType(t *types.Type) *obj.LSym {
 		}
 
 	case types.TMAP:
-		// internal/abi.MapType
-		s1 := writeType(t.Key())
-		s2 := writeType(t.Elem())
-		s3 := writeType(MapBucketType(t))
-		hasher := genhash(t.Key())
-
-		c.Field("Key").WritePtr(s1)
-		c.Field("Elem").WritePtr(s2)
-		c.Field("Bucket").WritePtr(s3)
-		c.Field("Hasher").WritePtr(hasher)
-		var flags uint32
-		// Note: flags must match maptype accessors in ../../../../runtime/type.go
-		// and maptype builder in ../../../../reflect/type.go:MapOf.
-		if t.Key().Size() > MAXKEYSIZE {
-			c.Field("KeySize").WriteUint8(uint8(types.PtrSize))
-			flags |= 1 // indirect key
-		} else {
-			c.Field("KeySize").WriteUint8(uint8(t.Key().Size()))
-		}
-
-		if t.Elem().Size() > MAXELEMSIZE {
-			c.Field("ValueSize").WriteUint8(uint8(types.PtrSize))
-			flags |= 2 // indirect value
-		} else {
-			c.Field("ValueSize").WriteUint8(uint8(t.Elem().Size()))
-		}
-		c.Field("BucketSize").WriteUint16(uint16(MapBucketType(t).Size()))
-		if types.IsReflexive(t.Key()) {
-			flags |= 4 // reflexive key
-		}
-		if needkeyupdate(t.Key()) {
-			flags |= 8 // need key update
-		}
-		if hashMightPanic(t.Key()) {
-			flags |= 16 // hash might panic
-		}
-		c.Field("Flags").WriteUint32(flags)
-
-		if u := t.Underlying(); u != t {
-			// If t is a named map type, also keep the underlying map
-			// type live in the binary. This is important to make sure that
-			// a named map and that same map cast to its underlying type via
-			// reflection, use the same hash function. See issue 37716.
-			r := obj.Addrel(lsym)
-			r.Sym = writeType(u)
-			r.Type = objabi.R_KEEP
-		}
+		writeMapType(t, lsym, c)
 
 	case types.TPTR:
 		// internal/abi.PtrType
@@ -1205,55 +935,72 @@ func writeType(t *types.Type) *obj.LSym {
 		dextratype(lsym, B, t, dataAdd)
 	}
 
-	// Note: DUPOK is required to ensure that we don't end up with more
-	// than one type descriptor for a given type, if the type descriptor
-	// can be defined in multiple packages, that is, unnamed types,
-	// instantiated types and shape types.
 	dupok := 0
-	if tbase.Sym() == nil || tbase.IsFullyInstantiated() || tbase.HasShape() {
+	if TypeCanBeDupok(tbase) {
 		dupok = obj.DUPOK
 	}
 
 	objw.Global(lsym, int32(E), int16(dupok|obj.RODATA))
 
-	// The linker will leave a table of all the typelinks for
-	// types in the binary, so the runtime can find them.
-	//
-	// When buildmode=shared, all types are in typelinks so the
-	// runtime can deduplicate type pointers.
-	keep := base.Ctxt.Flag_dynlink
-	if !keep && t.Sym() == nil {
-		// For an unnamed type, we only need the link if the type can
-		// be created at run time by reflect.PointerTo and similar
-		// functions. If the type exists in the program, those
-		// functions must return the existing type structure rather
-		// than creating a new one.
-		switch t.Kind() {
-		case types.TPTR, types.TARRAY, types.TCHAN, types.TFUNC, types.TMAP, types.TSLICE, types.TSTRUCT:
-			keep = true
-		}
-	}
-	// Do not put Noalg types in typelinks.  See issue #22605.
-	if types.TypeHasNoAlg(t) {
-		keep = false
-	}
-	lsym.Set(obj.AttrMakeTypelink, keep)
+	setAlgAttrs(lsym, t)
+	lsym.Align = int16(types.PtrSize)
 
 	return lsym
+}
+
+// setAlgAttrs sets the attributes of t's descriptor symbol that depend on
+// whether the descriptor carries the type's hash and equality algorithms.
+// Both the code that writes a descriptor and the code that upgrades a noalg
+// descriptor into a full one must set all of them, so they live here
+// together. See issue #82462 for what happens when the two disagree.
+func setAlgAttrs(lsym *obj.LSym, t *types.Type) {
+	// A noalg type gets a descriptor without the type's hash and equality
+	// algorithms, because this package has no use for them. Another package
+	// may well have one, and emit a descriptor for the same type that does
+	// link them. Both describe the same type and carry the same name, so
+	// mark this one weak: the descriptor with the algorithms is usable
+	// everywhere this one is, and has to be the one the linker keeps.
+	// See cmd/internal/obj.AttrWeakDef.
+	lsym.Set(obj.AttrWeakDef, types.TypeHasNoAlg(t))
+	lsym.Set(obj.AttrMakeTypelink, needTypelink(t))
+}
+
+// needTypelink reports whether t's descriptor belongs in the table of
+// typelinks that the linker leaves for the runtime to find.
+func needTypelink(t *types.Type) bool {
+	// Do not put Noalg types in typelinks. See issue #22605.
+	if types.TypeHasNoAlg(t) {
+		return false
+	}
+	// When buildmode=shared, all types are in typelinks so the
+	// runtime can deduplicate type pointers.
+	if base.Ctxt.Flag_dynlink {
+		return true
+	}
+	if t.Sym() != nil {
+		return false
+	}
+	// For an unnamed type, we only need the link if the type can
+	// be created at run time by reflect.PointerTo and similar
+	// functions. If the type exists in the program, those
+	// functions must return the existing type structure rather
+	// than creating a new one.
+	switch t.Kind() {
+	case types.TPTR, types.TARRAY, types.TCHAN, types.TFUNC, types.TMAP, types.TSLICE, types.TSTRUCT:
+		return true
+	}
+	return false
 }
 
 // InterfaceMethodOffset returns the offset of the i-th method in the interface
 // type descriptor, ityp.
 func InterfaceMethodOffset(ityp *types.Type, i int64) int64 {
 	// interface type descriptor layout is struct {
-	//   _type        // commonSize
-	//   pkgpath      // 1 word
-	//   []imethod    // 3 words (pointing to [...]imethod below)
+	//   internal/abi.InterfaceType
 	//   uncommontype // uncommonSize
 	//   [...]imethod
 	// }
-	// The size of imethod is 8.
-	return int64(commonSize()+4*types.PtrSize+uncommonSize(ityp)) + i*8
+	return rttype.InterfaceType.Size() + int64(uncommonSize(ityp)) + i*rttype.IMethod.Size()
 }
 
 // NeedRuntimeType ensures that a runtime type descriptor is emitted for t.
@@ -1264,13 +1011,23 @@ func NeedRuntimeType(t *types.Type) {
 	}
 }
 
+// ForEachRuntimeType calls fn for each type for which a runtime type descriptor
+// has been requested. This is used by the code that indexes symbols early, so
+// we can recursively index the symbols WriteRuntimeTypes numbers using the
+// recursive writeType function.
+func ForEachRuntimeType(fn func(*types.Type)) {
+	for _, ts := range signatslice {
+		fn(ts.t)
+	}
+}
+
 func WriteRuntimeTypes() {
 	// Process signatslice. Use a loop, as writeType adds
 	// entries to signatslice while it is being processed.
 	for len(signatslice) > 0 {
 		signats := signatslice
 		// Sort for reproducible builds.
-		sort.Sort(typesByString(signats))
+		slices.SortFunc(signats, typesStrCmp)
 		for _, ts := range signats {
 			t := ts.t
 			writeType(t)
@@ -1288,9 +1045,9 @@ func WriteGCSymbols() {
 	for t := range gcsymset {
 		gcsyms = append(gcsyms, typeAndStr{t: t, short: types.TypeSymName(t), regular: t.String()})
 	}
-	sort.Sort(typesByString(gcsyms))
+	slices.SortFunc(gcsyms, typesStrCmp)
 	for _, ts := range gcsyms {
-		dgcsym(ts.t, true)
+		dgcsym(ts.t, true, false)
 	}
 }
 
@@ -1298,10 +1055,10 @@ func WriteGCSymbols() {
 // allowNonImplement is true, allow the case where typ does not implement iface, and just
 // create a dummy itab with zeroed-out method entries.
 func writeITab(lsym *obj.LSym, typ, iface *types.Type, allowNonImplement bool) {
-	// TODO(mdempsky): Fix methodWrapper, geneq, and genhash (and maybe
-	// others) to stop clobbering these.
-	oldpos, oldfn := base.Pos, ir.CurFunc
-	defer func() { base.Pos, ir.CurFunc = oldpos, oldfn }()
+	// TODO(mdempsky): Fix geneq and genhash (and maybe others) to stop
+	// clobbering base.Pos.
+	oldpos := base.Pos
+	defer func() { base.Pos = oldpos }()
 
 	if typ == nil || (typ.IsPtr() && typ.Elem() == nil) || typ.IsUntyped() || iface == nil || !iface.IsInterface() || iface.IsEmptyInterface() {
 		base.Fatalf("writeITab(%v, %v)", typ, iface)
@@ -1337,21 +1094,27 @@ func writeITab(lsym *obj.LSym, typ, iface *types.Type, allowNonImplement bool) {
 	//   _      [4]byte
 	//   fun    [1]uintptr // variable sized. fun[0]==0 means _type does not implement inter.
 	// }
-	o := objw.SymPtr(lsym, 0, writeType(iface), 0)
-	o = objw.SymPtr(lsym, o, writeType(typ), 0)
-	o = objw.Uint32(lsym, o, types.TypeHash(typ)) // copy of type hash
-	o += 4                                        // skip unused field
+	c := rttype.NewCursor(lsym, 0, rttype.ITab)
+	c.Field("Inter").WritePtr(writeType(iface))
+	c.Field("Type").WritePtr(writeType(typ))
+	c.Field("Hash").WriteUint32(types.TypeHash(typ)) // copy of type hash
+
+	var delta int64
+	c = c.Field("Fun")
 	if !completeItab {
 		// If typ doesn't implement iface, make method entries be zero.
-		o = objw.Uintptr(lsym, o, 0)
-		entries = entries[:0]
-	}
-	for _, fn := range entries {
-		o = objw.SymPtrWeak(lsym, o, fn, 0) // method pointer for each method
+		c.Elem(0).WriteUintptr(0)
+	} else {
+		var a rttype.ArrayCursor
+		a, delta = c.ModifyArray(len(entries))
+		for i, fn := range entries {
+			a.Elem(i).WriteFuncPtrWeak(fn) // method pointer for each method
+		}
 	}
 	// Nothing writes static itabs, so they are read only.
-	objw.Global(lsym, int32(o), int16(obj.DUPOK|obj.RODATA))
+	objw.Global(lsym, int32(rttype.ITab.Size()+delta), int16(obj.DUPOK|obj.RODATA))
 	lsym.Set(obj.AttrContentAddressable, true)
+	lsym.Align = int16(types.PtrSize)
 }
 
 func WritePluginTable() {
@@ -1461,20 +1224,17 @@ type typeAndStr struct {
 	regular string
 }
 
-type typesByString []typeAndStr
-
-func (a typesByString) Len() int { return len(a) }
-func (a typesByString) Less(i, j int) bool {
+func typesStrCmp(a, b typeAndStr) int {
 	// put named types before unnamed types
-	if a[i].t.Sym() != nil && a[j].t.Sym() == nil {
-		return true
+	if a.t.Sym() != nil && b.t.Sym() == nil {
+		return -1
 	}
-	if a[i].t.Sym() == nil && a[j].t.Sym() != nil {
-		return false
+	if a.t.Sym() == nil && b.t.Sym() != nil {
+		return +1
 	}
 
-	if a[i].short != a[j].short {
-		return a[i].short < a[j].short
+	if r := strings.Compare(a.short, b.short); r != 0 {
+		return r
 	}
 	// When the only difference between the types is whether
 	// they refer to byte or uint8, such as **byte vs **uint8,
@@ -1485,59 +1245,36 @@ func (a typesByString) Less(i, j int) bool {
 	// avoid naming collisions, and there shouldn't be a reason to care
 	// about "byte" vs "uint8": they share the same runtime type
 	// descriptor anyway.
-	if a[i].regular != a[j].regular {
-		return a[i].regular < a[j].regular
+	if r := strings.Compare(a.regular, b.regular); r != 0 {
+		return r
+	}
+	// A type and the noalg version of it share a name, so nothing above
+	// tells them apart. Order the one that has the algorithms first: its
+	// descriptor is the one that has to survive. See #82043.
+	if an, bn := types.TypeHasNoAlg(a.t), types.TypeHasNoAlg(b.t); an != bn {
+		if bn {
+			return -1
+		}
+		return +1
 	}
 	// Identical anonymous interfaces defined in different locations
 	// will be equal for the above checks, but different in DWARF output.
 	// Sort by source position to ensure deterministic order.
 	// See issues 27013 and 30202.
-	if a[i].t.Kind() == types.TINTER && len(a[i].t.AllMethods()) > 0 {
-		return a[i].t.AllMethods()[0].Pos.Before(a[j].t.AllMethods()[0].Pos)
+	if a.t.Kind() == types.TINTER && len(a.t.AllMethods()) > 0 {
+		if a.t.AllMethods()[0].Pos.Before(b.t.AllMethods()[0].Pos) {
+			return -1
+		}
+		return +1
 	}
-	return false
+	return 0
 }
-func (a typesByString) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
 
-// maxPtrmaskBytes is the maximum length of a GC ptrmask bitmap,
-// which holds 1-bit entries describing where pointers are in a given type.
-// Above this length, the GC information is recorded as a GC program,
-// which can express repetition compactly. In either form, the
-// information is used by the runtime to initialize the heap bitmap,
-// and for large types (like 128 or more words), they are roughly the
-// same speed. GC programs are never much larger and often more
-// compact. (If large arrays are involved, they can be arbitrarily
-// more compact.)
-//
-// The cutoff must be large enough that any allocation large enough to
-// use a GC program is large enough that it does not share heap bitmap
-// bytes with any other objects, allowing the GC program execution to
-// assume an aligned start and not use atomic operations. In the current
-// runtime, this means all malloc size classes larger than the cutoff must
-// be multiples of four words. On 32-bit systems that's 16 bytes, and
-// all size classes >= 16 bytes are 16-byte aligned, so no real constraint.
-// On 64-bit systems, that's 32 bytes, and 32-byte alignment is guaranteed
-// for size classes >= 256 bytes. On a 64-bit system, 256 bytes allocated
-// is 32 pointers, the bits for which fit in 4 bytes. So maxPtrmaskBytes
-// must be >= 4.
-//
-// We used to use 16 because the GC programs do have some constant overhead
-// to get started, and processing 128 pointers seems to be enough to
-// amortize that overhead well.
-//
-// To make sure that the runtime's chansend can call typeBitsBulkBarrier,
-// we raised the limit to 2048, so that even 32-bit systems are guaranteed to
-// use bitmaps for objects up to 64 kB in size.
-//
-// Also known to reflect/type.go.
-const maxPtrmaskBytes = 2048
-
-// GCSym returns a data symbol containing GC information for type t, along
-// with a boolean reporting whether the UseGCProg bit should be set in the
-// type kind, and the ptrdata field to record in the reflect type information.
+// GCSym returns a data symbol containing GC information for type t.
+// GC information is always a bitmask, never a gc program.
 // GCSym may be called in concurrent backend, so it does not emit the symbol
 // content.
-func GCSym(t *types.Type) (lsym *obj.LSym, useGCProg bool, ptrdata int64) {
+func GCSym(t *types.Type, onDemandAllowed bool) (lsym *obj.LSym, ptrdata int64) {
 	// Record that we need to emit the GC symbol.
 	gcsymmu.Lock()
 	if _, ok := gcsymset[t]; !ok {
@@ -1545,22 +1282,23 @@ func GCSym(t *types.Type) (lsym *obj.LSym, useGCProg bool, ptrdata int64) {
 	}
 	gcsymmu.Unlock()
 
-	return dgcsym(t, false)
+	lsym, _, ptrdata = dgcsym(t, false, onDemandAllowed)
+	return
 }
 
 // dgcsym returns a data symbol containing GC information for type t, along
-// with a boolean reporting whether the UseGCProg bit should be set in the
-// type kind, and the ptrdata field to record in the reflect type information.
+// with a boolean reporting whether the gc mask should be computed on demand
+// at runtime, and the ptrdata field to record in the reflect type information.
 // When write is true, it writes the symbol data.
-func dgcsym(t *types.Type, write bool) (lsym *obj.LSym, useGCProg bool, ptrdata int64) {
+func dgcsym(t *types.Type, write, onDemandAllowed bool) (lsym *obj.LSym, onDemand bool, ptrdata int64) {
 	ptrdata = types.PtrDataSize(t)
-	if ptrdata/int64(types.PtrSize) <= maxPtrmaskBytes*8 {
+	if !onDemandAllowed || t.TFlag()&abi.TFlagGCMaskOnDemand == 0 {
 		lsym = dgcptrmask(t, write)
 		return
 	}
 
-	useGCProg = true
-	lsym, ptrdata = dgcprog(t, write)
+	onDemand = true
+	lsym = dgcptrmaskOnDemand(t, write)
 	return
 }
 
@@ -1581,6 +1319,9 @@ func dgcptrmask(t *types.Type, write bool) *obj.LSym {
 		}
 		objw.Global(lsym, int32(len(ptrmask)), obj.DUPOK|obj.RODATA|obj.LOCAL)
 		lsym.Set(obj.AttrContentAddressable, true)
+		// The runtime expects ptrmasks to be aligned
+		// as a uintptr.
+		lsym.Align = int16(types.PtrSize)
 	}
 	return lsym
 }
@@ -1589,9 +1330,6 @@ func dgcptrmask(t *types.Type, write bool) *obj.LSym {
 // word offsets in t that hold pointers.
 // ptrmask is assumed to fit at least types.PtrDataSize(t)/PtrSize bits.
 func fillptrmask(t *types.Type, ptrmask []byte) {
-	for i := range ptrmask {
-		ptrmask[i] = 0
-	}
 	if !t.HasPointers() {
 		return
 	}
@@ -1607,125 +1345,22 @@ func fillptrmask(t *types.Type, ptrmask []byte) {
 	}
 }
 
-// dgcprog emits and returns the symbol containing a GC program for type t
-// along with the size of the data described by the program (in the range
-// [types.PtrDataSize(t), t.Width]).
-// In practice, the size is types.PtrDataSize(t) except for non-trivial arrays.
-// For non-trivial arrays, the program describes the full t.Width size.
-func dgcprog(t *types.Type, write bool) (*obj.LSym, int64) {
-	types.CalcSize(t)
-	if t.Size() == types.BADWIDTH {
-		base.Fatalf("dgcprog: %v badwidth", t)
+// dgcptrmaskOnDemand emits and returns the symbol that should be referenced by
+// the GCData field of a type, for large types.
+func dgcptrmaskOnDemand(t *types.Type, write bool) *obj.LSym {
+	lsym := TypeLinksymPrefix(".gcmask", t)
+	if write && !lsym.OnList() {
+		// Note: contains a pointer, but a pointer to a
+		// persistentalloc allocation. Starts with nil.
+		// Allocated in BSS.
+		objw.Global(lsym, int32(types.PtrSize), obj.DUPOK|obj.NOPTR|obj.LOCAL)
 	}
-	lsym := TypeLinksymPrefix(".gcprog", t)
-	var p gcProg
-	p.init(lsym, write)
-	p.emit(t, 0)
-	offset := p.w.BitIndex() * int64(types.PtrSize)
-	p.end()
-	if ptrdata := types.PtrDataSize(t); offset < ptrdata || offset > t.Size() {
-		base.Fatalf("dgcprog: %v: offset=%d but ptrdata=%d size=%d", t, offset, ptrdata, t.Size())
-	}
-	return lsym, offset
-}
-
-type gcProg struct {
-	lsym   *obj.LSym
-	symoff int
-	w      gcprog.Writer
-	write  bool
-}
-
-func (p *gcProg) init(lsym *obj.LSym, write bool) {
-	p.lsym = lsym
-	p.write = write && !lsym.OnList()
-	p.symoff = 4 // first 4 bytes hold program length
-	if !write {
-		p.w.Init(func(byte) {})
-		return
-	}
-	p.w.Init(p.writeByte)
-	if base.Debug.GCProg > 0 {
-		fmt.Fprintf(os.Stderr, "compile: start GCProg for %v\n", lsym)
-		p.w.Debug(os.Stderr)
-	}
-}
-
-func (p *gcProg) writeByte(x byte) {
-	p.symoff = objw.Uint8(p.lsym, p.symoff, x)
-}
-
-func (p *gcProg) end() {
-	p.w.End()
-	if !p.write {
-		return
-	}
-	objw.Uint32(p.lsym, 0, uint32(p.symoff-4))
-	objw.Global(p.lsym, int32(p.symoff), obj.DUPOK|obj.RODATA|obj.LOCAL)
-	p.lsym.Set(obj.AttrContentAddressable, true)
-	if base.Debug.GCProg > 0 {
-		fmt.Fprintf(os.Stderr, "compile: end GCProg for %v\n", p.lsym)
-	}
-}
-
-func (p *gcProg) emit(t *types.Type, offset int64) {
-	types.CalcSize(t)
-	if !t.HasPointers() {
-		return
-	}
-	if t.Size() == int64(types.PtrSize) {
-		p.w.Ptr(offset / int64(types.PtrSize))
-		return
-	}
-	switch t.Kind() {
-	default:
-		base.Fatalf("gcProg.emit: unexpected type %v", t)
-
-	case types.TSTRING:
-		p.w.Ptr(offset / int64(types.PtrSize))
-
-	case types.TINTER:
-		// Note: the first word isn't a pointer. See comment in typebits.Set
-		p.w.Ptr(offset/int64(types.PtrSize) + 1)
-
-	case types.TSLICE:
-		p.w.Ptr(offset / int64(types.PtrSize))
-
-	case types.TARRAY:
-		if t.NumElem() == 0 {
-			// should have been handled by haspointers check above
-			base.Fatalf("gcProg.emit: empty array")
-		}
-
-		// Flatten array-of-array-of-array to just a big array by multiplying counts.
-		count := t.NumElem()
-		elem := t.Elem()
-		for elem.IsArray() {
-			count *= elem.NumElem()
-			elem = elem.Elem()
-		}
-
-		if !p.w.ShouldRepeat(elem.Size()/int64(types.PtrSize), count) {
-			// Cheaper to just emit the bits.
-			for i := int64(0); i < count; i++ {
-				p.emit(elem, offset+i*elem.Size())
-			}
-			return
-		}
-		p.emit(elem, offset)
-		p.w.ZeroUntil((offset + elem.Size()) / int64(types.PtrSize))
-		p.w.Repeat(elem.Size()/int64(types.PtrSize), count-1)
-
-	case types.TSTRUCT:
-		for _, t1 := range t.Fields() {
-			p.emit(t1.Type, offset+t1.Offset)
-		}
-	}
+	return lsym
 }
 
 // ZeroAddr returns the address of a symbol with at least
 // size bytes of zeros.
-func ZeroAddr(size int64) ir.Node {
+func ZeroAddr(curfunc *ir.Func, size int64) ir.Node {
 	if size >= 1<<31 {
 		base.Fatalf("map elem too big %d", size)
 	}
@@ -1734,7 +1369,13 @@ func ZeroAddr(size int64) ir.Node {
 	}
 	lsym := base.PkgLinksym("go:map", "zero", obj.ABI0)
 	x := ir.NewLinksymExpr(base.Pos, lsym, types.Types[types.TUINT8])
-	return typecheck.Expr(typecheck.NodAddr(x))
+	return typecheck.Expr(curfunc, typecheck.NodAddr(curfunc, x))
+}
+
+// TypeCanBeDupok reports whether the type descriptor can be defined in multiple packages:
+// that is, unnamed types, instantiated types and shape types.
+func TypeCanBeDupok(t *types.Type) bool {
+	return t.Sym() == nil || t.IsFullyInstantiated() || t.HasShape()
 }
 
 // NeedEmit reports whether typ is a type that we need to emit code
@@ -1819,8 +1460,8 @@ func methodWrapper(rcvr *types.Type, method *types.Field, forItab bool) *obj.LSy
 		rcvr = rcvr.PtrTo()
 	}
 
-	newnam := ir.MethodSym(rcvr, method.Sym)
-	lsym := newnam.Linksym()
+	sym, _ := ir.MethodSym(rcvr, method)
+	lsym := sym.Linksym()
 
 	// Unified IR creates its own wrappers.
 	return lsym
@@ -1840,16 +1481,14 @@ func MarkTypeUsedInInterface(t *types.Type, from *obj.LSym) {
 func MarkTypeSymUsedInInterface(tsym *obj.LSym, from *obj.LSym) {
 	// Emit a marker relocation. The linker will know the type is converted
 	// to an interface if "from" is reachable.
-	r := obj.Addrel(from)
-	r.Sym = tsym
-	r.Type = objabi.R_USEIFACE
+	from.AddRel(base.Ctxt, obj.Reloc{Type: objabi.R_USEIFACE, Sym: tsym})
 }
 
 // MarkUsedIfaceMethod marks that an interface method is used in the current
 // function. n is OCALLINTER node.
-func MarkUsedIfaceMethod(n *ir.CallExpr) {
+func MarkUsedIfaceMethod(curfunc *ir.Func, n *ir.CallExpr) {
 	// skip unnamed functions (func _())
-	if ir.CurFunc.LSym == nil {
+	if curfunc.LSym == nil {
 		return
 	}
 	dot := n.Fun.(*ir.SelectorExpr)
@@ -1874,25 +1513,18 @@ func MarkUsedIfaceMethod(n *ir.CallExpr) {
 		// type, and the linker could do more complicated matching using
 		// some sort of fuzzy shape matching. For now, only use the name
 		// of the method for matching.
-		r := obj.Addrel(ir.CurFunc.LSym)
-		r.Sym = staticdata.StringSymNoCommon(dot.Sel.Name)
-		r.Type = objabi.R_USENAMEDMETHOD
+		curfunc.LSym.AddRel(base.Ctxt, obj.Reloc{
+			Type: objabi.R_USENAMEDMETHOD,
+			Sym:  staticdata.StringSymNoCommon(dot.Sel.Name),
+		})
 		return
 	}
 
-	tsym := TypeLinksym(ityp)
-	r := obj.Addrel(ir.CurFunc.LSym)
-	r.Sym = tsym
-	// dot.Offset() is the method index * PtrSize (the offset of code pointer
-	// in itab).
+	// dot.Offset() is the method index * PtrSize (the offset of code pointer in itab).
 	midx := dot.Offset() / int64(types.PtrSize)
-	r.Add = InterfaceMethodOffset(ityp, midx)
-	r.Type = objabi.R_USEIFACEMETHOD
-}
-
-func deref(t *types.Type) *types.Type {
-	if t.IsPtr() {
-		return t.Elem()
-	}
-	return t
+	curfunc.LSym.AddRel(base.Ctxt, obj.Reloc{
+		Type: objabi.R_USEIFACEMETHOD,
+		Sym:  TypeLinksym(ityp),
+		Add:  InterfaceMethodOffset(ityp, midx),
+	})
 }

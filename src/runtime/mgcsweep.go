@@ -25,9 +25,7 @@
 package runtime
 
 import (
-	"internal/abi"
-	"internal/goexperiment"
-	"runtime/internal/atomic"
+	"internal/runtime/atomic"
 	"unsafe"
 )
 
@@ -171,13 +169,16 @@ func (a *activeSweep) end(sl sweepLocker) {
 			throw("mismatched begin/end of activeSweep")
 		}
 		if a.state.CompareAndSwap(state, state-1) {
-			if state != sweepDrainedMask {
+			if state-1 != sweepDrainedMask {
 				return
 			}
+			// We're the last sweeper, and there's nothing left to sweep.
 			if debug.gcpacertrace > 0 {
 				live := gcController.heapLive.Load()
 				print("pacer: sweep done at heap size ", live>>20, "MB; allocated ", (live-mheap_.sweepHeapLiveBasis)>>20, "MB during sweep; swept ", mheap_.pagesSwept.Load(), " pages at ", mheap_.sweepPagesPerByte, " pages/byte\n")
 			}
+			// Now that sweeping is completely done, flush remaining cleanups.
+			gcCleanups.flush()
 			return
 		}
 	}
@@ -230,11 +231,24 @@ func (a *activeSweep) reset() {
 func finishsweep_m() {
 	assertWorldStopped()
 
-	// Sweeping must be complete before marking commences, so
-	// sweep any unswept spans. If this is a concurrent GC, there
-	// shouldn't be any spans left to sweep, so this should finish
-	// instantly. If GC was forced before the concurrent sweep
-	// finished, there may be spans to sweep.
+	// Sweeping must be complete before marking commences.
+	//
+	// gcStart picks up any unswept spans prior to commencing, which
+	// ensures there are no unswept spans in the presence of a single GC.
+	// However, in the case of gcStart racing with another GC, there are
+	// edge cases that allow finishsweep_m to observe unswept spans. For
+	// example,
+	//
+	// - gcStart sweeps remaining spans prior to taking work.startSema.
+	//   While blocked waiting, another goroutine could take the lock and
+	//   complete an entire GC cycle. When the original goroutine finally
+	//   unblocks there are now unswept spans from the subsequent GC cycle.
+	//
+	// - Mark termination makes most sweep work prior to startTheWorld, but
+	//   it calls prepareForSweep after restarting the world, which adds more
+	//   work. A concurrent gcStart call could finish all of the initial work
+	//   before prepareForSweep adds more, and thus gcStart doesn't see it
+	//   until after taking work.startSema.
 	for sweepone() != ^uintptr(0) {
 	}
 
@@ -306,12 +320,17 @@ func bgsweep(c chan int) {
 			// N.B. freeSomeWbufs is already batched internally.
 			goschedIfBusy()
 		}
+		freeDeadSpanSPMCs()
 		lock(&sweep.lock)
 		if !isSweepDone() {
 			// This can happen if a GC runs between
 			// gosweepone returning ^0 above
 			// and the lock being acquired.
 			unlock(&sweep.lock)
+			// This goroutine must preempt when we have no work to do
+			// but isSweepDone returns false because of another existing sweeper.
+			// See issue #73499.
+			goschedIfBusy()
 			continue
 		}
 		sweep.parked = true
@@ -465,6 +484,13 @@ func (s *mspan) ensureSwept() {
 		throw("mspan.ensureSwept: m is not locked")
 	}
 
+	// Avoid registering a sweeper if the span is already swept.
+	// Preemption is disabled, so the sweep generation cannot change.
+	sweepgen := mheap_.sweepgen
+	if spangen := atomic.Load(&s.sweepgen); spangen == sweepgen || spangen == sweepgen+3 {
+		return
+	}
+
 	// If this operation fails, then that means that there are
 	// no more spans to be swept. In this case, either s has already
 	// been swept, or is about to be acquired for sweeping and swept.
@@ -519,7 +545,7 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 
 	trace := traceAcquire()
 	if trace.ok() {
-		trace.GCSweepSpan(s.npages * _PageSize)
+		trace.GCSweepSpan(s.npages * pageSize)
 		traceRelease(trace)
 	}
 
@@ -548,36 +574,49 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 	siter := newSpecialsIter(s)
 	for siter.valid() {
 		// A finalizer can be set for an inner byte of an object, find object beginning.
-		objIndex := uintptr(siter.s.offset) / size
+		objIndex := siter.s.offset / size
 		p := s.base() + objIndex*size
 		mbits := s.markBitsForIndex(objIndex)
 		if !mbits.isMarked() {
 			// This object is not marked and has at least one special record.
-			// Pass 1: see if it has at least one finalizer.
-			hasFin := false
+			// Pass 1: see if it has a finalizer.
+			hasFinAndRevived := false
 			endOffset := p - s.base() + size
-			for tmp := siter.s; tmp != nil && uintptr(tmp.offset) < endOffset; tmp = tmp.next {
+			for tmp := siter.s; tmp != nil && tmp.offset < endOffset; tmp = tmp.next {
 				if tmp.kind == _KindSpecialFinalizer {
 					// Stop freeing of object if it has a finalizer.
 					mbits.setMarkedNonAtomic()
-					hasFin = true
+					hasFinAndRevived = true
 					break
 				}
 			}
-			// Pass 2: queue all finalizers _or_ handle profile record.
-			for siter.valid() && uintptr(siter.s.offset) < endOffset {
-				// Find the exact byte for which the special was setup
-				// (as opposed to object beginning).
-				special := siter.s
-				p := s.base() + uintptr(special.offset)
-				if special.kind == _KindSpecialFinalizer || !hasFin {
+			if hasFinAndRevived {
+				// Pass 2: queue all finalizers and clear any weak handles. Weak handles are cleared
+				// before finalization as specified by the weak package. See the documentation
+				// for that package for more details.
+				for siter.valid() && siter.s.offset < endOffset {
+					// Find the exact byte for which the special was setup
+					// (as opposed to object beginning).
+					special := siter.s
+					p := s.base() + special.offset
+					if special.kind == _KindSpecialFinalizer || special.kind == _KindSpecialWeakHandle {
+						siter.unlinkAndNext()
+						freeSpecial(special, unsafe.Pointer(p), size)
+					} else {
+						// All other specials only apply when an object is freed,
+						// so just keep the special record.
+						siter.next()
+					}
+				}
+			} else {
+				// Pass 2: the object is truly dead, free (and handle) all specials.
+				for siter.valid() && siter.s.offset < endOffset {
+					// Find the exact byte for which the special was setup
+					// (as opposed to object beginning).
+					special := siter.s
+					p := s.base() + special.offset
 					siter.unlinkAndNext()
 					freeSpecial(special, unsafe.Pointer(p), size)
-				} else {
-					// The object has finalizers, so we're keeping it alive.
-					// All other specials only apply when an object is freed,
-					// so just keep the special record.
-					siter.next()
 				}
 			}
 		} else {
@@ -596,16 +635,19 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 		spanHasNoSpecials(s)
 	}
 
-	if debug.allocfreetrace != 0 || debug.clobberfree != 0 || raceenabled || msanenabled || asanenabled {
-		// Find all newly freed objects. This doesn't have to
-		// efficient; allocfreetrace has massive overhead.
+	if traceAllocFreeEnabled() || debug.clobberfree != 0 || raceenabled || msanenabled || asanenabled {
+		// Find all newly freed objects.
 		mbits := s.markBitsForBase()
 		abits := s.allocBitsForIndex(0)
 		for i := uintptr(0); i < uintptr(s.nelems); i++ {
 			if !mbits.isMarked() && (abits.index < uintptr(s.freeindex) || abits.isMarked()) {
 				x := s.base() + i*s.elemsize
-				if debug.allocfreetrace != 0 {
-					tracefree(unsafe.Pointer(x), size)
+				if traceAllocFreeEnabled() {
+					trace := traceAcquire()
+					if trace.ok() {
+						trace.HeapObjectFree(x)
+						traceRelease(trace)
+					}
 				}
 				if debug.clobberfree != 0 {
 					clobberfree(unsafe.Pointer(x), size)
@@ -620,10 +662,18 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 				if asanenabled && !s.isUserArenaChunk {
 					asanpoison(unsafe.Pointer(x), size)
 				}
+				if valgrindenabled && !s.isUserArenaChunk {
+					valgrindFree(unsafe.Pointer(x))
+				}
 			}
 			mbits.advance()
 			abits.advance()
 		}
+	}
+
+	// Copy over and clear the inline mark bits if necessary.
+	if gcUsesSpanInlineMarkBits(s.elemsize) {
+		s.moveInlineMarks(s.gcmarkBits)
 	}
 
 	// Check for zombie objects.
@@ -770,6 +820,19 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 		if nfreed != 0 {
 			// Free large object span to heap.
 
+			// Count the free in the consistent, external stats.
+			//
+			// Do this before freeSpan, which might update heapStats' inHeap
+			// value. If it does so, then metrics that subtract object footprint
+			// from inHeap might overflow. See #67019.
+			stats := memstats.heapStats.acquire()
+			atomic.Xadd64(&stats.largeFreeCount, 1)
+			atomic.Xadd64(&stats.largeFree, int64(size))
+			memstats.heapStats.release()
+
+			// Count the free in the inconsistent, internal stats.
+			gcController.totalFree.Add(int64(size))
+
 			// NOTE(rsc,dvyukov): The original implementation of efence
 			// in CL 22060046 used sysFree instead of sysFault, so that
 			// the operating system would eventually give the memory
@@ -790,28 +853,6 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 			} else {
 				mheap_.freeSpan(s)
 			}
-			if goexperiment.AllocHeaders && s.largeType != nil && s.largeType.TFlag&abi.TFlagUnrolledBitmap != 0 {
-				// In the allocheaders experiment, the unrolled GCProg bitmap is allocated separately.
-				// Free the space for the unrolled bitmap.
-				systemstack(func() {
-					s := spanOf(uintptr(unsafe.Pointer(s.largeType)))
-					mheap_.freeManual(s, spanAllocPtrScalarBits)
-				})
-				// Make sure to zero this pointer without putting the old
-				// value in a write buffer, as the old value might be an
-				// invalid pointer. See arena.go:(*mheap).allocUserArenaChunk.
-				*(*uintptr)(unsafe.Pointer(&s.largeType)) = 0
-			}
-
-			// Count the free in the consistent, external stats.
-			stats := memstats.heapStats.acquire()
-			atomic.Xadd64(&stats.largeFreeCount, 1)
-			atomic.Xadd64(&stats.largeFree, int64(size))
-			memstats.heapStats.release()
-
-			// Count the free in the inconsistent, internal stats.
-			gcController.totalFree.Add(int64(size))
-
 			return true
 		}
 
@@ -837,8 +878,11 @@ func (sl *sweepLocked) sweep(preserve bool) bool {
 // pointer to that object and marked it.
 func (s *mspan) reportZombies() {
 	printlock()
-	print("runtime: marked free object in span ", s, ", elemsize=", s.elemsize, " freeindex=", s.freeindex, " (bad use of unsafe.Pointer? try -d=checkptr)\n")
-	mbits := s.markBitsForBase()
+	print("runtime: marked free object in span ", s, ", elemsize=", s.elemsize, " freeindex=", s.freeindex, " (bad use of unsafe.Pointer or having race conditions? try -d=checkptr or -race)\n")
+	// Inline mark bits have already been moved to gcmarkBits by sweep, so
+	// read gcmarkBits directly rather than through markBitsForBase, which
+	// would read the now-cleared inline mark bits.
+	mbits := markBits{&s.gcmarkBits.x, uint8(1), 0}
 	abits := s.allocBitsForIndex(0)
 	for i := uintptr(0); i < uintptr(s.nelems); i++ {
 		addr := s.base() + i*s.elemsize
@@ -864,7 +908,7 @@ func (s *mspan) reportZombies() {
 			if length > 1024 {
 				length = 1024
 			}
-			hexdumpWords(addr, addr+length, nil)
+			hexdumpWords(addr, length, nil)
 		}
 		mbits.advance()
 		abits.advance()
@@ -976,9 +1020,9 @@ func gcPaceSweeper(trigger uint64) {
 		// concurrent sweep are less likely to leave pages
 		// unswept when GC starts.
 		heapDistance -= 1024 * 1024
-		if heapDistance < _PageSize {
+		if heapDistance < pageSize {
 			// Avoid setting the sweep ratio extremely high
-			heapDistance = _PageSize
+			heapDistance = pageSize
 		}
 		pagesSwept := mheap_.pagesSwept.Load()
 		pagesInUse := mheap_.pagesInUse.Load()

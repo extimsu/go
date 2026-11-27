@@ -40,17 +40,19 @@ func (z *Int) GobDecode(buf []byte) error {
 	if b>>1 != intGobVersion {
 		return fmt.Errorf("Int.GobDecode: encoding version %d not supported", b>>1)
 	}
-	z.neg = b&1 != 0
 	z.abs = z.abs.setBytes(buf[1:])
+	z.neg = len(z.abs) > 0 && b&1 != 0 // 0 has no sign
 	return nil
+}
+
+// AppendText implements the [encoding.TextAppender] interface.
+func (x *Int) AppendText(b []byte) (text []byte, err error) {
+	return x.Append(b, 10), nil
 }
 
 // MarshalText implements the [encoding.TextMarshaler] interface.
 func (x *Int) MarshalText() (text []byte, err error) {
-	if x == nil {
-		return []byte("<nil>"), nil
-	}
-	return x.abs.itoa(x.neg, 10), nil
+	return x.AppendText(nil)
 }
 
 // UnmarshalText implements the [encoding.TextUnmarshaler] interface.

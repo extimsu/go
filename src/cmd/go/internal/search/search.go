@@ -6,17 +6,22 @@ package search
 
 import (
 	"cmd/go/internal/base"
+	"cmd/go/internal/build"
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/fsys"
+	"cmd/go/internal/imports"
+	"cmd/go/internal/modindex"
 	"cmd/go/internal/str"
 	"cmd/internal/pkgpattern"
+	"errors"
 	"fmt"
-	"go/build"
 	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/mod/modfile"
 )
 
 // A Match represents the result of matching a single package pattern.
@@ -60,14 +65,14 @@ func (m *Match) IsLocal() bool {
 }
 
 // IsMeta reports whether the pattern is a “meta-package” keyword that represents
-// multiple packages, such as "std", "cmd", or "all".
+// multiple packages, such as "std", "cmd", "tool", "work", or "all".
 func (m *Match) IsMeta() bool {
 	return IsMetaPackage(m.pattern)
 }
 
 // IsMetaPackage checks if name is a reserved package name that expands to multiple packages.
 func IsMetaPackage(name string) bool {
-	return name == "std" || name == "cmd" || name == "all"
+	return name == "std" || name == "cmd" || name == "tool" || name == "work" || name == "all"
 }
 
 // A MatchError indicates an error that occurred while attempting to match a
@@ -117,7 +122,7 @@ func (m *Match) MatchPackages() {
 	have := map[string]bool{
 		"builtin": true, // ignore pseudo-package that exists only for documentation
 	}
-	if !cfg.BuildContext.CgoEnabled {
+	if cfg.BuildContext.CgoEnabled == build.CgoDisabled {
 		have["runtime/cgo"] = true // ignore during walk
 	}
 
@@ -135,7 +140,7 @@ func (m *Match) MatchPackages() {
 			root += "cmd" + string(filepath.Separator)
 		}
 
-		err := fsys.Walk(root, func(path string, fi fs.FileInfo, err error) error {
+		err := fsys.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err // Likely a permission error, which could interfere with matching.
 			}
@@ -160,8 +165,8 @@ func (m *Match) MatchPackages() {
 				want = false
 			}
 
-			if !fi.IsDir() {
-				if fi.Mode()&fs.ModeSymlink != 0 && want && strings.Contains(m.pattern, "...") {
+			if !d.IsDir() {
+				if d.Type()&fs.ModeSymlink != 0 && want && strings.Contains(m.pattern, "...") {
 					if target, err := fsys.Stat(path); err == nil && target.IsDir() {
 						fmt.Fprintf(os.Stderr, "warning: ignoring symlink %s\n", path)
 					}
@@ -179,7 +184,25 @@ func (m *Match) MatchPackages() {
 			if !match(name) {
 				return nil
 			}
-			pkg, err := cfg.BuildContext.ImportDir(path, 0)
+			var pkg *build.Package
+			if str.HasFilePathPrefix(path, cfg.GOROOTsrc) {
+				// Reuse the package index used by package loading instead of
+				// rereading every source file while expanding GOROOT patterns.
+				modroot := cfg.GOROOTsrc
+				gorootSrcCmd := filepath.Join(modroot, "cmd")
+				if str.HasFilePathPrefix(path, gorootSrcCmd) {
+					modroot = gorootSrcCmd
+				}
+				if ip, indexErr := modindex.GetPackage(modroot, path); indexErr == nil {
+					pkg, err = ip.Import(cfg.BuildContext, 0)
+				} else if errors.Is(indexErr, modindex.ErrNotIndexed) {
+					pkg, err = cfg.BuildContext.ImportDir(path, 0)
+				} else {
+					return indexErr
+				}
+			} else {
+				pkg, err = cfg.BuildContext.ImportDir(path, 0)
+			}
 			if err != nil {
 				if _, noGo := err.(*build.NoGoError); noGo {
 					// The package does not actually exist, so record neither the package
@@ -195,7 +218,7 @@ func (m *Match) MatchPackages() {
 			// packages under cmd/vendor. At least as of
 			// March, 2017, there is one there for the
 			// vendored pprof tool.
-			if m.pattern == "cmd" && pkg != nil && strings.HasPrefix(pkg.ImportPath, "cmd/vendor") && pkg.Name == "main" {
+			if m.pattern == "cmd" && pkg != nil && strings.HasPrefix(name, "cmd/vendor") && pkg.Name == "main" {
 				return nil
 			}
 
@@ -206,6 +229,69 @@ func (m *Match) MatchPackages() {
 			m.AddError(err)
 		}
 	}
+}
+
+// IgnorePatterns is normalized with normalizePath.
+type IgnorePatterns struct {
+	relativePatterns []string
+	anyPatterns      []string
+}
+
+// ShouldIgnore returns true if the given directory should be ignored
+// based on the ignore patterns.
+//
+// An ignore pattern "x" will cause any file or directory named "x"
+// (and its entire subtree) to be ignored, regardless of its location
+// within the module.
+//
+// An ignore pattern "./x" will only cause the specific file or directory
+// named "x" at the root of the module to be ignored.
+// Wildcards in ignore patterns are not supported.
+func (ignorePatterns *IgnorePatterns) ShouldIgnore(dir string) bool {
+	if dir == "" {
+		return false
+	}
+	dir = normalizePath(dir)
+	for _, pattern := range ignorePatterns.relativePatterns {
+		if strings.HasPrefix(dir, pattern) {
+			return true
+		}
+	}
+	for _, pattern := range ignorePatterns.anyPatterns {
+		if strings.Contains(dir, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+func NewIgnorePatterns(patterns []string) *IgnorePatterns {
+	var relativePatterns, anyPatterns []string
+	for _, pattern := range patterns {
+		ignorePatternPath, isRelative := strings.CutPrefix(pattern, "./")
+		ignorePatternPath = normalizePath(ignorePatternPath)
+		if isRelative {
+			relativePatterns = append(relativePatterns, ignorePatternPath)
+		} else {
+			anyPatterns = append(anyPatterns, ignorePatternPath)
+		}
+	}
+	return &IgnorePatterns{
+		relativePatterns: relativePatterns,
+		anyPatterns:      anyPatterns,
+	}
+}
+
+// normalizePath adds slashes to the front and end of the given path.
+func normalizePath(path string) string {
+	path = filepath.ToSlash(path)
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	if !strings.HasSuffix(path, "/") {
+		path += "/"
+	}
+	return path
 }
 
 // MatchDirs sets m.Dirs to a non-nil slice containing all directories that
@@ -253,16 +339,18 @@ func (m *Match) MatchDirs(modRoots []string) {
 	// We need to preserve the ./ for pattern matching
 	// and in the returned import paths.
 
-	if len(modRoots) > 1 {
+	var modRoot string
+	if len(modRoots) > 0 {
 		abs, err := filepath.Abs(dir)
 		if err != nil {
 			m.AddError(err)
 			return
 		}
 		var found bool
-		for _, modRoot := range modRoots {
-			if modRoot != "" && str.HasFilePathPrefix(abs, modRoot) {
+		for _, mr := range modRoots {
+			if mr != "" && str.HasFilePathPrefix(abs, mr) {
 				found = true
+				modRoot = mr
 			}
 		}
 		if !found {
@@ -274,15 +362,17 @@ func (m *Match) MatchDirs(modRoots []string) {
 		}
 	}
 
+	ignorePatterns := parseIgnorePatterns(modRoot)
+	tags := imports.Tags()
 	// If dir is actually a symlink to a directory,
 	// we want to follow it (see https://go.dev/issue/50807).
 	// Add a trailing separator to force that to happen.
 	dir = str.WithFilePathSeparator(dir)
-	err := fsys.Walk(dir, func(path string, fi fs.FileInfo, err error) error {
+	err := fsys.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err // Likely a permission error, which could interfere with matching.
 		}
-		if !fi.IsDir() {
+		if !d.IsDir() {
 			return nil
 		}
 		top := false
@@ -305,10 +395,21 @@ func (m *Match) MatchDirs(modRoots []string) {
 		if dot || strings.HasPrefix(elem, "_") || elem == "testdata" {
 			return filepath.SkipDir
 		}
+		absPath, err := filepath.Abs(path)
+		if err != nil {
+			return err
+		}
+
+		if ignorePatterns != nil && ignorePatterns.ShouldIgnore(InDir(absPath, modRoot)) {
+			if cfg.BuildX {
+				fmt.Fprintf(os.Stderr, "# ignoring directory %s\n", absPath)
+			}
+			return filepath.SkipDir
+		}
 
 		if !top && cfg.ModulesEnabled {
 			// Ignore other modules found in subdirectories.
-			if fi, err := fsys.Stat(filepath.Join(path, "go.mod")); err == nil && !fi.IsDir() {
+			if info, err := fsys.Stat(filepath.Join(path, "go.mod")); err == nil && !info.IsDir() {
 				return filepath.SkipDir
 			}
 		}
@@ -316,6 +417,19 @@ func (m *Match) MatchDirs(modRoots []string) {
 		name := prefix + filepath.ToSlash(path)
 		if !match(name) {
 			return nil
+		}
+
+		if modRoot := moduleRootContaining(modRoots, absPath); modRoot != "" {
+			hasPackage, ok, err := indexedPackage(modRoot, absPath, tags)
+			if err != nil {
+				return err
+			}
+			if ok {
+				if hasPackage {
+					m.Dirs = append(m.Dirs, name)
+				}
+				return nil
+			}
 		}
 
 		// We keep the directory if we can import it, or if we can't import it
@@ -342,6 +456,28 @@ func (m *Match) MatchDirs(modRoots []string) {
 	}
 }
 
+func moduleRootContaining(modRoots []string, absPath string) string {
+	var modRoot string
+	for _, root := range modRoots {
+		if root != "" && str.HasFilePathPrefix(absPath, root) && len(root) > len(modRoot) {
+			modRoot = root
+		}
+	}
+	return modRoot
+}
+
+func indexedPackage(modRoot, absPath string, tags map[string]bool) (hasPackage, ok bool, err error) {
+	ip, err := modindex.GetPackage(modRoot, absPath)
+	if errors.Is(err, modindex.ErrNotIndexed) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, true, err
+	}
+	_, _, err = ip.ScanDir(tags)
+	return err != imports.ErrNoGo, true, nil
+}
+
 // WarnUnmatched warns about patterns that didn't match any packages.
 func WarnUnmatched(matches []*Match) {
 	for _, m := range matches {
@@ -353,19 +489,20 @@ func WarnUnmatched(matches []*Match) {
 
 // ImportPaths returns the matching paths to use for the given command line.
 // It calls ImportPathsQuiet and then WarnUnmatched.
-func ImportPaths(patterns, modRoots []string) []*Match {
-	matches := ImportPathsQuiet(patterns, modRoots)
+func ImportPaths(patterns []string) []*Match {
+	matches := ImportPathsQuiet(patterns)
 	WarnUnmatched(matches)
 	return matches
 }
 
 // ImportPathsQuiet is like ImportPaths but does not warn about patterns with no matches.
-func ImportPathsQuiet(patterns, modRoots []string) []*Match {
-	var out []*Match
-	for _, a := range CleanPatterns(patterns) {
+func ImportPathsQuiet(patterns []string) []*Match {
+	patterns = CleanPatterns(patterns)
+	out := make([]*Match, 0, len(patterns))
+	for _, a := range patterns {
 		m := NewMatch(a)
 		if m.IsLocal() {
-			m.MatchDirs(modRoots)
+			m.MatchDirs(nil)
 
 			// Change the file import path to a regular import path if the package
 			// is in GOPATH or GOROOT. We don't report errors here; LoadImport
@@ -399,7 +536,7 @@ func CleanPatterns(patterns []string) []string {
 	if len(patterns) == 0 {
 		return []string{"."}
 	}
-	var out []string
+	out := make([]string, 0, len(patterns))
 	for _, a := range patterns {
 		var p, v string
 		if build.IsLocalImport(a) || filepath.IsAbs(a) {
@@ -418,9 +555,7 @@ func CleanPatterns(patterns []string) []string {
 		if filepath.IsAbs(p) {
 			p = filepath.Clean(p)
 		} else {
-			if filepath.Separator == '\\' {
-				p = strings.ReplaceAll(p, `\`, `/`)
-			}
+			p = strings.ReplaceAll(p, `\`, `/`)
 
 			// Put argument in canonical form, but preserve leading ./.
 			if strings.HasPrefix(p, "./") {
@@ -509,4 +644,26 @@ func InDir(path, dir string) string {
 		}
 	}
 	return ""
+}
+
+// parseIgnorePatterns reads the go.mod file at the given module root
+// and extracts the ignore patterns defined within it.
+// If modRoot is empty, it returns nil.
+func parseIgnorePatterns(modRoot string) *IgnorePatterns {
+	if modRoot == "" {
+		return nil
+	}
+	data, err := os.ReadFile(filepath.Join(modRoot, "go.mod"))
+	if err != nil {
+		return nil
+	}
+	modFile, err := modfile.Parse("go.mod", data, nil)
+	if err != nil {
+		return nil
+	}
+	var patterns []string
+	for _, i := range modFile.Ignore {
+		patterns = append(patterns, i.Path)
+	}
+	return NewIgnorePatterns(patterns)
 }

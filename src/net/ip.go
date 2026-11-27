@@ -14,7 +14,10 @@ package net
 
 import (
 	"internal/bytealg"
-	"internal/itoa"
+	"internal/godebug"
+	"internal/goversion"
+	"internal/strconv"
+	"internal/stringslite"
 	"net/netip"
 )
 
@@ -131,6 +134,10 @@ func (ip IP) IsLoopback() bool {
 
 // IsPrivate reports whether ip is a private address, according to
 // RFC 1918 (IPv4 addresses) and RFC 4193 (IPv6 addresses).
+// That is, it reports whether ip is in 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, or fc00::/7.
+//
+// IsPrivate does not describe a security property of addresses,
+// and should not be used for access control.
 func (ip IP) IsPrivate() bool {
 	if ip4 := ip.To4(); ip4 != nil {
 		// Following RFC 1918, Section 3. Private Address Space which says:
@@ -300,11 +307,18 @@ func (ip IP) String() string {
 	if len(ip) != IPv4len && len(ip) != IPv6len {
 		return "?" + hexString(ip)
 	}
-	// If IPv4, use dotted notation.
-	if p4 := ip.To4(); len(p4) == IPv4len {
-		return netip.AddrFrom4([4]byte(p4)).String()
+
+	var buf []byte
+	switch len(ip) {
+	case IPv4len:
+		const maxCap = len("255.255.255.255")
+		buf = make([]byte, 0, maxCap)
+	case IPv6len:
+		const maxCap = len("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")
+		buf = make([]byte, 0, maxCap)
 	}
-	return netip.AddrFrom16([16]byte(ip)).String()
+	buf = ip.appendTo(buf)
+	return string(buf)
 }
 
 func hexString(b []byte) string {
@@ -324,17 +338,41 @@ func ipEmptyString(ip IP) string {
 	return ip.String()
 }
 
+// appendTo appends the string representation of ip to b and returns the expanded b
+// If len(ip) != IPv4len or IPv6len, it appends nothing.
+func (ip IP) appendTo(b []byte) []byte {
+	// If IPv4, use dotted notation.
+	if p4 := ip.To4(); len(p4) == IPv4len {
+		ip = p4
+	}
+	addr, _ := netip.AddrFromSlice(ip)
+	return addr.AppendTo(b)
+}
+
+// AppendText implements the [encoding.TextAppender] interface.
+// The encoding is the same as returned by [IP.String], with one exception:
+// When len(ip) is zero, it appends nothing.
+func (ip IP) AppendText(b []byte) ([]byte, error) {
+	if len(ip) == 0 {
+		return b, nil
+	}
+	if len(ip) != IPv4len && len(ip) != IPv6len {
+		return b, &AddrError{Err: "invalid IP address", Addr: hexString(ip)}
+	}
+
+	return ip.appendTo(b), nil
+}
+
 // MarshalText implements the [encoding.TextMarshaler] interface.
 // The encoding is the same as returned by [IP.String], with one exception:
 // When len(ip) is zero, it returns an empty slice.
 func (ip IP) MarshalText() ([]byte, error) {
-	if len(ip) == 0 {
-		return []byte(""), nil
+	// 24 is satisfied with all IPv4 addresses and short IPv6 addresses
+	b, err := ip.AppendText(make([]byte, 0, 24))
+	if err != nil {
+		return nil, err
 	}
-	if len(ip) != IPv4len && len(ip) != IPv6len {
-		return nil, &AddrError{Err: "invalid IP address", Addr: hexString(ip)}
-	}
-	return []byte(ip.String()), nil
+	return b, nil
 }
 
 // UnmarshalText implements the [encoding.TextUnmarshaler] interface.
@@ -421,6 +459,76 @@ func (m IPMask) String() string {
 	return hexString(m)
 }
 
+var netmarshal = godebug.New("netmarshal")
+
+// netmarshalOld reports whether we are using the backward
+// compatible marshaling for IPMask, IPNet, and HardwareAddr.
+func netmarshalOld() bool {
+	switch netmarshal.Value() {
+	case "":
+		return goversion.Version < 30
+	case "0":
+		if goversion.Version >= 30 {
+			netmarshal.IncNonDefault()
+		}
+		return true
+	default:
+		if goversion.Version < 30 {
+			netmarshal.IncNonDefault()
+		}
+		return false
+	}
+}
+
+// MarshalText implements the [encoding.TextMarshaler] interface.
+// We marshal an IPMask as though it were an IP address.
+// For backward compatibility invalid IPMask values are
+// always encoded as base64 strings, with no error.
+func (m IPMask) MarshalText() ([]byte, error) {
+	// For backward compatibility, marshal as plain []byte.
+	if netmarshalOld() {
+		return base64Encode(m), nil
+	}
+
+	// We don't use IP.MarshalText directly because
+	// we want to preserve the length.
+	addr, ok := netip.AddrFromSlice(m)
+	if !ok {
+		// For backward compatibility, fall back to the old
+		// marshaling for an invalid IPMask.
+		return base64Encode(m), nil
+	}
+	return addr.AppendTo(nil), nil
+}
+
+// UnmarshalText implements the [encoding.TextUnmarshaler] interface.
+// In older Go versions the JSON encoding of IPMask was
+// that of a []byte. In order to support new Go programs reading JSON
+// encodings produced by old Go programs, we support the []byte encoding.
+func (m *IPMask) UnmarshalText(text []byte) error {
+	var ip IP
+	err := ip.UnmarshalText(text)
+	if err == nil {
+		if bytealg.IndexByte(text, ':') < 0 {
+			ip = ip.To4()
+		}
+		*m = IPMask(ip)
+		return nil
+	}
+
+	// IP.Unmarshal failed; try base64.
+
+	dst := make([]byte, len(text)/4*3)
+	n, ok := base64Decode(dst, text)
+	if ok {
+		*m = IPMask(dst[:n])
+		return nil
+	}
+
+	// The base64 decode failed: return the IP.Unmarshal error.
+	return err
+}
+
 func networkNumberAndMask(n *IPNet) (ip IP, m IPMask) {
 	if ip = n.IP.To4(); ip == nil {
 		ip = n.IP
@@ -483,14 +591,15 @@ func (n *IPNet) String() string {
 	if l == -1 {
 		return nn.String() + "/" + m.String()
 	}
-	return nn.String() + "/" + itoa.Uitoa(uint(l))
+	return nn.String() + "/" + strconv.Itoa(l)
 }
 
 // ParseIP parses s as an IP address, returning the result.
 // The string s can be in IPv4 dotted decimal ("192.0.2.1"), IPv6
 // ("2001:db8::68"), or IPv4-mapped IPv6 ("::ffff:192.0.2.1") form.
 // If s is not a valid textual representation of an IP address,
-// ParseIP returns nil.
+// ParseIP returns nil. The returned address is always 16 bytes,
+// IPv4 addresses are returned in IPv4-mapped IPv6 form.
 func ParseIP(s string) IP {
 	if addr, valid := parseIP(s); valid {
 		return IP(addr[:])
@@ -515,11 +624,10 @@ func parseIP(s string) ([16]byte, bool) {
 // For example, ParseCIDR("192.0.2.1/24") returns the IP address
 // 192.0.2.1 and the network 192.0.2.0/24.
 func ParseCIDR(s string) (IP, *IPNet, error) {
-	i := bytealg.IndexByteString(s, '/')
-	if i < 0 {
+	addr, mask, found := stringslite.Cut(s, "/")
+	if !found {
 		return nil, nil, &ParseError{Type: "CIDR address", Text: s}
 	}
-	addr, mask := s[:i], s[i+1:]
 
 	ipAddr, err := netip.ParseAddr(addr)
 	if err != nil || ipAddr.Zone() != "" {
@@ -539,4 +647,119 @@ func copyIP(x IP) IP {
 	y := make(IP, len(x))
 	copy(y, x)
 	return y
+}
+
+// base64Coding is the standard base64 coding characters.
+const base64Coding = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+// base64Encode returns src encoded as base64,
+// assuming the standard encoding.
+// This is here so that the net package doesn't depend on encoding/base64.
+func base64Encode(src []byte) []byte {
+	dst := make([]byte, (len(src)+2)/3*4)
+
+	di, si := 0, 0
+	n := len(src) / 3 * 3
+	for si < n {
+		val := uint(src[si+0])<<16 | uint(src[si+1])<<8 | uint(src[si+2])
+
+		dst[di+0] = base64Coding[(val>>18)&0x3F]
+		dst[di+1] = base64Coding[(val>>12)&0x3F]
+		dst[di+2] = base64Coding[(val>>6)&0x3F]
+		dst[di+3] = base64Coding[val&0x3F]
+
+		si += 3
+		di += 4
+	}
+
+	remain := len(src) - si
+	if remain == 0 {
+		return dst
+	}
+
+	val := uint(src[si+0]) << 16
+	if remain == 2 {
+		val |= uint(src[si+1]) << 8
+	}
+
+	dst[di+0] = base64Coding[(val>>18)&0x3F]
+	dst[di+1] = base64Coding[(val>>12)&0x3F]
+
+	switch remain {
+	case 2:
+		dst[di+2] = base64Coding[(val>>6)&0x3F]
+		dst[di+3] = '='
+	case 1:
+		dst[di+2] = '='
+		dst[di+3] = '='
+	}
+
+	return dst
+}
+
+// base64Decode decodes base64 data from text into dst,
+// assuming the standard encoding.
+// It returns the number of bytes placed in dst,
+// and whether the decode was successful.
+// This is here so that the net package doesn't depend on encoding/base64.
+func base64Decode(dst, text []byte) (int, bool) {
+	n := 0
+	for len(text) > 0 {
+		var dbuf [4]byte
+		dlen := 4
+		for j := range dbuf {
+			if len(text) == 0 {
+				return 0, false
+			}
+			in := text[0]
+			text = text[1:]
+
+			// Check for padding at end of input.
+			if in == '=' {
+				switch j {
+				case 0, 1:
+					return 0, false
+				case 2:
+					// We expect one more padding character.
+					if len(text) != 1 || text[0] != '=' {
+						return 0, false
+					}
+					text = text[1:]
+				case 3:
+					if len(text) != 0 {
+						return 0, false
+					}
+				}
+
+				dlen = j
+				break
+			}
+
+			out := bytealg.IndexByteString(base64Coding, in)
+			if out < 0 {
+				return 0, false
+			}
+
+			dbuf[j] = byte(out)
+		}
+
+		// Convert 4 6-bit sources into 3 bytes.
+		val := uint32(dbuf[0])<<18 | uint32(dbuf[1])<<12 | uint32(dbuf[2])<<6 | uint32(dbuf[3])
+		dbuf[2], dbuf[1], dbuf[0] = byte(val>>0), byte(val>>8), byte(val>>16)
+		switch dlen {
+		case 4:
+			dst[2] = dbuf[2]
+			fallthrough
+		case 3:
+			dst[1] = dbuf[1]
+			fallthrough
+		case 2:
+			dst[0] = dbuf[0]
+		}
+
+		dst = dst[3:]
+		n += dlen - 1
+	}
+
+	return n, true
 }

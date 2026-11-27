@@ -9,10 +9,12 @@ package work
 import (
 	"bytes"
 	"cmd/go/internal/base"
+	"cmd/go/internal/build"
 	"cmd/go/internal/cfg"
 	"cmd/go/internal/fsys"
 	"cmd/go/internal/modload"
 	"cmd/internal/quoted"
+	"errors"
 	"fmt"
 	"internal/platform"
 	"os"
@@ -20,24 +22,98 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"sync"
 )
 
 var buildInitStarted = false
 
-func BuildInit() {
+// makeCfgChangedEnv is the environment to set to
+// override the current environment for GOOS, GOARCH, and the GOARCH-specific
+// architecture environment variable to the configuration used by
+// the go command. They may be different because go tool <tool> for builtin
+// tools need to be built using the host configuration, so the configuration
+// used will be changed from that set in the environment. It is clipped
+// so its can append to it without changing it.
+var cfgChangedEnv []string
+
+func makeCfgChangedEnv() []string {
+	var env []string
+	if cfg.Getenv("GOOS") != cfg.Goos {
+		env = append(env, "GOOS="+cfg.Goos)
+	}
+	if cfg.Getenv("GOARCH") != cfg.Goarch {
+		env = append(env, "GOARCH="+cfg.Goarch)
+	}
+	if archenv, val, changed := cfg.GetArchEnv(); changed {
+		env = append(env, archenv+"="+val)
+	}
+	return slices.Clip(env)
+}
+
+func BuildInit(ld *modload.Loader) {
 	if buildInitStarted {
 		base.Fatalf("go: internal error: work.BuildInit called more than once")
 	}
 	buildInitStarted = true
 	base.AtExit(closeBuilders)
 
-	modload.Init()
+	if cfg.GORESTRICTEDBUILD != "0" && cfg.GORESTRICTEDBUILD != "1" {
+		base.Fatalf("go: invalid GORESTRICTEDBUILD value %q (must be 0 or 1)", cfg.GORESTRICTEDBUILD)
+	}
+	if cfg.RestrictedBuild() {
+		if cfg.BuildContext.CgoEnabled == build.CgoEnabled {
+			cfg.BuildContext.CgoEnabled = build.CgoDisabled
+		}
+		if cfg.BuildBuildvcs == "true" {
+			base.Fatalf("go: -buildvcs=true is not allowed when GORESTRICTEDBUILD=1")
+		}
+		cfg.BuildBuildvcs = "false"
+		if cfg.BuildToolchainName == "gccgo" {
+			base.Fatalf("go: -compiler=gccgo is not allowed when GORESTRICTEDBUILD=1")
+		}
+		if cfg.BuildASan {
+			base.Fatalf("go: -asan is not allowed when GORESTRICTEDBUILD=1")
+		}
+		if cfg.BuildMSan {
+			base.Fatalf("go: -msan is not allowed when GORESTRICTEDBUILD=1")
+		}
+		if cfg.BuildLinkshared {
+			base.Fatalf("go: -linkshared is not allowed when GORESTRICTEDBUILD=1")
+		}
+		switch cfg.BuildBuildmode {
+		case "c-archive", "c-shared", "shared", "plugin":
+			base.Fatalf("go: -buildmode=%s is not allowed when GORESTRICTEDBUILD=1", cfg.BuildBuildmode)
+		}
+	}
+
+	// Check CGO_ENABLED=bindings here rather than at startup, so that
+	// commands like go env, go version, and go help keep working with a
+	// saved CGO_ENABLED=bindings setting.
+	if cfg.BuildContext.CgoEnabled == build.CgoBindings {
+		if !platform.CgoSupported(cfg.Goos, cfg.Goarch) || platform.Broken(cfg.Goos, cfg.Goarch) {
+			base.Fatalf("go: CGO_ENABLED=bindings is not supported on %s/%s", cfg.Goos, cfg.Goarch)
+		}
+		if cfg.Experiment != nil && !cfg.Experiment.CgoBindings {
+			base.Fatalf("go: CGO_ENABLED=bindings requires GOEXPERIMENT=cgobindings")
+		}
+		if cfg.BuildContext.Compiler != "gc" {
+			base.Fatalf("go: CGO_ENABLED=bindings is not supported with -compiler=%s", cfg.BuildContext.Compiler)
+		}
+	}
+
+	modload.Init(ld)
 	instrumentInit()
 	buildModeInit()
-	if err := fsys.Init(base.Cwd()); err != nil {
+	initCompilerConcurrencyPool()
+	cfgChangedEnv = makeCfgChangedEnv()
+
+	if err := fsys.Init(); err != nil {
 		base.Fatal(err)
+	}
+	if from, replaced := fsys.DirContainsReplacement(cfg.GOMODCACHE); replaced {
+		base.Fatalf("go: overlay contains a replacement for %s. Files beneath GOMODCACHE (%s) must not be replaced.", from, cfg.GOMODCACHE)
 	}
 
 	// Make sure -pkgdir is absolute, because we run commands
@@ -162,9 +238,13 @@ func instrumentInit() {
 
 	// Check that cgo is enabled.
 	// Note: On macOS, -race does not require cgo. -asan and -msan still do.
-	if !cfg.BuildContext.CgoEnabled && (cfg.Goos != "darwin" || cfg.BuildASan || cfg.BuildMSan) {
+	// With CGO_ENABLED=bindings, -race imports the race runtime's C library
+	// dependencies dynamically and does not require a C toolchain.
+	if cfg.BuildContext.CgoEnabled != build.CgoEnabled && !(cfg.BuildContext.CgoEnabled == build.CgoBindings && cfg.BuildRace) && (cfg.Goos != "darwin" || cfg.BuildASan || cfg.BuildMSan) {
 		if runtime.GOOS != cfg.Goos || runtime.GOARCH != cfg.Goarch {
 			fmt.Fprintf(os.Stderr, "go: %s requires cgo\n", modeFlag)
+		} else if cfg.BuildRace && cfg.Experiment != nil && cfg.Experiment.CgoBindings {
+			fmt.Fprintf(os.Stderr, "go: %s requires cgo; enable cgo by setting CGO_ENABLED=1 or CGO_ENABLED=bindings\n", modeFlag)
 		} else {
 			fmt.Fprintf(os.Stderr, "go: %s requires cgo; enable cgo by setting CGO_ENABLED=1\n", modeFlag)
 		}
@@ -353,11 +433,16 @@ var compiler struct {
 // It returns a non-nil error if the compiler matches a known version schema but
 // the version could not be parsed, or if $(go env CC) could not be determined.
 func compilerVersion() (version, error) {
+	if cfg.RestrictedBuild() {
+		return version{}, errors.New("C compiler invocation is not allowed when GORESTRICTEDBUILD=1")
+	}
 	compiler.Once.Do(func() {
 		compiler.err = func() error {
 			compiler.name = "unknown"
 			cc := os.Getenv("CC")
-			out, err := exec.Command(cc, "--version").Output()
+			cmd := exec.Command(cc, "--version")
+			cmd.Env = append(cmd.Environ(), "LANG=C")
+			out, err := cmd.Output()
 			if err != nil {
 				// Compiler does not support "--version" flag: not Clang or GCC.
 				return err
@@ -366,7 +451,9 @@ func compilerVersion() (version, error) {
 			var match [][]byte
 			if bytes.HasPrefix(out, []byte("gcc")) {
 				compiler.name = "gcc"
-				out, err := exec.Command(cc, "-v").CombinedOutput()
+				cmd := exec.Command(cc, "-v")
+				cmd.Env = append(cmd.Environ(), "LANG=C")
+				out, err := cmd.CombinedOutput()
 				if err != nil {
 					// gcc, but does not support gcc's "-v" flag?!
 					return err

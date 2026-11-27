@@ -26,6 +26,10 @@ func GoSyntax(inst Inst, pc uint64, symname func(uint64) (string, uint64), text 
 		symname = func(uint64) (string, uint64) { return "", 0 }
 	}
 
+	if sveIsOp(inst.Op) {
+		return sveGoSyntax(inst)
+	}
+
 	var args []string
 	for _, a := range inst.Args {
 		if a == nil {
@@ -52,31 +56,18 @@ func GoSyntax(inst Inst, pc uint64, symname func(uint64) (string, uint64), text 
 
 	// Move addressing mode into opcode suffix.
 	suffix := ""
-	switch inst.Op {
-	case LDR, LDRB, LDRH, LDRSB, LDRSH, LDRSW, STR, STRB, STRH, STUR, STURB, STURH, LD1, ST1:
-		switch mem := inst.Args[1].(type) {
+	for i := range inst.Args {
+		switch mem := inst.Args[i].(type) {
 		case MemImmediate:
 			switch mem.Mode {
 			case AddrOffset:
 				// no suffix
 			case AddrPreIndex:
-				suffix = ".W"
+				suffix += ".W"
 			case AddrPostIndex, AddrPostReg:
-				suffix = ".P"
+				suffix += ".P"
 			}
-		}
 
-	case STP, LDP:
-		switch mem := inst.Args[2].(type) {
-		case MemImmediate:
-			switch mem.Mode {
-			case AddrOffset:
-				// no suffix
-			case AddrPreIndex:
-				suffix = ".W"
-			case AddrPostIndex:
-				suffix = ".P"
-			}
 		}
 	}
 
@@ -119,6 +110,12 @@ func GoSyntax(inst Inst, pc uint64, symname func(uint64) (string, uint64), text 
 		}
 		if rno >= 0 && rno <= int(WZR) {
 			op = "MOVW"
+			// mov Wd, Wm zero-extends into Xd. cmd/asm's MOVW between
+			// registers is the sign-extending move (SXTW); the
+			// zero-extending one is MOVWU.
+			if src, ok := inst.Args[1].(Reg); ok && src <= WZR {
+				op = "MOVWU"
+			}
 		} else if rno >= int(X0) && rno <= int(XZR) {
 			op = "MOVD"
 		}

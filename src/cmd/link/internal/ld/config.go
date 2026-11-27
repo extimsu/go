@@ -8,7 +8,12 @@ import (
 	"fmt"
 	"internal/buildcfg"
 	"internal/platform"
+	"os"
 )
+
+func restrictedBuild() bool {
+	return os.Getenv("GORESTRICTEDBUILD") == "1"
+}
 
 // A BuildMode indicates the sort of object we are building.
 //
@@ -34,7 +39,7 @@ func (mode *BuildMode) Set(s string) error {
 		return fmt.Errorf("invalid buildmode: %q", s)
 	case "exe":
 		switch buildcfg.GOOS + "/" + buildcfg.GOARCH {
-		case "darwin/arm64", "windows/arm", "windows/arm64": // On these platforms, everything is PIE
+		case "darwin/amd64", "darwin/arm64", "windows/arm64": // On these platforms, everything is PIE
 			*mode = BuildModePIE
 		default:
 			*mode = BuildModeExe
@@ -136,8 +141,17 @@ func mustLinkExternal(ctxt *Link) (res bool, reason string) {
 		return true, "asan"
 	}
 
-	if iscgo && platform.MustLinkExternal(buildcfg.GOOS, buildcfg.GOARCH, true) {
-		return true, buildcfg.GOARCH + " does not support internal cgo"
+	if iscgo {
+		var mustExt bool
+		if buildcfg.Experiment.RuntimeCgoPurego && len(hostobj) == 0 {
+			// The pure Go runtime/cgo and no C host objects.
+			mustExt = platform.MustLinkExternalWithoutHostObj(buildcfg.GOOS, buildcfg.GOARCH)
+		} else {
+			mustExt = platform.MustLinkExternal(buildcfg.GOOS, buildcfg.GOARCH, true)
+		}
+		if mustExt {
+			return true, buildcfg.GOARCH + " does not support internal cgo"
+		}
 	}
 
 	// Some build modes require work the internal linker cannot do (yet).
@@ -145,6 +159,9 @@ func mustLinkExternal(ctxt *Link) (res bool, reason string) {
 	case BuildModeCArchive:
 		return true, "buildmode=c-archive"
 	case BuildModeCShared:
+		if buildcfg.GOARCH == "wasm" {
+			break
+		}
 		return true, "buildmode=c-shared"
 	case BuildModePIE:
 		if !platform.InternalLinkPIESupported(buildcfg.GOOS, buildcfg.GOARCH) {
@@ -185,6 +202,17 @@ func determineLinkMode(ctxt *Link) {
 	extNeeded, extReason := mustLinkExternal(ctxt)
 	via := ""
 
+	if restrictedBuild() {
+		if ctxt.LinkMode == LinkExternal {
+			Exitf("external linking is not allowed when GORESTRICTEDBUILD=1")
+		}
+		ctxt.LinkMode = LinkInternal
+		if extNeeded {
+			Exitf("GORESTRICTEDBUILD=1 requires internal linking, but external linking is required: %s", extReason)
+		}
+		return
+	}
+
 	if ctxt.LinkMode == LinkAuto {
 		// The environment variable GO_EXTLINK_ENABLED controls the
 		// default value of -linkmode. If it is not set when the
@@ -210,15 +238,7 @@ func determineLinkMode(ctxt *Link) {
 		}
 	}
 
-	switch ctxt.LinkMode {
-	case LinkInternal:
-		if extNeeded {
-			Exitf("internal linking requested %sbut external linking required: %s", via, extReason)
-		}
-	case LinkExternal:
-		switch {
-		case buildcfg.GOARCH == "ppc64" && buildcfg.GOOS == "linux":
-			Exitf("external linking not supported for %s/ppc64", buildcfg.GOOS)
-		}
+	if ctxt.LinkMode == LinkInternal && extNeeded {
+		Exitf("internal linking requested %sbut external linking required: %s", via, extReason)
 	}
 }

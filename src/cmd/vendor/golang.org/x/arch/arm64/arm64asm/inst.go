@@ -19,6 +19,9 @@ type Op uint16
 
 func (op Op) String() string {
 	if op >= Op(len(opstr)) || opstr[op] == "" {
+		if sveIsOp(op) {
+			return sveOpString(op)
+		}
 		return fmt.Sprintf("Op(%d)", int(op))
 	}
 	return opstr[op]
@@ -51,7 +54,8 @@ type Args [5]Arg
 // Reg, RegSP, ImmShift, RegExtshiftAmount, PCRel, MemImmediate,
 // MemExtend, Imm, Imm64, Imm_hint, Imm_clrex, Imm_dcps, Cond,
 // Imm_c, Imm_option, Imm_prfop, Pstatefield, Systemreg, Imm_fp
-// RegisterWithArrangement, RegisterWithArrangementAndIndex.
+// RegisterWithArrangement, RegisterWithArrangementAndIndex,
+// ImmSigned, MemScaledVL, MemVectorBase, MemVectorIndex, VLGroup.
 type Arg interface {
 	isArg()
 	String() string
@@ -357,6 +361,9 @@ func (r Reg) String() string {
 	case V0 <= r && r <= V31:
 		return fmt.Sprintf("V%d", int(r-V0))
 	default:
+		if s := sveRegString(r); s != "" {
+			return s
+		}
 		return fmt.Sprintf("Reg(%d)", int(r))
 	}
 }
@@ -469,7 +476,7 @@ func (rea RegExtshiftAmount) String() string {
 		if rea.amount != 0 {
 			buf += fmt.Sprintf(" #%d", rea.amount)
 		} else {
-			if rea.show_zero == true {
+			if rea.show_zero {
 				buf += fmt.Sprintf(" #%d", rea.amount)
 			}
 		}
@@ -527,7 +534,7 @@ func (m MemImmediate) String() string {
 		postR := post.String()
 		return fmt.Sprintf("[%s], %s", R, postR)
 	}
-	return fmt.Sprintf("unimplemented!")
+	return "unimplemented!"
 }
 
 // A MemExtend is a memory reference made up of a base R and index expression X.
@@ -897,6 +904,8 @@ func (a Arrangement) String() (result string) {
 		result = ".2D"
 	case Arrangement1Q:
 		result = ".1Q"
+	default:
+		result = sveArrangementString(a)
 	}
 	return
 }
@@ -905,12 +914,18 @@ func (a Arrangement) String() (result string) {
 type RegisterWithArrangement struct {
 	r   Reg
 	a   Arrangement
-	cnt uint8
+	cnt uint8 // registers in a list, or 0 if not a list; the top bit is sveRangeBit
 }
 
 func (RegisterWithArrangement) isArg() {}
 
 func (r RegisterWithArrangement) String() string {
+	if n, rng := listCount(r.cnt); rng || fileBase(r.r) != V0 {
+		if n == 0 {
+			return r.r.String() + r.a.String()
+		}
+		return sveListString(r.r, r.a, n)
+	}
 	result := r.r.String()
 	result += r.a.String()
 	if r.cnt > 0 {
@@ -942,12 +957,19 @@ type RegisterWithArrangementAndIndex struct {
 	r     Reg
 	a     Arrangement
 	index uint8
-	cnt   uint8
+	cnt   uint8 // registers in a list, or 0 if not a list; the top bit is sveRangeBit
 }
 
 func (RegisterWithArrangementAndIndex) isArg() {}
 
 func (r RegisterWithArrangementAndIndex) String() string {
+	if n, rng := listCount(r.cnt); rng || fileBase(r.r) != V0 {
+		s := r.r.String() + r.a.String()
+		if n > 1 {
+			s = sveListString(r.r, r.a, n)
+		}
+		return fmt.Sprintf("%s[%d]", s, r.index)
+	}
 	result := r.r.String()
 	result += r.a.String()
 	if r.cnt > 0 {
@@ -1021,110 +1043,110 @@ func (s sysInstFields) getType() sys {
 }
 
 var sysInstsAttrs = map[sysInstFields]sysInstAttrs{
-	sysInstFields{0, 8, 3, 0}:  {sys_TLBI, "VMALLE1IS", false},
-	sysInstFields{0, 8, 3, 1}:  {sys_TLBI, "VAE1IS", true},
-	sysInstFields{0, 8, 3, 2}:  {sys_TLBI, "ASIDE1IS", true},
-	sysInstFields{0, 8, 3, 3}:  {sys_TLBI, "VAAE1IS", true},
-	sysInstFields{0, 8, 3, 5}:  {sys_TLBI, "VALE1IS", true},
-	sysInstFields{0, 8, 3, 7}:  {sys_TLBI, "VAALE1IS", true},
-	sysInstFields{0, 8, 7, 0}:  {sys_TLBI, "VMALLE1", false},
-	sysInstFields{0, 8, 7, 1}:  {sys_TLBI, "VAE1", true},
-	sysInstFields{0, 8, 7, 2}:  {sys_TLBI, "ASIDE1", true},
-	sysInstFields{0, 8, 7, 3}:  {sys_TLBI, "VAAE1", true},
-	sysInstFields{0, 8, 7, 5}:  {sys_TLBI, "VALE1", true},
-	sysInstFields{0, 8, 7, 7}:  {sys_TLBI, "VAALE1", true},
-	sysInstFields{4, 8, 0, 1}:  {sys_TLBI, "IPAS2E1IS", true},
-	sysInstFields{4, 8, 0, 5}:  {sys_TLBI, "IPAS2LE1IS", true},
-	sysInstFields{4, 8, 3, 0}:  {sys_TLBI, "ALLE2IS", false},
-	sysInstFields{4, 8, 3, 1}:  {sys_TLBI, "VAE2IS", true},
-	sysInstFields{4, 8, 3, 4}:  {sys_TLBI, "ALLE1IS", false},
-	sysInstFields{4, 8, 3, 5}:  {sys_TLBI, "VALE2IS", true},
-	sysInstFields{4, 8, 3, 6}:  {sys_TLBI, "VMALLS12E1IS", false},
-	sysInstFields{4, 8, 4, 1}:  {sys_TLBI, "IPAS2E1", true},
-	sysInstFields{4, 8, 4, 5}:  {sys_TLBI, "IPAS2LE1", true},
-	sysInstFields{4, 8, 7, 0}:  {sys_TLBI, "ALLE2", false},
-	sysInstFields{4, 8, 7, 1}:  {sys_TLBI, "VAE2", true},
-	sysInstFields{4, 8, 7, 4}:  {sys_TLBI, "ALLE1", false},
-	sysInstFields{4, 8, 7, 5}:  {sys_TLBI, "VALE2", true},
-	sysInstFields{4, 8, 7, 6}:  {sys_TLBI, "VMALLS12E1", false},
-	sysInstFields{6, 8, 3, 0}:  {sys_TLBI, "ALLE3IS", false},
-	sysInstFields{6, 8, 3, 1}:  {sys_TLBI, "VAE3IS", true},
-	sysInstFields{6, 8, 3, 5}:  {sys_TLBI, "VALE3IS", true},
-	sysInstFields{6, 8, 7, 0}:  {sys_TLBI, "ALLE3", false},
-	sysInstFields{6, 8, 7, 1}:  {sys_TLBI, "VAE3", true},
-	sysInstFields{6, 8, 7, 5}:  {sys_TLBI, "VALE3", true},
-	sysInstFields{0, 8, 1, 0}:  {sys_TLBI, "VMALLE1OS", false},
-	sysInstFields{0, 8, 1, 1}:  {sys_TLBI, "VAE1OS", true},
-	sysInstFields{0, 8, 1, 2}:  {sys_TLBI, "ASIDE1OS", true},
-	sysInstFields{0, 8, 1, 3}:  {sys_TLBI, "VAAE1OS", true},
-	sysInstFields{0, 8, 1, 5}:  {sys_TLBI, "VALE1OS", true},
-	sysInstFields{0, 8, 1, 7}:  {sys_TLBI, "VAALE1OS", true},
-	sysInstFields{0, 8, 2, 1}:  {sys_TLBI, "RVAE1IS", true},
-	sysInstFields{0, 8, 2, 3}:  {sys_TLBI, "RVAAE1IS", true},
-	sysInstFields{0, 8, 2, 5}:  {sys_TLBI, "RVALE1IS", true},
-	sysInstFields{0, 8, 2, 7}:  {sys_TLBI, "RVAALE1IS", true},
-	sysInstFields{0, 8, 5, 1}:  {sys_TLBI, "RVAE1OS", true},
-	sysInstFields{0, 8, 5, 3}:  {sys_TLBI, "RVAAE1OS", true},
-	sysInstFields{0, 8, 5, 5}:  {sys_TLBI, "RVALE1OS", true},
-	sysInstFields{0, 8, 5, 7}:  {sys_TLBI, "RVAALE1OS", true},
-	sysInstFields{0, 8, 6, 1}:  {sys_TLBI, "RVAE1", true},
-	sysInstFields{0, 8, 6, 3}:  {sys_TLBI, "RVAAE1", true},
-	sysInstFields{0, 8, 6, 5}:  {sys_TLBI, "RVALE1", true},
-	sysInstFields{0, 8, 6, 7}:  {sys_TLBI, "RVAALE1", true},
-	sysInstFields{4, 8, 0, 2}:  {sys_TLBI, "RIPAS2E1IS", true},
-	sysInstFields{4, 8, 0, 6}:  {sys_TLBI, "RIPAS2LE1IS", true},
-	sysInstFields{4, 8, 1, 0}:  {sys_TLBI, "ALLE2OS", false},
-	sysInstFields{4, 8, 1, 1}:  {sys_TLBI, "VAE2OS", true},
-	sysInstFields{4, 8, 1, 4}:  {sys_TLBI, "ALLE1OS", false},
-	sysInstFields{4, 8, 1, 5}:  {sys_TLBI, "VALE2OS", true},
-	sysInstFields{4, 8, 1, 6}:  {sys_TLBI, "VMALLS12E1OS", false},
-	sysInstFields{4, 8, 2, 1}:  {sys_TLBI, "RVAE2IS", true},
-	sysInstFields{4, 8, 2, 5}:  {sys_TLBI, "RVALE2IS", true},
-	sysInstFields{4, 8, 4, 0}:  {sys_TLBI, "IPAS2E1OS", true},
-	sysInstFields{4, 8, 4, 2}:  {sys_TLBI, "RIPAS2E1", true},
-	sysInstFields{4, 8, 4, 3}:  {sys_TLBI, "RIPAS2E1OS", true},
-	sysInstFields{4, 8, 4, 4}:  {sys_TLBI, "IPAS2LE1OS", true},
-	sysInstFields{4, 8, 4, 6}:  {sys_TLBI, "RIPAS2LE1", true},
-	sysInstFields{4, 8, 4, 7}:  {sys_TLBI, "RIPAS2LE1OS", true},
-	sysInstFields{4, 8, 5, 1}:  {sys_TLBI, "RVAE2OS", true},
-	sysInstFields{4, 8, 5, 5}:  {sys_TLBI, "RVALE2OS", true},
-	sysInstFields{4, 8, 6, 1}:  {sys_TLBI, "RVAE2", true},
-	sysInstFields{4, 8, 6, 5}:  {sys_TLBI, "RVALE2", true},
-	sysInstFields{6, 8, 1, 0}:  {sys_TLBI, "ALLE3OS", false},
-	sysInstFields{6, 8, 1, 1}:  {sys_TLBI, "VAE3OS", true},
-	sysInstFields{6, 8, 1, 5}:  {sys_TLBI, "VALE3OS", true},
-	sysInstFields{6, 8, 2, 1}:  {sys_TLBI, "RVAE3IS", true},
-	sysInstFields{6, 8, 2, 5}:  {sys_TLBI, "RVALE3IS", true},
-	sysInstFields{6, 8, 5, 1}:  {sys_TLBI, "RVAE3OS", true},
-	sysInstFields{6, 8, 5, 5}:  {sys_TLBI, "RVALE3OS", true},
-	sysInstFields{6, 8, 6, 1}:  {sys_TLBI, "RVAE3", true},
-	sysInstFields{6, 8, 6, 5}:  {sys_TLBI, "RVALE3", true},
-	sysInstFields{0, 7, 6, 1}:  {sys_DC, "IVAC", true},
-	sysInstFields{0, 7, 6, 2}:  {sys_DC, "ISW", true},
-	sysInstFields{0, 7, 10, 2}: {sys_DC, "CSW", true},
-	sysInstFields{0, 7, 14, 2}: {sys_DC, "CISW", true},
-	sysInstFields{3, 7, 4, 1}:  {sys_DC, "ZVA", true},
-	sysInstFields{3, 7, 10, 1}: {sys_DC, "CVAC", true},
-	sysInstFields{3, 7, 11, 1}: {sys_DC, "CVAU", true},
-	sysInstFields{3, 7, 14, 1}: {sys_DC, "CIVAC", true},
-	sysInstFields{0, 7, 6, 3}:  {sys_DC, "IGVAC", true},
-	sysInstFields{0, 7, 6, 4}:  {sys_DC, "IGSW", true},
-	sysInstFields{0, 7, 6, 5}:  {sys_DC, "IGDVAC", true},
-	sysInstFields{0, 7, 6, 6}:  {sys_DC, "IGDSW", true},
-	sysInstFields{0, 7, 10, 4}: {sys_DC, "CGSW", true},
-	sysInstFields{0, 7, 10, 6}: {sys_DC, "CGDSW", true},
-	sysInstFields{0, 7, 14, 4}: {sys_DC, "CIGSW", true},
-	sysInstFields{0, 7, 14, 6}: {sys_DC, "CIGDSW", true},
-	sysInstFields{3, 7, 4, 3}:  {sys_DC, "GVA", true},
-	sysInstFields{3, 7, 4, 4}:  {sys_DC, "GZVA", true},
-	sysInstFields{3, 7, 10, 3}: {sys_DC, "CGVAC", true},
-	sysInstFields{3, 7, 10, 5}: {sys_DC, "CGDVAC", true},
-	sysInstFields{3, 7, 12, 3}: {sys_DC, "CGVAP", true},
-	sysInstFields{3, 7, 12, 5}: {sys_DC, "CGDVAP", true},
-	sysInstFields{3, 7, 13, 3}: {sys_DC, "CGVADP", true},
-	sysInstFields{3, 7, 13, 5}: {sys_DC, "CGDVADP", true},
-	sysInstFields{3, 7, 14, 3}: {sys_DC, "CIGVAC", true},
-	sysInstFields{3, 7, 14, 5}: {sys_DC, "CIGDVAC", true},
-	sysInstFields{3, 7, 12, 1}: {sys_DC, "CVAP", true},
-	sysInstFields{3, 7, 13, 1}: {sys_DC, "CVADP", true},
+	{0, 8, 3, 0}:  {sys_TLBI, "VMALLE1IS", false},
+	{0, 8, 3, 1}:  {sys_TLBI, "VAE1IS", true},
+	{0, 8, 3, 2}:  {sys_TLBI, "ASIDE1IS", true},
+	{0, 8, 3, 3}:  {sys_TLBI, "VAAE1IS", true},
+	{0, 8, 3, 5}:  {sys_TLBI, "VALE1IS", true},
+	{0, 8, 3, 7}:  {sys_TLBI, "VAALE1IS", true},
+	{0, 8, 7, 0}:  {sys_TLBI, "VMALLE1", false},
+	{0, 8, 7, 1}:  {sys_TLBI, "VAE1", true},
+	{0, 8, 7, 2}:  {sys_TLBI, "ASIDE1", true},
+	{0, 8, 7, 3}:  {sys_TLBI, "VAAE1", true},
+	{0, 8, 7, 5}:  {sys_TLBI, "VALE1", true},
+	{0, 8, 7, 7}:  {sys_TLBI, "VAALE1", true},
+	{4, 8, 0, 1}:  {sys_TLBI, "IPAS2E1IS", true},
+	{4, 8, 0, 5}:  {sys_TLBI, "IPAS2LE1IS", true},
+	{4, 8, 3, 0}:  {sys_TLBI, "ALLE2IS", false},
+	{4, 8, 3, 1}:  {sys_TLBI, "VAE2IS", true},
+	{4, 8, 3, 4}:  {sys_TLBI, "ALLE1IS", false},
+	{4, 8, 3, 5}:  {sys_TLBI, "VALE2IS", true},
+	{4, 8, 3, 6}:  {sys_TLBI, "VMALLS12E1IS", false},
+	{4, 8, 4, 1}:  {sys_TLBI, "IPAS2E1", true},
+	{4, 8, 4, 5}:  {sys_TLBI, "IPAS2LE1", true},
+	{4, 8, 7, 0}:  {sys_TLBI, "ALLE2", false},
+	{4, 8, 7, 1}:  {sys_TLBI, "VAE2", true},
+	{4, 8, 7, 4}:  {sys_TLBI, "ALLE1", false},
+	{4, 8, 7, 5}:  {sys_TLBI, "VALE2", true},
+	{4, 8, 7, 6}:  {sys_TLBI, "VMALLS12E1", false},
+	{6, 8, 3, 0}:  {sys_TLBI, "ALLE3IS", false},
+	{6, 8, 3, 1}:  {sys_TLBI, "VAE3IS", true},
+	{6, 8, 3, 5}:  {sys_TLBI, "VALE3IS", true},
+	{6, 8, 7, 0}:  {sys_TLBI, "ALLE3", false},
+	{6, 8, 7, 1}:  {sys_TLBI, "VAE3", true},
+	{6, 8, 7, 5}:  {sys_TLBI, "VALE3", true},
+	{0, 8, 1, 0}:  {sys_TLBI, "VMALLE1OS", false},
+	{0, 8, 1, 1}:  {sys_TLBI, "VAE1OS", true},
+	{0, 8, 1, 2}:  {sys_TLBI, "ASIDE1OS", true},
+	{0, 8, 1, 3}:  {sys_TLBI, "VAAE1OS", true},
+	{0, 8, 1, 5}:  {sys_TLBI, "VALE1OS", true},
+	{0, 8, 1, 7}:  {sys_TLBI, "VAALE1OS", true},
+	{0, 8, 2, 1}:  {sys_TLBI, "RVAE1IS", true},
+	{0, 8, 2, 3}:  {sys_TLBI, "RVAAE1IS", true},
+	{0, 8, 2, 5}:  {sys_TLBI, "RVALE1IS", true},
+	{0, 8, 2, 7}:  {sys_TLBI, "RVAALE1IS", true},
+	{0, 8, 5, 1}:  {sys_TLBI, "RVAE1OS", true},
+	{0, 8, 5, 3}:  {sys_TLBI, "RVAAE1OS", true},
+	{0, 8, 5, 5}:  {sys_TLBI, "RVALE1OS", true},
+	{0, 8, 5, 7}:  {sys_TLBI, "RVAALE1OS", true},
+	{0, 8, 6, 1}:  {sys_TLBI, "RVAE1", true},
+	{0, 8, 6, 3}:  {sys_TLBI, "RVAAE1", true},
+	{0, 8, 6, 5}:  {sys_TLBI, "RVALE1", true},
+	{0, 8, 6, 7}:  {sys_TLBI, "RVAALE1", true},
+	{4, 8, 0, 2}:  {sys_TLBI, "RIPAS2E1IS", true},
+	{4, 8, 0, 6}:  {sys_TLBI, "RIPAS2LE1IS", true},
+	{4, 8, 1, 0}:  {sys_TLBI, "ALLE2OS", false},
+	{4, 8, 1, 1}:  {sys_TLBI, "VAE2OS", true},
+	{4, 8, 1, 4}:  {sys_TLBI, "ALLE1OS", false},
+	{4, 8, 1, 5}:  {sys_TLBI, "VALE2OS", true},
+	{4, 8, 1, 6}:  {sys_TLBI, "VMALLS12E1OS", false},
+	{4, 8, 2, 1}:  {sys_TLBI, "RVAE2IS", true},
+	{4, 8, 2, 5}:  {sys_TLBI, "RVALE2IS", true},
+	{4, 8, 4, 0}:  {sys_TLBI, "IPAS2E1OS", true},
+	{4, 8, 4, 2}:  {sys_TLBI, "RIPAS2E1", true},
+	{4, 8, 4, 3}:  {sys_TLBI, "RIPAS2E1OS", true},
+	{4, 8, 4, 4}:  {sys_TLBI, "IPAS2LE1OS", true},
+	{4, 8, 4, 6}:  {sys_TLBI, "RIPAS2LE1", true},
+	{4, 8, 4, 7}:  {sys_TLBI, "RIPAS2LE1OS", true},
+	{4, 8, 5, 1}:  {sys_TLBI, "RVAE2OS", true},
+	{4, 8, 5, 5}:  {sys_TLBI, "RVALE2OS", true},
+	{4, 8, 6, 1}:  {sys_TLBI, "RVAE2", true},
+	{4, 8, 6, 5}:  {sys_TLBI, "RVALE2", true},
+	{6, 8, 1, 0}:  {sys_TLBI, "ALLE3OS", false},
+	{6, 8, 1, 1}:  {sys_TLBI, "VAE3OS", true},
+	{6, 8, 1, 5}:  {sys_TLBI, "VALE3OS", true},
+	{6, 8, 2, 1}:  {sys_TLBI, "RVAE3IS", true},
+	{6, 8, 2, 5}:  {sys_TLBI, "RVALE3IS", true},
+	{6, 8, 5, 1}:  {sys_TLBI, "RVAE3OS", true},
+	{6, 8, 5, 5}:  {sys_TLBI, "RVALE3OS", true},
+	{6, 8, 6, 1}:  {sys_TLBI, "RVAE3", true},
+	{6, 8, 6, 5}:  {sys_TLBI, "RVALE3", true},
+	{0, 7, 6, 1}:  {sys_DC, "IVAC", true},
+	{0, 7, 6, 2}:  {sys_DC, "ISW", true},
+	{0, 7, 10, 2}: {sys_DC, "CSW", true},
+	{0, 7, 14, 2}: {sys_DC, "CISW", true},
+	{3, 7, 4, 1}:  {sys_DC, "ZVA", true},
+	{3, 7, 10, 1}: {sys_DC, "CVAC", true},
+	{3, 7, 11, 1}: {sys_DC, "CVAU", true},
+	{3, 7, 14, 1}: {sys_DC, "CIVAC", true},
+	{0, 7, 6, 3}:  {sys_DC, "IGVAC", true},
+	{0, 7, 6, 4}:  {sys_DC, "IGSW", true},
+	{0, 7, 6, 5}:  {sys_DC, "IGDVAC", true},
+	{0, 7, 6, 6}:  {sys_DC, "IGDSW", true},
+	{0, 7, 10, 4}: {sys_DC, "CGSW", true},
+	{0, 7, 10, 6}: {sys_DC, "CGDSW", true},
+	{0, 7, 14, 4}: {sys_DC, "CIGSW", true},
+	{0, 7, 14, 6}: {sys_DC, "CIGDSW", true},
+	{3, 7, 4, 3}:  {sys_DC, "GVA", true},
+	{3, 7, 4, 4}:  {sys_DC, "GZVA", true},
+	{3, 7, 10, 3}: {sys_DC, "CGVAC", true},
+	{3, 7, 10, 5}: {sys_DC, "CGDVAC", true},
+	{3, 7, 12, 3}: {sys_DC, "CGVAP", true},
+	{3, 7, 12, 5}: {sys_DC, "CGDVAP", true},
+	{3, 7, 13, 3}: {sys_DC, "CGVADP", true},
+	{3, 7, 13, 5}: {sys_DC, "CGDVADP", true},
+	{3, 7, 14, 3}: {sys_DC, "CIGVAC", true},
+	{3, 7, 14, 5}: {sys_DC, "CIGDVAC", true},
+	{3, 7, 12, 1}: {sys_DC, "CVAP", true},
+	{3, 7, 13, 1}: {sys_DC, "CVADP", true},
 }

@@ -17,6 +17,7 @@ import (
 // little in each run.bash.  It does not check or run the generated code.
 // The test file is however a useful example of fused-vs-cascaded multiply-add.
 func TestFmaHash(t *testing.T) {
+	t.Parallel()
 	switch runtime.GOOS {
 	case "linux", "darwin":
 	default:
@@ -41,7 +42,7 @@ func TestFmaHash(t *testing.T) {
 	t.Logf("%v", cmd.Env)
 	b, e := cmd.CombinedOutput()
 	if e != nil {
-		t.Error(e)
+		t.Errorf("build failed: %v\n%s", e, b)
 	}
 	s := string(b) // Looking for "GOFMAHASH triggered main.main:24"
 	re := "fmahash(0?) triggered .*fma.go:29:..;.*fma.go:18:.."

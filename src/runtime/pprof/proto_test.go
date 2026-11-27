@@ -7,6 +7,7 @@ package pprof
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"internal/abi"
 	"internal/profile"
@@ -33,7 +34,9 @@ func translateCPUProfile(data []uint64, count int) (*profile.Profile, error) {
 	if err := b.addCPUData(data, tags); err != nil {
 		return nil, err
 	}
-	b.build()
+	if err := b.build(); err != nil {
+		return nil, err
+	}
 	return profile.Parse(&buf)
 }
 
@@ -73,8 +76,14 @@ func TestConvertCPUProfileNoSamples(t *testing.T) {
 	checkProfile(t, p, 2000*1000, periodType, sampleType, nil, "")
 }
 
+//go:noinline
 func f1() { f1() }
-func f2() { f2() }
+
+//go:noinline
+func f2() {
+	f2()
+	f2() // Keep f2+3 within the symbolized PCs on WebAssembly.
+}
 
 // testPCs returns two PCs and two corresponding memory mappings
 // to use in test profiles.
@@ -86,21 +95,28 @@ func testPCs(t *testing.T) (addr1, addr2 uint64, map1, map2 *profile.Mapping) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		mprof := &profile.Profile{}
-		if err = mprof.ParseMemoryMap(bytes.NewReader(mmap)); err != nil {
-			t.Fatalf("parsing /proc/self/maps: %v", err)
-		}
-		if len(mprof.Mapping) < 2 {
+		var mappings []*profile.Mapping
+		id := uint64(1)
+		parseProcSelfMaps(mmap, func(lo, hi, offset uint64, file, buildID string) {
+			mappings = append(mappings, &profile.Mapping{
+				ID:      id,
+				Start:   lo,
+				Limit:   hi,
+				Offset:  offset,
+				File:    file,
+				BuildID: buildID,
+			})
+			id++
+		})
+		if len(mappings) < 2 {
 			// It is possible for a binary to only have 1 executable
 			// region of memory.
-			t.Skipf("need 2 or more mappings, got %v", len(mprof.Mapping))
+			t.Skipf("need 2 or more mappings, got %v", len(mappings))
 		}
-		addr1 = mprof.Mapping[0].Start
-		map1 = mprof.Mapping[0]
-		map1.BuildID, _ = elfBuildID(map1.File)
-		addr2 = mprof.Mapping[1].Start
-		map2 = mprof.Mapping[1]
-		map2.BuildID, _ = elfBuildID(map2.File)
+		addr1 = mappings[0].Start
+		map1 = mappings[0]
+		addr2 = mappings[1].Start
+		map2 = mappings[1]
 	case "windows", "darwin", "ios":
 		addr1 = uint64(abi.FuncPCABIInternal(f1))
 		addr2 = uint64(abi.FuncPCABIInternal(f2))
@@ -126,9 +142,6 @@ func testPCs(t *testing.T) (addr1, addr2 uint64, map1, map2 *profile.Mapping) {
 			BuildID:      buildID,
 			HasFunctions: true,
 		}
-	case "js", "wasip1":
-		addr1 = uint64(abi.FuncPCABIInternal(f1))
-		addr2 = uint64(abi.FuncPCABIInternal(f2))
 	default:
 		addr1 = uint64(abi.FuncPCABIInternal(f1))
 		addr2 = uint64(abi.FuncPCABIInternal(f2))
@@ -461,5 +474,18 @@ func TestEmptyStack(t *testing.T) {
 	_, err := translateCPUProfile(b, 2)
 	if err != nil {
 		t.Fatalf("translating profile: %v", err)
+	}
+}
+
+var errWrite = errors.New("error from writer")
+
+type errWriter struct{}
+
+func (errWriter) Write(p []byte) (int, error) { return 0, errWrite }
+
+func TestWriteToErr(t *testing.T) {
+	err := Lookup("heap").WriteTo(&errWriter{}, 0)
+	if !errors.Is(err, errWrite) {
+		t.Fatalf("want error from writer, got: %v", err)
 	}
 }

@@ -7,7 +7,7 @@
 package runtime
 
 import (
-	"runtime/internal/atomic"
+	"internal/runtime/atomic"
 	"unsafe"
 )
 
@@ -21,9 +21,6 @@ var worldIsStopped atomic.Uint32
 type lockRankStruct struct {
 	// static lock ranking of the lock
 	rank lockRank
-	// pad field to make sure lockRankStruct is a multiple of 8 bytes, even on
-	// 32-bit systems.
-	pad int
 }
 
 // lockInit(l *mutex, rank int) sets the rank of lock before it is used.
@@ -104,12 +101,18 @@ func printHeldLocks(gp *g) {
 	}
 }
 
-// acquireLockRank acquires a rank which is not associated with a mutex lock
+// acquireLockRankAndM acquires a rank which is not associated with a mutex
+// lock. To maintain the invariant that an M which holds lock-like resources
+// will have m.locks/mutexMLocksDelta > 0, it also acquires the M and adjusts
+// m.locks by mutexMLocksDelta.
 //
 // This function may be called in nosplit context and thus must be nosplit.
 //
 //go:nosplit
-func acquireLockRank(rank lockRank) {
+func acquireLockRankAndM(rank lockRank) {
+	mp := acquirem()
+	mp.locks += mutexMLocksDelta // not safe to profile right now
+
 	gp := getg()
 	// Log the new class. See comment on lockWithRank.
 	systemstack(func() {
@@ -189,12 +192,14 @@ func unlockWithRank(l *mutex) {
 	})
 }
 
-// releaseLockRank releases a rank which is not associated with a mutex lock
+// releaseLockRankAndM releases a rank which is not associated with a mutex
+// lock. To maintain the invariant that an M with m.locks==0 does not hold any
+// lock-like resources, it also releases the M.
 //
 // This function may be called in nosplit context and thus must be nosplit.
 //
 //go:nosplit
-func releaseLockRank(rank lockRank) {
+func releaseLockRankAndM(rank lockRank) {
 	gp := getg()
 	systemstack(func() {
 		found := false
@@ -211,6 +216,10 @@ func releaseLockRank(rank lockRank) {
 			throw("lockRank release without matching lockRank acquire")
 		}
 	})
+
+	mp := getg().m
+	mp.locks -= mutexMLocksDelta
+	releasem(mp)
 }
 
 // nosplit because it may be called from nosplit contexts.

@@ -15,7 +15,6 @@ import (
 	"errors"
 	"fmt"
 	"hash"
-	"internal/godebug"
 	"io"
 	"net"
 	"sync"
@@ -48,13 +47,14 @@ type Conn struct {
 	handshakes       int
 	extMasterSecret  bool
 	didResume        bool // whether this connection was a session resumption
+	didHRR           bool // whether a HelloRetryRequest was sent/received
 	cipherSuite      uint16
+	curveID          CurveID
+	peerSigAlg       SignatureScheme
 	ocspResponse     []byte   // stapled OCSP response
 	scts             [][]byte // signed certificate timestamps from server
 	peerCertificates []*x509.Certificate
-	// activeCertHandles contains the cache handles to certificates in
-	// peerCertificates that are used to track active references.
-	activeCertHandles []*activeCert
+	localCertificate [][]byte
 	// verifiedChains contains the certificate chains that we built, as
 	// opposed to the ones presented by the server.
 	verifiedChains [][]*x509.Certificate
@@ -69,6 +69,10 @@ type Conn struct {
 	// resumptionSecret is the resumption_master_secret for handling
 	// or sending NewSessionTicket messages.
 	resumptionSecret []byte
+	echAccepted      bool
+	// echGrease is true when the client sent a GREASE'd ECH extension
+	// instead of a real one.
+	echGrease bool
 
 	// ticketKeys is the set of active session ticket keys for this
 	// connection. The first one is used to encrypt new tickets and
@@ -98,12 +102,27 @@ type Conn struct {
 	clientProtocol string
 
 	// input/output
-	in, out   halfConn
-	rawInput  bytes.Buffer // raw input, starting with a record header
-	input     bytes.Reader // application data waiting to be read, from rawInput.Next
-	hand      bytes.Buffer // handshake data waiting to be read
-	buffering bool         // whether records are buffered in sendBuf
-	sendBuf   []byte       // a buffer of records waiting to be sent
+	in, out halfConn
+	// rawInput holds raw input, starting with a record header.
+	// It is nil when no input is buffered, in which case the buffer has
+	// been returned to rawInputPool so that connections idle in Read do
+	// not pin a record-sized buffer. It is lazily repopulated from the
+	// pool by readFromUntil.
+	rawInput *bytes.Buffer
+	// smallInput is a small buffer that serves as rawInput while
+	// waiting for a record header after rawInput has been returned to
+	// rawInputPool. It is lazily allocated by readFromUntil and then
+	// kept for the life of the connection.
+	smallInput *bytes.Buffer
+	// input holds application data waiting to be read, from rawInput.Next.
+	input bytes.Reader
+	// hand holds handshake data waiting to be read.
+	// It is nil when no handshake data is buffered, in which case the
+	// buffer has been returned to handPool. Use handBuf and handLen to
+	// access it.
+	hand      *bytes.Buffer
+	buffering bool   // whether records are buffered in sendBuf
+	sendBuf   []byte // a buffer of records waiting to be sent
 
 	// bytesSent counts the bytes of application data sent.
 	// packetsSent counts packets.
@@ -219,20 +238,19 @@ func (hc *halfConn) changeCipherSpec() error {
 	hc.mac = hc.nextMac
 	hc.nextCipher = nil
 	hc.nextMac = nil
-	for i := range hc.seq {
-		hc.seq[i] = 0
-	}
+	clear(hc.seq[:])
 	return nil
 }
 
+// setTrafficSecret sets the traffic secret for the given encryption level. setTrafficSecret
+// should not be called directly, but rather through the Conn setWriteTrafficSecret and
+// setReadTrafficSecret wrapper methods.
 func (hc *halfConn) setTrafficSecret(suite *cipherSuiteTLS13, level QUICEncryptionLevel, secret []byte) {
 	hc.trafficSecret = secret
 	hc.level = level
 	key, iv := suite.trafficKey(secret)
 	hc.cipher = suite.aead(key, iv)
-	for i := range hc.seq {
-		hc.seq[i] = 0
-	}
+	clear(hc.seq[:])
 }
 
 // incSeq increments the sequence number.
@@ -392,15 +410,17 @@ func (hc *halfConn) decrypt(record []byte) ([]byte, recordType, error) {
 				c.SetIV(payload[:explicitNonceLen])
 				payload = payload[explicitNonceLen:]
 			}
-			c.CryptBlocks(payload, payload)
+			subtle.WithDataIndependentTiming(func() {
+				c.CryptBlocks(payload, payload)
 
-			// In a limited attempt to protect against CBC padding oracles like
-			// Lucky13, the data past paddingLen (which is secret) is passed to
-			// the MAC function as extra data, to be fed into the HMAC after
-			// computing the digest. This makes the MAC roughly constant time as
-			// long as the digest computation is constant time and does not
-			// affect the subsequent write, modulo cache effects.
-			paddingLen, paddingGood = extractPadding(payload)
+				// In a limited attempt to protect against CBC padding oracles like
+				// Lucky13, the data past paddingLen (which is secret) is passed to
+				// the MAC function as extra data, to be fed into the HMAC after
+				// computing the digest. This makes the MAC roughly constant time as
+				// long as the digest computation is constant time and does not
+				// affect the subsequent write, modulo cache effects.
+				paddingLen, paddingGood = extractPadding(payload)
+			})
 		default:
 			panic("unknown cipher type")
 		}
@@ -434,21 +454,25 @@ func (hc *halfConn) decrypt(record []byte) ([]byte, recordType, error) {
 			return nil, 0, alertBadRecordMAC
 		}
 
-		n := len(payload) - macSize - paddingLen
-		n = subtle.ConstantTimeSelect(int(uint32(n)>>31), 0, n) // if n < 0 { n = 0 }
-		record[3] = byte(n >> 8)
-		record[4] = byte(n)
-		remoteMAC := payload[n : n+macSize]
-		localMAC := tls10MAC(hc.mac, hc.scratchBuf[:0], hc.seq[:], record[:recordHeaderLen], payload[:n], payload[n+macSize:])
+		var macAndPaddingGood int
+		var n int
+		subtle.WithDataIndependentTiming(func() {
+			n = len(payload) - macSize - paddingLen
+			n = subtle.ConstantTimeSelect(int(uint32(n)>>31), 0, n) // if n < 0 { n = 0 }
+			record[3] = byte(n >> 8)
+			record[4] = byte(n)
+			remoteMAC := payload[n : n+macSize]
+			localMAC := tls10MAC(hc.mac, hc.scratchBuf[:0], hc.seq[:], record[:recordHeaderLen], payload[:n], payload[n+macSize:])
 
-		// This is equivalent to checking the MACs and paddingGood
-		// separately, but in constant-time to prevent distinguishing
-		// padding failures from MAC failures. Depending on what value
-		// of paddingLen was returned on bad padding, distinguishing
-		// bad MAC from bad padding can lead to an attack.
-		//
-		// See also the logic at the end of extractPadding.
-		macAndPaddingGood := subtle.ConstantTimeCompare(localMAC, remoteMAC) & int(paddingGood)
+			// This is equivalent to checking the MACs and paddingGood
+			// separately, but in constant-time to prevent distinguishing
+			// padding failures from MAC failures. Depending on what value
+			// of paddingLen was returned on bad padding, distinguishing
+			// bad MAC from bad padding can lead to an attack.
+			//
+			// See also the logic at the end of extractPadding.
+			macAndPaddingGood = subtle.ConstantTimeCompare(localMAC, remoteMAC) & int(paddingGood)
+		})
 		if macAndPaddingGood != 1 {
 			return nil, 0, alertBadRecordMAC
 		}
@@ -580,7 +604,9 @@ func (e RecordHeaderError) Error() string { return "tls: " + e.Msg }
 func (c *Conn) newRecordHeaderError(conn net.Conn, msg string) (err RecordHeaderError) {
 	err.Msg = msg
 	err.Conn = conn
-	copy(err.RecordHeader[:], c.rawInput.Bytes())
+	if c.rawInput != nil {
+		copy(err.RecordHeader[:], c.rawInput.Bytes())
+	}
 	return err
 }
 
@@ -620,6 +646,19 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 
 	if c.quic != nil {
 		return c.in.setErrorLocked(errors.New("tls: internal error: attempted to read record with QUIC transport"))
+	}
+
+	// If rawInput is empty, we are about to block in a Read on the
+	// underlying connection waiting for the next record, possibly for a
+	// long time. A previous record may have grown rawInput to the maximum
+	// record size; don't pin that memory while idle. Return the buffer to
+	// the pool, and let readFromUntil read the header into a small buffer
+	// and switch back to a pooled record-sized buffer only once the
+	// payload length is known.
+	if c.rawInput != nil && c.rawInput.Len() == 0 && c.rawInput != c.smallInput && c.rawInput.Cap() > maxIdleInputCap {
+		c.rawInput.Reset()
+		rawInputPool.Put(c.rawInput)
+		c.rawInput = nil
 	}
 
 	// Read header, payload.
@@ -696,13 +735,13 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 		return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
 	}
 
-	if typ != recordTypeAlert && typ != recordTypeChangeCipherSpec && len(data) > 0 {
+	if (typ == recordTypeApplicationData || (typ == recordTypeHandshake && !handshakeComplete)) && len(data) > 0 {
 		// This is a state-advancing message: reset the retry count.
 		c.retryCount = 0
 	}
 
 	// Handshake messages MUST NOT be interleaved with other record types in TLS 1.3.
-	if c.vers == VersionTLS13 && typ != recordTypeHandshake && c.hand.Len() > 0 {
+	if c.vers == VersionTLS13 && typ != recordTypeHandshake && c.handLen() > 0 {
 		return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
 	}
 
@@ -721,6 +760,15 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 			return c.in.setErrorLocked(io.EOF)
 		}
 		if c.vers == VersionTLS13 {
+			// TLS 1.3 removed warning-level alerts except for alertUserCanceled
+			// (RFC 8446, § 6.1). Since at least one major implementation
+			// (https://bugs.openjdk.org/browse/JDK-8323517) misuses this alert,
+			// many TLS stacks now ignore it outright when seen in a TLS 1.3
+			// handshake (e.g. BoringSSL, NSS, Rustls).
+			if alert(data[1]) == alertUserCanceled {
+				// Like TLS 1.2 alertLevelWarning alerts, we drop the record and retry.
+				return c.retryReadRecord(expectChangeCipherSpec)
+			}
 			return c.in.setErrorLocked(&net.OpError{Op: "remote error", Err: alert(data[1])})
 		}
 		switch data[0] {
@@ -738,7 +786,7 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 			return c.in.setErrorLocked(c.sendAlert(alertDecodeError))
 		}
 		// Handshake messages are not allowed to fragment across the CCS.
-		if c.hand.Len() > 0 {
+		if c.handLen() > 0 {
 			return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
 		}
 		// In TLS 1.3, change_cipher_spec records are ignored until the
@@ -774,7 +822,7 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 		if len(data) == 0 || expectChangeCipherSpec {
 			return c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
 		}
-		c.hand.Write(data)
+		c.handBuf().Write(data)
 	}
 
 	return nil
@@ -791,42 +839,113 @@ func (c *Conn) retryReadRecord(expectChangeCipherSpec bool) error {
 	return c.readRecordOrCCS(expectChangeCipherSpec)
 }
 
-// atLeastReader reads from R, stopping with EOF once at least N bytes have been
-// read. It is different from an io.LimitedReader in that it doesn't cut short
-// the last Read call, and in that it considers an early EOF an error.
-type atLeastReader struct {
-	R io.Reader
-	N int64
+// rawInputPool pools the record-sized buffers that back Conn.rawInput
+// while records are being received. A connection returns its buffer to
+// the pool before blocking to wait for a new record, often for a long
+// time, so that idle connections do not each pin a record-sized buffer.
+// Only buffers with capacity above maxIdleInputCap are pooled; smaller
+// buffers stay attached to their connection.
+var rawInputPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
+// maxIdleInputCap is the largest rawInput capacity that a connection
+// keeps while waiting for a new record to arrive. It is large enough to
+// hold a record header and small records, so that only connections
+// receiving larger records pay for the pooled buffer switch below.
+const maxIdleInputCap = 1024
+
+// handPool pools the buffers that back Conn.hand, which typically grow
+// to hold the peer's largest flight of handshake messages. A connection
+// returns its buffer to the pool once the handshake completes and after
+// buffered post-handshake messages have been consumed, so that
+// established connections do not pin it.
+var handPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
+// handBuf returns c.hand for writing, getting a buffer from handPool if
+// c.hand is nil.
+func (c *Conn) handBuf() *bytes.Buffer {
+	if c.hand == nil {
+		c.hand = handPool.Get().(*bytes.Buffer)
+	}
+	return c.hand
 }
 
-func (r *atLeastReader) Read(p []byte) (int, error) {
-	if r.N <= 0 {
-		return 0, io.EOF
+// handLen returns the number of buffered handshake bytes.
+func (c *Conn) handLen() int {
+	if c.hand == nil {
+		return 0
 	}
-	n, err := r.R.Read(p)
-	r.N -= int64(n) // won't underflow unless len(p) >= n > 9223372036854775809
-	if r.N > 0 && err == io.EOF {
-		return n, io.ErrUnexpectedEOF
+	return c.hand.Len()
+}
+
+// releaseHand returns c.hand to handPool if it is empty.
+func (c *Conn) releaseHand() {
+	if c.hand != nil && c.hand.Len() == 0 {
+		c.hand.Reset()
+		handPool.Put(c.hand)
+		c.hand = nil
 	}
-	if r.N <= 0 && err == nil {
-		return n, io.EOF
-	}
-	return n, err
 }
 
 // readFromUntil reads from r into c.rawInput until c.rawInput contains
 // at least n bytes or else returns an error.
 func (c *Conn) readFromUntil(r io.Reader, n int) error {
+	if c.rawInput == nil {
+		// The record buffer was released while waiting for a new
+		// record. Block for the header using the connection's small
+		// buffer; the switch to a pooled record-sized buffer below
+		// happens only once the payload length is known and data is
+		// flowing.
+		if c.smallInput == nil {
+			c.smallInput = new(bytes.Buffer)
+		}
+		c.rawInput = c.smallInput
+	}
 	if c.rawInput.Len() >= n {
 		return nil
 	}
 	needs := n - c.rawInput.Len()
+	if want := c.rawInput.Len() + needs + bytes.MinRead; want > maxIdleInputCap && want > c.rawInput.Cap() {
+		// Growing past maxIdleInputCap: switch to a pooled buffer so
+		// that record-sized buffers are recycled across connections
+		// rather than allocated for every record.
+		b := rawInputPool.Get().(*bytes.Buffer)
+		b.Write(c.rawInput.Bytes())
+		if c.rawInput == c.smallInput {
+			c.smallInput.Reset()
+		} else if c.rawInput.Cap() > maxIdleInputCap {
+			c.rawInput.Reset()
+			rawInputPool.Put(c.rawInput)
+		}
+		c.rawInput = b
+	}
 	// There might be extra input waiting on the wire. Make a best effort
 	// attempt to fetch it so that it can be used in (*Conn).Read to
 	// "predict" closeNotify alerts.
+	// TODO(dmo): we use bytes.MinRead here because we used the buffer
+	// ReadFrom mechanism to avoid allocations, but we've hoisted this
+	// loop for performance. We really should use our own heuristic here
+	// for how much to read ahead.
 	c.rawInput.Grow(needs + bytes.MinRead)
-	_, err := c.rawInput.ReadFrom(&atLeastReader{r, int64(needs)})
-	return err
+	for {
+		buf := c.rawInput.AvailableBuffer()[:c.rawInput.Available()]
+		n, err := r.Read(buf)
+		// This write is just to update the internal state of the
+		// rawInput bytes.Buffer. It cannot fail.
+		c.rawInput.Write(buf[:n])
+		needs -= n
+		if needs <= 0 {
+			if err == io.EOF {
+				err = nil
+			}
+			return err
+		}
+		if err == io.EOF {
+			return io.ErrUnexpectedEOF
+		}
+		if err != nil {
+			return err
+		}
+	}
 }
 
 // sendAlertLocked sends a TLS alert message.
@@ -1040,7 +1159,7 @@ func (c *Conn) writeRecordLocked(typ recordType, data []byte) (int, error) {
 }
 
 // writeHandshakeRecord writes a handshake message to the connection and updates
-// the record layer state. If transcript is non-nil the marshalled message is
+// the record layer state. If transcript is non-nil the marshaled message is
 // written to it.
 func (c *Conn) writeHandshakeRecord(msg handshakeMessage, transcript transcriptHash) (int, error) {
 	c.out.Lock()
@@ -1071,7 +1190,7 @@ func (c *Conn) readHandshakeBytes(n int) error {
 	if c.quic != nil {
 		return c.quicReadHandshakeBytes(n)
 	}
-	for c.hand.Len() < n {
+	for c.handLen() < n {
 		if err := c.readRecord(); err != nil {
 			return err
 		}
@@ -1087,10 +1206,22 @@ func (c *Conn) readHandshake(transcript transcriptHash) (any, error) {
 		return nil, err
 	}
 	data := c.hand.Bytes()
+
+	maxHandshakeSize := maxHandshake
+	// hasVers indicates we're past the first message, forcing someone trying to
+	// make us just allocate a large buffer to at least do the initial part of
+	// the handshake first.
+	if c.haveVers && data[0] == typeCertificate {
+		// Since certificate messages are likely to be the only messages that
+		// can be larger than maxHandshake, we use a special limit for just
+		// those messages.
+		maxHandshakeSize = maxHandshakeCertificateMsg
+	}
+
 	n := int(data[1])<<16 | int(data[2])<<8 | int(data[3])
-	if n > maxHandshake {
+	if n > maxHandshakeSize {
 		c.sendAlertLocked(alertInternalError)
-		return nil, c.in.setErrorLocked(fmt.Errorf("tls: handshake message of length %d bytes exceeds maximum of %d bytes", n, maxHandshake))
+		return nil, c.in.setErrorLocked(fmt.Errorf("tls: handshake message of length %d bytes exceeds maximum of %d bytes", n, maxHandshakeSize))
 	}
 	if err := c.readHandshakeBytes(4 + n); err != nil {
 		return nil, err
@@ -1158,7 +1289,7 @@ func (c *Conn) unmarshalHandshakeMessage(data []byte, transcript transcriptHash)
 	data = append([]byte(nil), data...)
 
 	if !m.unmarshal(data) {
-		return nil, c.in.setErrorLocked(c.sendAlert(alertUnexpectedMessage))
+		return nil, c.in.setErrorLocked(c.sendAlert(alertDecodeError))
 	}
 
 	if transcript != nil {
@@ -1321,9 +1452,6 @@ func (c *Conn) handleKeyUpdate(keyUpdate *keyUpdateMsg) error {
 		return c.in.setErrorLocked(c.sendAlert(alertInternalError))
 	}
 
-	newSecret := cipherSuite.nextTrafficSecret(c.in.trafficSecret)
-	c.in.setTrafficSecret(cipherSuite, QUICEncryptionLevelInitial, newSecret)
-
 	if keyUpdate.updateRequested {
 		c.out.Lock()
 		defer c.out.Unlock()
@@ -1341,7 +1469,12 @@ func (c *Conn) handleKeyUpdate(keyUpdate *keyUpdateMsg) error {
 		}
 
 		newSecret := cipherSuite.nextTrafficSecret(c.out.trafficSecret)
-		c.out.setTrafficSecret(cipherSuite, QUICEncryptionLevelInitial, newSecret)
+		c.setWriteTrafficSecret(cipherSuite, QUICEncryptionLevelInitial, newSecret)
+	}
+
+	newSecret := cipherSuite.nextTrafficSecret(c.in.trafficSecret)
+	if err := c.setReadTrafficSecret(cipherSuite, QUICEncryptionLevelInitial, newSecret, keyUpdate.updateRequested); err != nil {
+		return err
 	}
 
 	return nil
@@ -1370,11 +1503,12 @@ func (c *Conn) Read(b []byte) (int, error) {
 		if err := c.readRecord(); err != nil {
 			return 0, err
 		}
-		for c.hand.Len() > 0 {
+		for c.handLen() > 0 {
 			if err := c.handlePostHandshakeMessage(); err != nil {
 				return 0, err
 			}
 		}
+		c.releaseHand()
 	}
 
 	n, _ := c.input.Read(b)
@@ -1502,37 +1636,23 @@ func (c *Conn) handshakeContext(ctx context.Context) (ret error) {
 	}
 
 	handshakeCtx, cancel := context.WithCancel(ctx)
-	// Note: defer this before starting the "interrupter" goroutine
+	// Note: defer this before calling context.AfterFunc
 	// so that we can tell the difference between the input being canceled and
 	// this cancellation. In the former case, we need to close the connection.
 	defer cancel()
 
 	if c.quic != nil {
-		c.quic.cancelc = handshakeCtx.Done()
+		c.quic.ctx = handshakeCtx
 		c.quic.cancel = cancel
 	} else if ctx.Done() != nil {
-		// Start the "interrupter" goroutine, if this context might be canceled.
-		// (The background context cannot).
-		//
-		// The interrupter goroutine waits for the input context to be done and
-		// closes the connection if this happens before the function returns.
-		done := make(chan struct{})
-		interruptRes := make(chan error, 1)
+		// Close the connection if ctx is canceled before the function returns.
+		stop := context.AfterFunc(ctx, func() {
+			_ = c.conn.Close()
+		})
 		defer func() {
-			close(done)
-			if ctxErr := <-interruptRes; ctxErr != nil {
+			if !stop() {
 				// Return context error to user.
-				ret = ctxErr
-			}
-		}()
-		go func() {
-			select {
-			case <-handshakeCtx.Done():
-				// Close the connection, discarding the error
-				_ = c.conn.Close()
-				interruptRes <- handshakeCtx.Err()
-			case <-done:
-				interruptRes <- nil
+				ret = ctx.Err()
 			}
 		}()
 	}
@@ -1566,17 +1686,27 @@ func (c *Conn) handshakeContext(ctx context.Context) (ret error) {
 		panic("tls: internal error: handshake returned an error but is marked successful")
 	}
 
+	// The handshake buffer typically grew to hold the peer's largest
+	// flight of handshake messages and is now empty. Post-handshake
+	// messages are rare and small, so release the buffer rather than
+	// pinning it for the life of the connection.
+	if c.handshakeErr == nil {
+		c.releaseHand()
+	}
+
 	if c.quic != nil {
 		if c.handshakeErr == nil {
 			c.quicHandshakeComplete()
 			// Provide the 1-RTT read secret now that the handshake is complete.
 			// The QUIC layer MUST NOT decrypt 1-RTT packets prior to completing
 			// the handshake (RFC 9001, Section 5.7).
-			c.quicSetReadSecret(QUICEncryptionLevelApplication, c.cipherSuite, c.in.trafficSecret)
+			if err := c.quicSetReadSecret(QUICEncryptionLevelApplication, c.cipherSuite, c.in.trafficSecret); err != nil {
+				return err
+			}
 		} else {
-			var a alert
 			c.out.Lock()
-			if !errors.As(c.out.err, &a) {
+			a, ok := errors.AsType[alert](c.out.err)
+			if !ok {
 				a = alertInternalError
 			}
 			c.out.Unlock()
@@ -1594,13 +1724,17 @@ func (c *Conn) handshakeContext(ctx context.Context) (ret error) {
 }
 
 // ConnectionState returns basic TLS details about the connection.
+//
+// The returned [ConnectionState] is only meaningful after the handshake has
+// completed, as reported by [ConnectionState.HandshakeComplete]; before then
+// its fields are not populated. The handshake is run automatically by the
+// first [Conn.Read] or [Conn.Write], or it can be triggered explicitly with
+// [Conn.Handshake].
 func (c *Conn) ConnectionState() ConnectionState {
 	c.handshakeMutex.Lock()
 	defer c.handshakeMutex.Unlock()
 	return c.connectionStateLocked()
 }
-
-var tlsunsafeekm = godebug.New("tlsunsafeekm")
 
 func (c *Conn) connectionStateLocked() ConnectionState {
 	var state ConnectionState
@@ -1608,10 +1742,14 @@ func (c *Conn) connectionStateLocked() ConnectionState {
 	state.Version = c.vers
 	state.NegotiatedProtocol = c.clientProtocol
 	state.DidResume = c.didResume
+	state.HelloRetryRequest = c.didHRR
+	state.testingOnlyPeerSignatureAlgorithm = c.peerSigAlg
+	state.CurveID = c.curveID
 	state.NegotiatedProtocolIsMutual = true
 	state.ServerName = c.serverName
 	state.CipherSuite = c.cipherSuite
 	state.PeerCertificates = c.peerCertificates
+	state.LocalCertificate = c.localCertificate
 	state.VerifiedChains = c.verifiedChains
 	state.SignedCertificateTimestamps = c.scts
 	state.OCSPResponse = c.ocspResponse
@@ -1625,16 +1763,11 @@ func (c *Conn) connectionStateLocked() ConnectionState {
 	if c.config.Renegotiation != RenegotiateNever {
 		state.ekm = noEKMBecauseRenegotiation
 	} else if c.vers != VersionTLS13 && !c.extMasterSecret {
-		state.ekm = func(label string, context []byte, length int) ([]byte, error) {
-			if tlsunsafeekm.Value() == "1" {
-				tlsunsafeekm.IncNonDefault()
-				return c.ekm(label, context, length)
-			}
-			return noEKMBecauseNoEMS(label, context, length)
-		}
+		state.ekm = noEKMBecauseNoEMS
 	} else {
 		state.ekm = c.ekm
 	}
+	state.ECHAccepted = c.echAccepted
 	return state
 }
 
@@ -1663,4 +1796,30 @@ func (c *Conn) VerifyHostname(host string) error {
 		return errors.New("tls: handshake did not verify certificate chain")
 	}
 	return c.peerCertificates[0].VerifyHostname(host)
+}
+
+// setReadTrafficSecret sets the read traffic secret for the given encryption level. If
+// being called at the same time as setWriteTrafficSecret, the caller must ensure the call
+// to setWriteTrafficSecret happens first so any alerts are sent at the write level.
+func (c *Conn) setReadTrafficSecret(suite *cipherSuiteTLS13, level QUICEncryptionLevel, secret []byte, locked bool) error {
+	// Ensure that there are no buffered handshake messages before changing the
+	// read keys, since that can cause messages to be parsed that were encrypted
+	// using old keys which are no longer appropriate.
+	if c.handLen() != 0 {
+		if locked {
+			c.sendAlertLocked(alertUnexpectedMessage)
+		} else {
+			c.sendAlert(alertUnexpectedMessage)
+		}
+		return errors.New("tls: handshake buffer not empty before setting read traffic secret")
+	}
+	c.in.setTrafficSecret(suite, level, secret)
+	return nil
+}
+
+// setWriteTrafficSecret sets the write traffic secret for the given encryption level. If
+// being called at the same time as setReadTrafficSecret, the caller must ensure the call
+// to setWriteTrafficSecret happens first so any alerts are sent at the write level.
+func (c *Conn) setWriteTrafficSecret(suite *cipherSuiteTLS13, level QUICEncryptionLevel, secret []byte) {
+	c.out.setTrafficSecret(suite, level, secret)
 }

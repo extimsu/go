@@ -9,11 +9,14 @@ package http
 import (
 	"errors"
 	"fmt"
-	"internal/safefilepath"
+	"internal/godebug"
 	"io"
 	"io/fs"
+	"math"
 	"mime"
 	"mime/multipart"
+	"net/http/internal"
+	"net/http/internal/ascii"
 	"net/textproto"
 	"net/url"
 	"os"
@@ -25,22 +28,19 @@ import (
 	"time"
 )
 
-// A Dir implements [FileSystem] using the native file system restricted to a
-// specific directory tree.
+// A Dir implements [FileSystem] using the local filesystem.
+// Most users should prefer using [FileServerFS] with an [os.Root] rather than Dir.
 //
-// While the [FileSystem.Open] method takes '/'-separated paths, a Dir's string
-// value is a filename on the native file system, not a URL, so it is separated
-// by [filepath.Separator], which isn't necessarily '/'.
-//
-// Note that Dir could expose sensitive files and directories. Dir will follow
-// symlinks pointing out of the directory tree, which can be especially dangerous
-// if serving from a directory in which users are able to create arbitrary symlinks.
-// Dir will also allow access to files and directories starting with a period,
-// which could expose sensitive directories like .git or sensitive files like
-// .htpasswd. To exclude files with a leading period, remove the files/directories
-// from the server or create a custom FileSystem implementation.
-//
+// Dir's string value names a local directory path to serve.
 // An empty Dir is treated as ".".
+//
+// Dir will follow symbolic links, including links pointing outside its directory.
+//
+// Dir will serve files starting with a dot, which can expose sensitive
+// directories such as .git or sensitive files such as .htpassword.
+//
+// See [FileServerFS] for examples of restricting access to a directory using [os.Root],
+// and of hiding files starting with a dot.
 type Dir string
 
 // mapOpenError maps the provided non-nil error from opening name
@@ -67,12 +67,21 @@ func mapOpenError(originalErr error, name string, sep rune, stat func(string) (f
 	return originalErr
 }
 
+// errInvalidUnsafePath is returned by Dir.Open when the call to
+// filepath.Localize fails. filepath.Localize returns an error if the path
+// cannot be represented by the operating system.
+var errInvalidUnsafePath = errors.New("http: invalid or unsafe file path")
+
 // Open implements [FileSystem] using [os.Open], opening files for reading rooted
 // and relative to the directory d.
 func (d Dir) Open(name string) (File, error) {
-	path, err := safefilepath.FromFS(path.Clean("/" + name))
+	path := path.Clean("/" + name)[1:]
+	if path == "" {
+		path = "."
+	}
+	path, err := filepath.Localize(path)
 	if err != nil {
-		return nil, errors.New("http: invalid or unsafe file path")
+		return nil, errInvalidUnsafePath
 	}
 	dir := string(d)
 	if dir == "" {
@@ -87,6 +96,8 @@ func (d Dir) Open(name string) (File, error) {
 }
 
 // A FileSystem implements access to a collection of named files.
+// Most users should prefer using [FileServerFS] rather than FileSystem.
+//
 // The elements in a file path are separated by slash ('/', U+002F)
 // characters, regardless of host operating system convention.
 // See the [FileServer] function to convert a FileSystem to a [Handler].
@@ -97,10 +108,10 @@ type FileSystem interface {
 	Open(name string) (File, error)
 }
 
-// A File is returned by a [FileSystem]'s Open method and can be
-// served by the [FileServer] implementation.
+// A File is returned by a [FileSystem]'s Open method.
+// Most users should prefer using [FileServerFS] rather than FileSystem.
 //
-// The methods should behave the same as those on an [*os.File].
+// The methods of File behave the same as those on an [*os.File].
 type File interface {
 	io.Closer
 	io.Reader
@@ -151,6 +162,9 @@ func dirList(w ResponseWriter, r *Request, f File) {
 	sort.Slice(dirs, func(i, j int) bool { return dirs.name(i) < dirs.name(j) })
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, "<!doctype html>\n")
+	fmt.Fprintf(w, "<meta name=\"viewport\" content=\"width=device-width\">\n")
+	fmt.Fprintf(w, "<meta name=\"color-scheme\" content=\"light dark\">\n")
 	fmt.Fprintf(w, "<pre>\n")
 	for i, n := 0, dirs.len(); i < n; i++ {
 		name := dirs.name(i)
@@ -164,6 +178,40 @@ func dirList(w ResponseWriter, r *Request, f File) {
 		fmt.Fprintf(w, "<a href=\"%s\">%s</a>\n", url.String(), htmlReplacer.Replace(name))
 	}
 	fmt.Fprintf(w, "</pre>\n")
+}
+
+// GODEBUG=httpservecontentkeepheaders=1 restores the pre-1.23 behavior of not deleting
+// Cache-Control, Content-Encoding, Etag, or Last-Modified headers on ServeContent errors.
+var httpservecontentkeepheaders = godebug.New("httpservecontentkeepheaders")
+
+// serveError serves an error from ServeFile, ServeFileFS, and ServeContent.
+// Because those can all be configured by the caller by setting headers like
+// Etag, Last-Modified, and Cache-Control to send on a successful response,
+// the error path needs to clear them, since they may not be meant for errors.
+func serveError(w ResponseWriter, text string, code int) {
+	h := w.Header()
+
+	nonDefault := false
+	for _, k := range []string{
+		"Cache-Control",
+		"Content-Encoding",
+		"Etag",
+		"Last-Modified",
+	} {
+		if !h.has(k) {
+			continue
+		}
+		if httpservecontentkeepheaders.Value() == "1" {
+			nonDefault = true
+		} else {
+			h.Del(k)
+		}
+	}
+	if nonDefault {
+		httpservecontentkeepheaders.IncNonDefault()
+	}
+
+	Error(w, text, code)
 }
 
 // ServeContent replies to the request using the content in the
@@ -186,11 +234,17 @@ func dirList(w ResponseWriter, r *Request, f File) {
 //
 // The content's Seek method must work: ServeContent uses
 // a seek to the end of the content to determine its size.
+// Note that [*os.File] implements the [io.ReadSeeker] interface.
 //
 // If the caller has set w's ETag header formatted per RFC 7232, section 2.3,
 // ServeContent uses it to handle requests using If-Match, If-None-Match, or If-Range.
 //
-// Note that [*os.File] implements the [io.ReadSeeker] interface.
+// If an error occurs when serving the request (for example, when
+// handling an invalid range request), ServeContent responds with an
+// error message. By default, ServeContent strips the Cache-Control,
+// Content-Encoding, ETag, and Last-Modified headers from error responses.
+// The GODEBUG setting httpservecontentkeepheaders=1 causes ServeContent
+// to preserve these headers.
 func ServeContent(w ResponseWriter, req *Request, name string, modtime time.Time, content io.ReadSeeker) {
 	sizeFunc := func() (int64, error) {
 		size, err := content.Seek(0, io.SeekEnd)
@@ -237,12 +291,12 @@ func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, 
 		ctype = mime.TypeByExtension(filepath.Ext(name))
 		if ctype == "" {
 			// read a chunk to decide between utf-8 text and binary
-			var buf [sniffLen]byte
+			var buf [internal.SniffLen]byte
 			n, _ := io.ReadFull(content, buf[:])
 			ctype = DetectContentType(buf[:n])
 			_, err := content.Seek(0, io.SeekStart) // rewind to output whole file
 			if err != nil {
-				Error(w, "seeker can't seek", StatusInternalServerError)
+				serveError(w, "seeker can't seek", StatusInternalServerError)
 				return
 			}
 		}
@@ -253,12 +307,12 @@ func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, 
 
 	size, err := sizeFunc()
 	if err != nil {
-		Error(w, err.Error(), StatusInternalServerError)
+		serveError(w, err.Error(), StatusInternalServerError)
 		return
 	}
 	if size < 0 {
 		// Should never happen but just to be sure
-		Error(w, "negative content size computed", StatusInternalServerError)
+		serveError(w, "negative content size computed", StatusInternalServerError)
 		return
 	}
 
@@ -280,7 +334,7 @@ func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, 
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
 		fallthrough
 	default:
-		Error(w, err.Error(), StatusRequestedRangeNotSatisfiable)
+		serveError(w, err.Error(), StatusRequestedRangeNotSatisfiable)
 		return
 	}
 
@@ -306,7 +360,7 @@ func serveContent(w ResponseWriter, r *Request, name string, modtime time.Time, 
 		// multipart responses."
 		ra := ranges[0]
 		if _, err := content.Seek(ra.start, io.SeekStart); err != nil {
-			Error(w, err.Error(), StatusRequestedRangeNotSatisfiable)
+			serveError(w, err.Error(), StatusRequestedRangeNotSatisfiable)
 			return
 		}
 		sendSize = ra.length
@@ -639,7 +693,7 @@ func serveFile(w ResponseWriter, r *Request, fs FileSystem, name string, redirec
 	f, err := fs.Open(name)
 	if err != nil {
 		msg, code := toHTTPError(err)
-		Error(w, msg, code)
+		serveError(w, msg, code)
 		return
 	}
 	defer f.Close()
@@ -647,7 +701,7 @@ func serveFile(w ResponseWriter, r *Request, fs FileSystem, name string, redirec
 	d, err := f.Stat()
 	if err != nil {
 		msg, code := toHTTPError(err)
-		Error(w, msg, code)
+		serveError(w, msg, code)
 		return
 	}
 
@@ -660,11 +714,16 @@ func serveFile(w ResponseWriter, r *Request, fs FileSystem, name string, redirec
 				localRedirect(w, r, path.Base(url)+"/")
 				return
 			}
-		} else {
-			if url[len(url)-1] == '/' {
-				localRedirect(w, r, "../"+path.Base(url))
+		} else if url[len(url)-1] == '/' {
+			base := path.Base(url)
+			if base == "/" || base == "." {
+				// The FileSystem maps a path like "/" or "/./" to a file instead of a directory.
+				msg := "http: attempting to traverse a non-directory"
+				serveError(w, msg, StatusInternalServerError)
 				return
 			}
+			localRedirect(w, r, "../"+base)
+			return
 		}
 	}
 
@@ -717,6 +776,9 @@ func toHTTPError(err error) (msg string, httpStatus int) {
 	if errors.Is(err, fs.ErrPermission) {
 		return "403 Forbidden", StatusForbidden
 	}
+	if errors.Is(err, errInvalidUnsafePath) {
+		return "404 page not found", StatusNotFound
+	}
 	// Default:
 	return "500 Internal Server Error", StatusInternalServerError
 }
@@ -724,6 +786,12 @@ func toHTTPError(err error) (msg string, httpStatus int) {
 // localRedirect gives a Moved Permanently response.
 // It does not convert relative paths to absolute paths like Redirect does.
 func localRedirect(w ResponseWriter, r *Request, newPath string) {
+	// There is no reliable way for us to redirect correctly when the path has
+	// escaped slashes, since StripPrefix might be in use. Just return 404.
+	if p := r.URL.EscapedPath(); strings.Contains(p, "%2f") || strings.Contains(p, "%2F") {
+		NotFound(w, r)
+		return
+	}
 	if q := r.URL.RawQuery; q != "" {
 		newPath += "?" + q
 	}
@@ -737,7 +805,7 @@ func localRedirect(w ResponseWriter, r *Request, newPath string) {
 // If the provided file or directory name is a relative path, it is
 // interpreted relative to the current directory and may ascend to
 // parent directories. If the provided name is constructed from user
-// input, it should be sanitized before calling ServeFile.
+// input, it should be sanitized before calling [ServeFile].
 //
 // As a precaution, ServeFile will reject requests where r.URL.Path
 // contains a ".." path element; this protects against callers who
@@ -759,7 +827,7 @@ func ServeFile(w ResponseWriter, r *Request, name string) {
 		// here and ".." may not be wanted.
 		// Note that name might not contain "..", for example if code (still
 		// incorrectly) used filepath.Join(myDir, r.URL.Path).
-		Error(w, "invalid URL path", StatusBadRequest)
+		serveError(w, "invalid URL path", StatusBadRequest)
 		return
 	}
 	dir, file := filepath.Split(name)
@@ -768,23 +836,22 @@ func ServeFile(w ResponseWriter, r *Request, name string) {
 
 // ServeFileFS replies to the request with the contents
 // of the named file or directory from the file system fsys.
+// The files provided by fsys must implement [io.Seeker].
 //
-// If the provided file or directory name is a relative path, it is
-// interpreted relative to the current directory and may ascend to
-// parent directories. If the provided name is constructed from user
-// input, it should be sanitized before calling [ServeFile].
+// If the provided name is constructed from user input, it should be
+// sanitized before calling [ServeFileFS].
 //
-// As a precaution, ServeFile will reject requests where r.URL.Path
+// As a precaution, ServeFileFS will reject requests where r.URL.Path
 // contains a ".." path element; this protects against callers who
 // might unsafely use [filepath.Join] on r.URL.Path without sanitizing
 // it and then use that filepath.Join result as the name argument.
 //
-// As another special case, ServeFile redirects any request where r.URL.Path
+// As another special case, ServeFileFS redirects any request where r.URL.Path
 // ends in "/index.html" to the same path, without the final
 // "index.html". To avoid such redirects either modify the path or
-// use ServeContent.
+// use [ServeContent].
 //
-// Outside of those two special cases, ServeFile does not use
+// Outside of those two special cases, ServeFileFS does not use
 // r.URL.Path for selecting the file or directory to serve; only the
 // file or directory provided in the name argument is used.
 func ServeFileFS(w ResponseWriter, r *Request, fsys fs.FS, name string) {
@@ -794,7 +861,7 @@ func ServeFileFS(w ResponseWriter, r *Request, fsys fs.FS, name string) {
 		// here and ".." may not be wanted.
 		// Note that name might not contain "..", for example if code (still
 		// incorrectly) used filepath.Join(myDir, r.URL.Path).
-		Error(w, "invalid URL path", StatusBadRequest)
+		serveError(w, "invalid URL path", StatusBadRequest)
 		return
 	}
 	serveFile(w, r, FS(fsys), name, false)
@@ -804,7 +871,7 @@ func containsDotDot(v string) bool {
 	if !strings.Contains(v, "..") {
 		return false
 	}
-	for _, ent := range strings.FieldsFunc(v, isSlashRune) {
+	for ent := range strings.FieldsFuncSeq(v, isSlashRune) {
 		if ent == ".." {
 			return true
 		}
@@ -893,37 +960,38 @@ func (f ioFile) Readdir(count int) ([]fs.FileInfo, error) {
 // FS converts fsys to a [FileSystem] implementation,
 // for use with [FileServer] and [NewFileTransport].
 // The files provided by fsys must implement [io.Seeker].
+//
+// Most users should use [FileServerFS] instead.
 func FS(fsys fs.FS) FileSystem {
 	return ioFS{fsys}
 }
 
 // FileServer returns a handler that serves HTTP requests
 // with the contents of the file system rooted at root.
+// Most users should use [FileServerFS] instead.
 //
 // As a special case, the returned file server redirects any request
 // ending in "/index.html" to the same path, without the final
 // "index.html".
-//
-// To use the operating system's file system implementation,
-// use [http.Dir]:
-//
-//	http.Handle("/", http.FileServer(http.Dir("/tmp")))
-//
-// To use an [fs.FS] implementation, use [http.FileServerFS] instead.
 func FileServer(root FileSystem) Handler {
 	return &fileHandler{root}
 }
 
 // FileServerFS returns a handler that serves HTTP requests
 // with the contents of the file system fsys.
+// The files provided by fsys must implement [io.Seeker].
 //
 // As a special case, the returned file server redirects any request
 // ending in "/index.html" to the same path, without the final
 // "index.html".
 //
-//	http.Handle("/", http.FileServerFS(fsys))
-func FileServerFS(root fs.FS) Handler {
-	return FileServer(FS(root))
+// FileServer serves all files contained within the [fs.FS].
+// The examples demonstrate safely serving a local directory
+// while blocking symlinks that lead outside the directory,
+// and serving a local directory while hiding files that
+// start with a dot such as ".git" and ".htpassword".
+func FileServerFS(fsys fs.FS) Handler {
+	return FileServer(FS(fsys))
 }
 
 func (f *fileHandler) ServeHTTP(w ResponseWriter, r *Request) {
@@ -951,6 +1019,25 @@ func (r httpRange) mimeHeader(contentType string, size int64) textproto.MIMEHead
 	}
 }
 
+// GODEBUG=httpservecontentmaxranges=<limit> controls the maximum number of ranges that will
+// be processed in a Range header. Setting httpservecontentmaxranges=0 disables the limit.
+var httpservecontentmaxranges = godebug.New("httpservecontentmaxranges")
+
+const defaultMaxContentRanges = 200
+
+func maxContentRanges() int {
+	maxRanges := defaultMaxContentRanges
+	if v := httpservecontentmaxranges.Value(); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			maxRanges = n
+			if maxRanges == 0 {
+				maxRanges = math.MaxInt
+			}
+		}
+	}
+	return maxRanges
+}
+
 // parseRange parses a Range header string as per RFC 7233.
 // errNoOverlap is returned if none of the ranges overlap.
 func parseRange(s string, size int64) ([]httpRange, error) {
@@ -958,12 +1045,20 @@ func parseRange(s string, size int64) ([]httpRange, error) {
 		return nil, nil // header not present
 	}
 	const b = "bytes="
-	if !strings.HasPrefix(s, b) {
+	if len(s) < len(b) || !ascii.EqualFold(s[:len(b)], b) {
 		return nil, errors.New("invalid range")
 	}
 	var ranges []httpRange
 	noOverlap := false
-	for _, ra := range strings.Split(s[len(b):], ",") {
+	numRanges := strings.Count(s[len(b):], ",") + 1
+	maxRanges := maxContentRanges()
+	if (numRanges > maxRanges) != (numRanges > defaultMaxContentRanges) {
+		httpservecontentmaxranges.IncNonDefault()
+	}
+	if numRanges > maxRanges {
+		return nil, nil // ignore header with too many ranges
+	}
+	for ra := range strings.SplitSeq(s[len(b):], ",") {
 		ra = textproto.TrimString(ra)
 		if ra == "" {
 			continue

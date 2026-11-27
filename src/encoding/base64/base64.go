@@ -6,8 +6,9 @@
 package base64
 
 import (
-	"encoding/binary"
+	"internal/byteorder"
 	"io"
+	"math"
 	"slices"
 	"strconv"
 )
@@ -151,44 +152,43 @@ func (enc *Encoding) Encode(dst, src []byte) {
 	// outside of the loop to speed up the encoder.
 	_ = enc.encode
 
-	di, si := 0, 0
-	n := (len(src) / 3) * 3
-	for si < n {
+	// The following optimization avoids the need to recompute the capacities
+	// when generating code for src[3:] and dst[4:].
+	src, dst = src[:len(src):len(src)], dst[:len(dst):len(dst)]
+
+	for len(src) >= 3 {
 		// Convert 3x 8bit source bytes into 4 bytes
-		val := uint(src[si+0])<<16 | uint(src[si+1])<<8 | uint(src[si+2])
+		val := uint(src[0])<<16 | uint(src[1])<<8 | uint(src[2])
 
-		dst[di+0] = enc.encode[val>>18&0x3F]
-		dst[di+1] = enc.encode[val>>12&0x3F]
-		dst[di+2] = enc.encode[val>>6&0x3F]
-		dst[di+3] = enc.encode[val&0x3F]
+		_ = dst[3] // Eliminate bounds checks below.
+		dst[0] = enc.encode[val>>18&0x3F]
+		dst[1] = enc.encode[val>>12&0x3F]
+		dst[2] = enc.encode[val>>6&0x3F]
+		dst[3] = enc.encode[val&0x3F]
 
-		si += 3
-		di += 4
+		src = src[3:]
+		dst = dst[4:]
 	}
 
-	remain := len(src) - si
-	if remain == 0 {
+	// Add the remaining small block (if any).
+	switch len(src) {
+	case 0:
 		return
-	}
-	// Add the remaining small block
-	val := uint(src[si+0]) << 16
-	if remain == 2 {
-		val |= uint(src[si+1]) << 8
-	}
-
-	dst[di+0] = enc.encode[val>>18&0x3F]
-	dst[di+1] = enc.encode[val>>12&0x3F]
-
-	switch remain {
-	case 2:
-		dst[di+2] = enc.encode[val>>6&0x3F]
-		if enc.padChar != NoPadding {
-			dst[di+3] = byte(enc.padChar)
-		}
 	case 1:
+		val := uint(src[0]) << 16
+		dst[0] = enc.encode[val>>18&0x3F]
+		dst[1] = enc.encode[val>>12&0x3F]
 		if enc.padChar != NoPadding {
-			dst[di+2] = byte(enc.padChar)
-			dst[di+3] = byte(enc.padChar)
+			dst[2] = byte(enc.padChar)
+			dst[3] = byte(enc.padChar)
+		}
+	case 2:
+		val := uint(src[0])<<16 | uint(src[1])<<8
+		dst[0] = enc.encode[val>>18&0x3F]
+		dst[1] = enc.encode[val>>12&0x3F]
+		dst[2] = enc.encode[val>>6&0x3F]
+		if enc.padChar != NoPadding {
+			dst[3] = byte(enc.padChar)
 		}
 	}
 }
@@ -204,9 +204,20 @@ func (enc *Encoding) AppendEncode(dst, src []byte) []byte {
 
 // EncodeToString returns the base64 encoding of src.
 func (enc *Encoding) EncodeToString(src []byte) string {
-	buf := make([]byte, enc.EncodedLen(len(src)))
-	enc.Encode(buf, src)
-	return string(buf)
+	// Kept small so that it is inlined and a short
+	// result can stay on the caller's stack.
+	var buf [64]byte
+	return string(enc.encodeBuf(buf[:], src))
+}
+
+// encodeBuf returns the encoding of src, using buf if it fits.
+func (enc *Encoding) encodeBuf(buf, src []byte) []byte {
+	n := enc.EncodedLen(len(src))
+	if n > len(buf) {
+		buf = make([]byte, n)
+	}
+	enc.Encode(buf[:n], src)
+	return buf[:n]
 }
 
 type encoder struct {
@@ -287,9 +298,17 @@ func NewEncoder(enc *Encoding, w io.Writer) io.WriteCloser {
 
 // EncodedLen returns the length in bytes of the base64 encoding
 // of an input buffer of length n.
+// It panics if the encoded length overflows int,
+// which can happen only if n > [math.MaxInt]/4*3.
 func (enc *Encoding) EncodedLen(n int) int {
 	if enc.padChar == NoPadding {
+		if n > math.MaxInt/4*3+2 {
+			panic("encoded length overflows int")
+		}
 		return n/3*4 + (n%3*8+5)/6 // minimum # chars at 6 bits per char
+	}
+	if n > math.MaxInt/4*3 {
+		panic("encoded length overflows int")
 	}
 	return (n + 2) / 3 * 4 // minimum # 4-char quanta, 3 bytes each
 }
@@ -409,6 +428,7 @@ func (enc *Encoding) decodeQuantum(dst, src []byte, si int) (nsi, n int, err err
 // AppendDecode appends the base64 decoded src to dst
 // and returns the extended buffer.
 // If the input is malformed, it returns the partially decoded src and an error.
+// New line characters (\r and \n) are ignored.
 func (enc *Encoding) AppendDecode(dst, src []byte) ([]byte, error) {
 	// Compute the output size without padding to avoid over allocating.
 	n := len(src)
@@ -423,6 +443,8 @@ func (enc *Encoding) AppendDecode(dst, src []byte) ([]byte, error) {
 }
 
 // DecodeString returns the bytes represented by the base64 string s.
+// If the input is malformed, it returns the partially decoded data and
+// [CorruptInputError]. New line characters (\r and \n) are ignored.
 func (enc *Encoding) DecodeString(s string) ([]byte, error) {
 	dbuf := make([]byte, enc.DecodedLen(len(s)))
 	n, err := enc.Decode(dbuf, []byte(s))
@@ -434,10 +456,21 @@ type decoder struct {
 	readErr error // error from r.Read
 	enc     *Encoding
 	r       io.Reader
+	end     bool       // saw a padded group: no more input may follow
+	total   int64      // input consumed so far, excluding filtered newlines
 	buf     [1024]byte // leftover input
 	nbuf    int
 	out     []byte // leftover decoded output
 	outbuf  [1024 / 4 * 3]byte
+}
+
+// rebaseError updates the offset of a CorruptInputError returned by decoding
+// d.buf so that it refers to a position in the whole input stream.
+func (d *decoder) rebaseError(err error) error {
+	if e, ok := err.(CorruptInputError); ok {
+		return CorruptInputError(int64(e) + d.total)
+	}
+	return err
 }
 
 func (d *decoder) Read(p []byte) (n int, err error) {
@@ -467,11 +500,19 @@ func (d *decoder) Read(p []byte) (n int, err error) {
 		d.nbuf += nn
 	}
 
+	// A padded group must end the stream: decoding the same input as a whole
+	// reports any input after it as garbage.
+	if d.end && d.nbuf > 0 {
+		d.err = CorruptInputError(d.total)
+		return 0, d.err
+	}
+
 	if d.nbuf < 4 {
 		if d.enc.padChar == NoPadding && d.nbuf > 0 {
 			// Decode final fragment, without padding.
 			var nw int
 			nw, d.err = d.enc.Decode(d.outbuf[:], d.buf[:d.nbuf])
+			d.err = d.rebaseError(d.err)
 			d.nbuf = 0
 			d.out = d.outbuf[:nw]
 			n = copy(p, d.out)
@@ -501,6 +542,13 @@ func (d *decoder) Read(p []byte) (n int, err error) {
 	} else {
 		n, d.err = d.enc.Decode(p, d.buf[:nr])
 	}
+	if d.err != nil {
+		d.err = d.rebaseError(d.err)
+	} else if d.enc.padChar != NoPadding && d.buf[nr-1] == byte(d.enc.padChar) {
+		// The decoded chunk ended with a padded group.
+		d.end = true
+	}
+	d.total += int64(nr)
 	d.nbuf -= nr
 	copy(d.buf[:d.nbuf], d.buf[nr:])
 	return n, d.err
@@ -508,7 +556,8 @@ func (d *decoder) Read(p []byte) (n int, err error) {
 
 // Decode decodes src using the encoding enc. It writes at most
 // [Encoding.DecodedLen](len(src)) bytes to dst and returns the number of bytes
-// written. If src contains invalid base64 data, it will return the
+// written. The caller must ensure that dst is large enough to hold all
+// the decoded data. If src contains invalid base64 data, it will return the
 // number of bytes successfully written and [CorruptInputError].
 // New line characters (\r and \n) are ignored.
 func (enc *Encoding) Decode(dst, src []byte) (n int, err error) {
@@ -534,7 +583,7 @@ func (enc *Encoding) Decode(dst, src []byte) (n int, err error) {
 			enc.decodeMap[src2[6]],
 			enc.decodeMap[src2[7]],
 		); ok {
-			binary.BigEndian.PutUint64(dst[n:], dn)
+			byteorder.BEPutUint64(dst[n:], dn)
 			n += 6
 			si += 8
 		} else {
@@ -555,7 +604,7 @@ func (enc *Encoding) Decode(dst, src []byte) (n int, err error) {
 			enc.decodeMap[src2[2]],
 			enc.decodeMap[src2[3]],
 		); ok {
-			binary.BigEndian.PutUint32(dst[n:], dn)
+			byteorder.BEPutUint32(dst[n:], dn)
 			n += 3
 			si += 4
 		} else {
@@ -622,15 +671,7 @@ type newlineFilteringReader struct {
 func (r *newlineFilteringReader) Read(p []byte) (int, error) {
 	n, err := r.wrapped.Read(p)
 	for n > 0 {
-		offset := 0
-		for i, b := range p[:n] {
-			if b != '\r' && b != '\n' {
-				if i != offset {
-					p[offset] = b
-				}
-				offset++
-			}
-		}
+		offset := stripNewlines(p[:n])
 		if offset > 0 {
 			return offset, err
 		}
@@ -638,6 +679,48 @@ func (r *newlineFilteringReader) Read(p []byte) (int, error) {
 		n, err = r.wrapped.Read(p)
 	}
 	return n, err
+}
+
+// stripNewlines removes newline characters from p in place
+// and returns the number of bytes that remain.
+func stripNewlines(p []byte) int {
+	n := 0 // bytes kept
+	i := 0
+	for ; len(p)-i >= 8; i += 8 {
+		x := byteorder.LEUint64(p[i:])
+		if mayHaveNewline(x) {
+			n += dropNewlines(p[n:], p[i:i+8])
+			continue
+		}
+		byteorder.LEPutUint64(p[n:], x)
+		n += 8
+	}
+	return n + dropNewlines(p[n:], p[i:])
+}
+
+// dropNewlines copies src to dst, skipping newline characters,
+// and returns the number of bytes copied.
+// The copy is safe when dst starts at or before src.
+func dropNewlines(dst, src []byte) int {
+	n := 0
+	for _, b := range src {
+		if b != '\r' && b != '\n' {
+			dst[n] = b
+			n++
+		}
+	}
+	return n
+}
+
+// mayHaveNewline reports whether any byte of x is '\r' or less,
+// as both newline characters are. It is the classic zero-byte test
+// (see Hacker's Delight, section 6-1) with '\r'+1 in place of 1.
+func mayHaveNewline(x uint64) bool {
+	const (
+		lo = 0x0101010101010101 // low bit of each byte
+		hi = 0x8080808080808080 // high bit of each byte
+	)
+	return (x-lo*('\r'+1))&^x&hi != 0
 }
 
 // NewDecoder constructs a new base64 stream decoder.

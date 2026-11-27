@@ -13,8 +13,12 @@ package cipher
 
 import (
 	"bytes"
-	"crypto/internal/alias"
+	"crypto/internal/fips140/aes"
+	"crypto/internal/fips140/alias"
+	"crypto/internal/fips140only"
 	"crypto/subtle"
+	"internal/runtime/sys"
+	_ "unsafe"
 )
 
 type cbc struct {
@@ -36,11 +40,59 @@ func newCBC(b Block, iv []byte) *cbc {
 type cbcEncrypter cbc
 
 // cbcEncAble is an interface implemented by ciphers that have a specific
-// optimized implementation of CBC encryption, like crypto/aes.
-// NewCBCEncrypter will check for this interface and return the specific
-// BlockMode if found.
+// optimized implementation of CBC encryption. crypto/aes doesn't use this
+// anymore, and we'd like to eventually remove it.
 type cbcEncAble interface {
 	NewCBCEncrypter(iv []byte) BlockMode
+}
+
+var unwrapAESBlockFunc func(Block) (*aes.Block, bool)
+
+//go:linkname registerAESBlockUnwrap
+func registerAESBlockUnwrap(fn func(Block) (*aes.Block, bool)) {
+	unwrapAESBlockFunc = fn
+}
+
+func unwrapAESBlock(b Block) (*aes.Block, bool) {
+	if b, ok := b.(*aes.Block); ok {
+		return b, true
+	}
+	if unwrapAESBlockFunc != nil {
+		return unwrapAESBlockFunc(b)
+	}
+	return nil, false
+}
+
+type aesCBCEncrypterWrapper struct {
+	c *aes.CBCEncrypter
+}
+
+func (w aesCBCEncrypterWrapper) BlockSize() int {
+	return w.c.BlockSize()
+}
+
+func (w aesCBCEncrypterWrapper) CryptBlocks(dst, src []byte) {
+	subtle.WithDataIndependentTiming(func() { w.c.CryptBlocks(dst, src) })
+}
+
+func (w aesCBCEncrypterWrapper) SetIV(iv []byte) {
+	w.c.SetIV(iv)
+}
+
+type aesCBCDecrypterWrapper struct {
+	c *aes.CBCDecrypter
+}
+
+func (w aesCBCDecrypterWrapper) BlockSize() int {
+	return w.c.BlockSize()
+}
+
+func (w aesCBCDecrypterWrapper) CryptBlocks(dst, src []byte) {
+	subtle.WithDataIndependentTiming(func() { w.c.CryptBlocks(dst, src) })
+}
+
+func (w aesCBCDecrypterWrapper) SetIV(iv []byte) {
+	w.c.SetIV(iv)
 }
 
 // NewCBCEncrypter returns a BlockMode which encrypts in cipher block chaining
@@ -49,6 +101,16 @@ type cbcEncAble interface {
 func NewCBCEncrypter(b Block, iv []byte) BlockMode {
 	if len(iv) != b.BlockSize() {
 		panic("cipher.NewCBCEncrypter: IV length must equal block size")
+	}
+	if b, ok := unwrapAESBlock(b); ok {
+		c := aes.NewCBCEncrypter(b, [16]byte(iv))
+		if !sys.DITSupported {
+			return c
+		}
+		return aesCBCEncrypterWrapper{c}
+	}
+	if fips140only.Enforced() {
+		panic("crypto/cipher: use of CBC with non-AES ciphers is not allowed in FIPS 140-only mode")
 	}
 	if cbc, ok := b.(cbcEncAble); ok {
 		return cbc.NewCBCEncrypter(iv)
@@ -79,6 +141,9 @@ func (x *cbcEncrypter) CryptBlocks(dst, src []byte) {
 	if alias.InexactOverlap(dst[:len(src)], src) {
 		panic("crypto/cipher: invalid buffer overlap")
 	}
+	if _, ok := unwrapAESBlock(x.b); ok {
+		panic("crypto/cipher: internal error: generic CBC used with AES")
+	}
 
 	iv := x.iv
 
@@ -107,9 +172,8 @@ func (x *cbcEncrypter) SetIV(iv []byte) {
 type cbcDecrypter cbc
 
 // cbcDecAble is an interface implemented by ciphers that have a specific
-// optimized implementation of CBC decryption, like crypto/aes.
-// NewCBCDecrypter will check for this interface and return the specific
-// BlockMode if found.
+// optimized implementation of CBC decryption. crypto/aes doesn't use this
+// anymore, and we'd like to eventually remove it.
 type cbcDecAble interface {
 	NewCBCDecrypter(iv []byte) BlockMode
 }
@@ -120,6 +184,16 @@ type cbcDecAble interface {
 func NewCBCDecrypter(b Block, iv []byte) BlockMode {
 	if len(iv) != b.BlockSize() {
 		panic("cipher.NewCBCDecrypter: IV length must equal block size")
+	}
+	if b, ok := unwrapAESBlock(b); ok {
+		c := aes.NewCBCDecrypter(b, [16]byte(iv))
+		if !sys.DITSupported {
+			return c
+		}
+		return aesCBCDecrypterWrapper{c}
+	}
+	if fips140only.Enforced() {
+		panic("crypto/cipher: use of CBC with non-AES ciphers is not allowed in FIPS 140-only mode")
 	}
 	if cbc, ok := b.(cbcDecAble); ok {
 		return cbc.NewCBCDecrypter(iv)
@@ -149,6 +223,9 @@ func (x *cbcDecrypter) CryptBlocks(dst, src []byte) {
 	}
 	if alias.InexactOverlap(dst[:len(src)], src) {
 		panic("crypto/cipher: invalid buffer overlap")
+	}
+	if _, ok := unwrapAESBlock(x.b); ok {
+		panic("crypto/cipher: internal error: generic CBC used with AES")
 	}
 	if len(src) == 0 {
 		return

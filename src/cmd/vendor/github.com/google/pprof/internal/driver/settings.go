@@ -90,7 +90,7 @@ func configMenu(fname string, u url.URL) []configMenuEntry {
 	result := make([]configMenuEntry, len(configs))
 	lastMatch := -1
 	for i, cfg := range configs {
-		dst, changed := cfg.config.makeURL(u)
+		dst, changed := cfg.makeURL(u)
 		if !changed {
 			lastMatch = i
 		}
@@ -102,7 +102,7 @@ func configMenu(fname string, u url.URL) []configMenuEntry {
 			UserConfig: (i != 0),
 		}
 	}
-	// Mark the last matching config as currennt
+	// Mark the last matching config as current
 	if lastMatch >= 0 {
 		result[lastMatch].Current = true
 	}

@@ -45,7 +45,7 @@ func addParamsAnalyzer(fn *ir.Func, analyzers []propAnalyzer, fp *FuncProps, nf 
 	return analyzers
 }
 
-// makeParamAnalyzer creates a new helper object to analyze parameters
+// makeParamsAnalyzer creates a new helper object to analyze parameters
 // of function fn. If the function doesn't have any interesting
 // params, a nil helper is returned along with a set of default param
 // flags for the func.
@@ -122,9 +122,9 @@ func (pa *paramsAnalyzer) findParamIdx(n *ir.Name) int {
 
 type testfType func(x ir.Node, param *ir.Name, idx int) (bool, bool)
 
-// paramsAnalyzer invokes function 'testf' on the specified expression
-// 'x' for each parameter, and if the result is TRUE, or's 'flag' into
-// the flags for that param.
+// checkParams invokes function 'testf' on the specified expression 'x'
+// for each parameter. If the result is TRUE, it OR's either 'flag' or 'mayflag'
+// into the flags for that param, depending on whether we are in a conditional context.
 func (pa *paramsAnalyzer) checkParams(x ir.Node, flag ParamPropBits, mayflag ParamPropBits, testf testfType) {
 	for idx, p := range pa.params {
 		if !pa.top[idx] && pa.values[idx] == ParamNoInfo {

@@ -14,35 +14,20 @@ import (
 	"cmd/internal/src"
 )
 
-var funcStack []*ir.Func // stack of previous values of ir.CurFunc
-
 // DeclFunc declares the parameters for fn and adds it to
 // Target.Funcs.
-//
-// Before returning, it sets CurFunc to fn. When the caller is done
-// constructing fn, it must call FinishFuncBody to restore CurFunc.
 func DeclFunc(fn *ir.Func) {
 	fn.DeclareParams(true)
 	fn.Nname.Defn = fn
 	Target.Funcs = append(Target.Funcs, fn)
-
-	funcStack = append(funcStack, ir.CurFunc)
-	ir.CurFunc = fn
 }
 
-// FinishFuncBody restores ir.CurFunc to its state before the last
-// call to DeclFunc.
-func FinishFuncBody() {
-	funcStack, ir.CurFunc = funcStack[:len(funcStack)-1], funcStack[len(funcStack)-1]
-}
-
-func CheckFuncStack() {
-	if len(funcStack) != 0 {
-		base.Fatalf("funcStack is non-empty: %v", len(funcStack))
-	}
-}
-
-// make a new Node off the books.
+// TempAt makes a new Node off the books.
+//
+// N.B., the new Node is a function-local variable defaulting to function scope.
+// It helps in some cases if an ODCL is also created and placed in a narrower scope,
+// such as if the variable can be used in a loop body and potentially escape.
+// TODO: Consider some mechanism to more conveniently create a block scoped temporary.
 func TempAt(pos src.XPos, curfn *ir.Func, typ *types.Type) *ir.Name {
 	if curfn == nil {
 		base.FatalfAt(pos, "no curfn for TempAt")

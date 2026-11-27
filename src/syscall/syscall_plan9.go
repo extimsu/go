@@ -14,16 +14,29 @@ package syscall
 import (
 	"errors"
 	"internal/oserror"
+	"internal/strconv"
 	"runtime"
 	"unsafe"
 )
 
 const ImplementsGetwd = true
-const bitSize16 = 2
+
+// Errno is not used with GOOS plan9.
+//
+// It exists because the Go 1 API contract
+// (api/go1.txt's "pkg syscall, type Errno uintptr")
+// says it exists, and so code in the ecosystem often
+// assume it exists. This lets portable code be written
+// without build-tagged files, using runtime.GOOS checks instead.
+type Errno uintptr
+
+func (e Errno) Error() string   { return "errno " + strconv.Itoa(int(e)) }
+func (e Errno) Temporary() bool { return false }
+func (e Errno) Timeout() bool   { return false }
 
 // ErrorString implements Error's String method by returning itself.
 //
-// ErrorString values can be tested against error values using errors.Is.
+// ErrorString values can be tested against error values using [errors.Is].
 // For example:
 //
 //	_, _, err := syscall.Syscall(...)
@@ -46,6 +59,8 @@ func (e ErrorString) Is(target error) bool {
 			"has been removed", "no parent")
 	case errors.ErrUnsupported:
 		return checkErrMessageContent(e, "not supported")
+	case ENOTDIR:
+		return checkErrMessageContent(e, "not a directory")
 	}
 	return false
 }
@@ -99,8 +114,15 @@ var (
 )
 
 // For testing: clients can set this flag to force
-// creation of IPv6 sockets to return EAFNOSUPPORT.
+// creation of IPv6 sockets to return [EAFNOSUPPORT].
 var SocketDisableIPv6 bool
+
+// x/sys/plan9 accesses these in assembly.
+//
+//go:linkname Syscall
+//go:linkname Syscall6
+//go:linkname RawSyscall
+//go:linkname RawSyscall6
 
 func Syscall(trap, a1, a2, a3 uintptr) (r1, r2 uintptr, err ErrorString)
 func Syscall6(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err ErrorString)
@@ -213,6 +235,10 @@ func Pipe(p []int) (err error) {
 
 // Underlying system call writes to newoffset via pointer.
 // Implemented in assembly to avoid allocation.
+//
+// Accessed via assembly from x/sys/plan9.
+//
+//go:linkname seek
 func seek(placeholder uintptr, fd int, offset int64, whence int) (newoffset int64, err string)
 
 func Seek(fd int, offset int64, whence int) (newoffset int64, err error) {
@@ -225,21 +251,7 @@ func Seek(fd int, offset int64, whence int) (newoffset int64, err error) {
 }
 
 func Mkdir(path string, mode uint32) (err error) {
-	// If path exists and is not a directory, Create will fail silently.
-	// Work around this by rejecting Mkdir if path exists.
-	statbuf := make([]byte, bitSize16)
-	// Remove any trailing slashes from path, otherwise the Stat will
-	// fail with ENOTDIR.
-	n := len(path)
-	for n > 1 && path[n-1] == '/' {
-		n--
-	}
-	_, err = Stat(path[0:n], statbuf)
-	if err == nil {
-		return EEXIST
-	}
-
-	fd, err := Create(path, O_RDONLY, DMDIR|mode)
+	fd, err := Create(path, O_RDONLY|O_EXCL, DMDIR|mode)
 
 	if fd != -1 {
 		Close(fd)

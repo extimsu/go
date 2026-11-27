@@ -18,8 +18,7 @@ import (
 
 // IsRegularMemory reports whether t can be compared/hashed as regular memory.
 func IsRegularMemory(t *types.Type) bool {
-	a, _ := types.AlgType(t)
-	return a == types.AMEM
+	return types.AlgType(t) == types.AMEM
 }
 
 // Memrun finds runs of struct fields for which memory-only algs are appropriate.
@@ -120,6 +119,11 @@ func eqStructFieldCost(t *types.Type, i int) (int64, int64, int) {
 		next int
 	)
 
+	if ft := t.Field(i).Type; ft.IsSIMD() {
+		// The back end compares SIMD values directly.
+		return 1, ft.Size(), i + 1
+	}
+
 	if base.Ctxt.Arch.CanMergeLoads {
 		// If we can merge adjacent loads then we can calculate the cost of the
 		// comparison using the size of the memory run and the size of the registers.
@@ -142,13 +146,17 @@ func eqStructFieldCost(t *types.Type, i int) (int64, int64, int) {
 }
 
 func calculateCostForType(t *types.Type) int64 {
+	if t.IsSIMD() {
+		// The back end compares SIMD values directly.
+		return 1
+	}
 	var cost int64
 	switch t.Kind() {
 	case types.TSTRUCT:
 		return EqStructCost(t)
 	case types.TSLICE:
 		// Slices are not comparable.
-		base.Fatalf("eqStructFieldCost: unexpected slice type")
+		base.Fatalf("calculateCostForType: unexpected slice type")
 	case types.TARRAY:
 		elemCost := calculateCostForType(t.Elem())
 		cost = t.NumElem() * elemCost
@@ -169,7 +177,7 @@ func calculateCostForType(t *types.Type) int64 {
 // The first return value is the flattened list of conditions,
 // the second value is a boolean indicating whether any of the
 // comparisons could panic.
-func EqStruct(t *types.Type, np, nq ir.Node) ([]ir.Node, bool) {
+func EqStruct(curfunc *ir.Func, t *types.Type, np, nq ir.Node) ([]ir.Node, bool) {
 	// The conditions are a list-of-lists. Conditions are reorderable
 	// within each inner list. The outer lists must be evaluated in order.
 	var conds [][]ir.Node
@@ -200,13 +208,13 @@ func EqStruct(t *types.Type, np, nq ir.Node) ([]ir.Node, bool) {
 			}
 			switch {
 			case f.Type.IsString():
-				p := typecheck.DotField(base.Pos, typecheck.Expr(np), i)
-				q := typecheck.DotField(base.Pos, typecheck.Expr(nq), i)
-				eqlen, eqmem := EqString(p, q)
+				p := typecheck.DotField(base.Pos, typecheck.Expr(curfunc, np), i)
+				q := typecheck.DotField(base.Pos, typecheck.Expr(curfunc, nq), i)
+				eqlen, eqmem := EqString(curfunc, p, q)
 				and(eqlen)
 				and(eqmem)
 			default:
-				and(eqfield(np, nq, i))
+				and(eqfield(curfunc, np, nq, i))
 			}
 			if typeCanPanic {
 				// Also enforce ordering after something that can panic.
@@ -220,11 +228,11 @@ func EqStruct(t *types.Type, np, nq ir.Node) ([]ir.Node, bool) {
 		if cost <= 4 {
 			// Cost of 4 or less: use plain field equality.
 			for j := i; j < next; j++ {
-				and(eqfield(np, nq, j))
+				and(eqfield(curfunc, np, nq, j))
 			}
 		} else {
 			// Higher cost: use memequal.
-			cc := eqmem(np, nq, i, size)
+			cc := eqmem(curfunc, np, nq, i, size)
 			and(cc)
 		}
 		i = next
@@ -255,13 +263,13 @@ func EqStruct(t *types.Type, np, nq ir.Node) ([]ir.Node, bool) {
 //
 // which can be used to construct string equality comparison.
 // eqlen must be evaluated before eqmem, and shortcircuiting is required.
-func EqString(s, t ir.Node) (eqlen *ir.BinaryExpr, eqmem *ir.CallExpr) {
-	s = typecheck.Conv(s, types.Types[types.TSTRING])
-	t = typecheck.Conv(t, types.Types[types.TSTRING])
-	sptr := ir.NewUnaryExpr(base.Pos, ir.OSPTR, s)
-	tptr := ir.NewUnaryExpr(base.Pos, ir.OSPTR, t)
-	slen := typecheck.Conv(ir.NewUnaryExpr(base.Pos, ir.OLEN, s), types.Types[types.TUINTPTR])
-	tlen := typecheck.Conv(ir.NewUnaryExpr(base.Pos, ir.OLEN, t), types.Types[types.TUINTPTR])
+func EqString(curfunc *ir.Func, s, t ir.Node) (eqlen *ir.BinaryExpr, eqmem *ir.CallExpr) {
+	s = typecheck.Conv(curfunc, s, types.Types[types.TSTRING])
+	t = typecheck.Conv(curfunc, t, types.Types[types.TSTRING])
+	sptr := ir.NewConvExpr(base.Pos, ir.OCONVNOP, types.Types[types.TUNSAFEPTR], ir.NewUnaryExpr(base.Pos, ir.OSPTR, s))
+	tptr := ir.NewConvExpr(base.Pos, ir.OCONVNOP, types.Types[types.TUNSAFEPTR], ir.NewUnaryExpr(base.Pos, ir.OSPTR, t))
+	slen := typecheck.Conv(curfunc, ir.NewUnaryExpr(base.Pos, ir.OLEN, s), types.Types[types.TUINTPTR])
+	tlen := typecheck.Conv(curfunc, ir.NewUnaryExpr(base.Pos, ir.OLEN, t), types.Types[types.TUINTPTR])
 
 	// Pick the 3rd arg to memequal. Both slen and tlen are fine to use, because we short
 	// circuit the memequal call if they aren't the same. But if one is a constant some
@@ -294,11 +302,11 @@ func EqString(s, t ir.Node) (eqlen *ir.BinaryExpr, eqmem *ir.CallExpr) {
 		cmplen = tlen
 	}
 
-	fn := typecheck.LookupRuntime("memequal", types.Types[types.TUINT8], types.Types[types.TUINT8])
-	call := typecheck.Call(base.Pos, fn, []ir.Node{sptr, tptr, ir.Copy(cmplen)}, false).(*ir.CallExpr)
+	fn := typecheck.LookupRuntime("memequal")
+	call := typecheck.Call(curfunc, base.Pos, fn, []ir.Node{sptr, tptr, ir.Copy(cmplen)}, false).(*ir.CallExpr)
 
 	cmp := ir.NewBinaryExpr(base.Pos, ir.OEQ, slen, tlen)
-	cmp = typecheck.Expr(cmp).(*ir.BinaryExpr)
+	cmp = typecheck.Expr(curfunc, cmp).(*ir.BinaryExpr)
 	cmp.SetType(types.Types[types.TBOOL])
 	return cmp, call
 }
@@ -313,7 +321,7 @@ func EqString(s, t ir.Node) (eqlen *ir.BinaryExpr, eqmem *ir.CallExpr) {
 //
 // which can be used to construct interface equality comparison.
 // eqtab must be evaluated before eqdata, and shortcircuiting is required.
-func EqInterface(s, t ir.Node) (eqtab *ir.BinaryExpr, eqdata *ir.CallExpr) {
+func EqInterface(curfunc *ir.Func, s, t ir.Node) (eqtab *ir.BinaryExpr, eqdata *ir.CallExpr) {
 	if !types.Identical(s.Type(), t.Type()) {
 		base.Fatalf("EqInterface %v %v", s.Type(), t.Type())
 	}
@@ -335,10 +343,10 @@ func EqInterface(s, t ir.Node) (eqtab *ir.BinaryExpr, eqdata *ir.CallExpr) {
 	sdata.SetTypecheck(1)
 	tdata.SetTypecheck(1)
 
-	call := typecheck.Call(base.Pos, fn, []ir.Node{stab, sdata, tdata}, false).(*ir.CallExpr)
+	call := typecheck.Call(curfunc, base.Pos, fn, []ir.Node{stab, sdata, tdata}, false).(*ir.CallExpr)
 
 	cmp := ir.NewBinaryExpr(base.Pos, ir.OEQ, stab, ttab)
-	cmp = typecheck.Expr(cmp).(*ir.BinaryExpr)
+	cmp = typecheck.Expr(curfunc, cmp).(*ir.BinaryExpr)
 	cmp.SetType(types.Types[types.TBOOL])
 	return cmp, call
 }
@@ -346,18 +354,18 @@ func EqInterface(s, t ir.Node) (eqtab *ir.BinaryExpr, eqdata *ir.CallExpr) {
 // eqfield returns the node
 //
 //	p.field == q.field
-func eqfield(p, q ir.Node, field int) ir.Node {
-	nx := typecheck.DotField(base.Pos, typecheck.Expr(p), field)
-	ny := typecheck.DotField(base.Pos, typecheck.Expr(q), field)
-	return typecheck.Expr(ir.NewBinaryExpr(base.Pos, ir.OEQ, nx, ny))
+func eqfield(curfunc *ir.Func, p, q ir.Node, field int) ir.Node {
+	nx := typecheck.DotField(base.Pos, typecheck.Expr(curfunc, p), field)
+	ny := typecheck.DotField(base.Pos, typecheck.Expr(curfunc, q), field)
+	return typecheck.Expr(curfunc, ir.NewBinaryExpr(base.Pos, ir.OEQ, nx, ny))
 }
 
 // eqmem returns the node
 //
 //	memequal(&p.field, &q.field, size)
-func eqmem(p, q ir.Node, field int, size int64) ir.Node {
-	nx := typecheck.Expr(typecheck.NodAddr(typecheck.DotField(base.Pos, p, field)))
-	ny := typecheck.Expr(typecheck.NodAddr(typecheck.DotField(base.Pos, q, field)))
+func eqmem(curfunc *ir.Func, p, q ir.Node, field int, size int64) ir.Node {
+	nx := typecheck.Expr(curfunc, typecheck.NodAddr(curfunc, typecheck.DotField(base.Pos, p, field)))
+	ny := typecheck.Expr(curfunc, typecheck.NodAddr(curfunc, typecheck.DotField(base.Pos, q, field)))
 
 	fn, needsize := eqmemfunc(size, nx.Type().Elem())
 	call := ir.NewCallExpr(base.Pos, ir.OCALL, fn, nil)
@@ -371,6 +379,11 @@ func eqmem(p, q ir.Node, field int, size int64) ir.Node {
 }
 
 func eqmemfunc(size int64, t *types.Type) (fn *ir.Name, needsize bool) {
+	if !base.Ctxt.Arch.CanMergeLoads && t.Alignment() < int64(base.Ctxt.Arch.Alignment) && t.Alignment() < t.Size() {
+		// We can't use larger comparisons if the value might not be aligned
+		// enough for the larger comparison. See issues 46283 and 67160.
+		size = 0
+	}
 	switch size {
 	case 1, 2, 4, 8, 16:
 		buf := fmt.Sprintf("memequal%d", int(size)*8)

@@ -5,7 +5,8 @@
 package elliptic
 
 import (
-	"crypto/internal/nistec"
+	"crypto/internal/fips140/nistec"
+	"crypto/subtle"
 	"errors"
 	"math/big"
 )
@@ -18,7 +19,7 @@ func initP224() {
 	p224.params = &CurveParams{
 		Name:    "P-224",
 		BitSize: 224,
-		// FIPS 186-4, section D.1.2.2
+		// SP 800-186, Section 3.2.1.2
 		P:  bigFromDecimal("26959946667150639794667015087019630673557916260026308143510066298881"),
 		N:  bigFromDecimal("26959946667150639794667015087019625940457807714424391721682722368061"),
 		B:  bigFromHex("b4050a850c04b3abf54132565044b0b7d7bfd8ba270b39432355ffb4"),
@@ -27,19 +28,15 @@ func initP224() {
 	}
 }
 
-type p256Curve struct {
-	nistCurve[*nistec.P256Point]
-}
-
-var p256 = &p256Curve{nistCurve[*nistec.P256Point]{
+var p256 = &nistCurve[*nistec.P256Point]{
 	newPoint: nistec.NewP256Point,
-}}
+}
 
 func initP256() {
 	p256.params = &CurveParams{
 		Name:    "P-256",
 		BitSize: 256,
-		// FIPS 186-4, section D.1.2.3
+		// SP 800-186, Section 3.2.1.3
 		P:  bigFromDecimal("115792089210356248762697446949407573530086143415290314195533631308867097853951"),
 		N:  bigFromDecimal("115792089210356248762697446949407573529996955224135760342422259061068512044369"),
 		B:  bigFromHex("5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b"),
@@ -56,7 +53,7 @@ func initP384() {
 	p384.params = &CurveParams{
 		Name:    "P-384",
 		BitSize: 384,
-		// FIPS 186-4, section D.1.2.4
+		// SP 800-186, Section 3.2.1.4
 		P: bigFromDecimal("394020061963944792122790401001436138050797392704654" +
 			"46667948293404245721771496870329047266088258938001861606973112319"),
 		N: bigFromDecimal("394020061963944792122790401001436138050797392704654" +
@@ -78,7 +75,7 @@ func initP521() {
 	p521.params = &CurveParams{
 		Name:    "P-521",
 		BitSize: 521,
-		// FIPS 186-4, section D.1.2.5
+		// SP 800-186, Section 3.2.1.5
 		P: bigFromDecimal("68647976601306097149819007990813932172694353001433" +
 			"0540939446345918554318339765605212255964066145455497729631139148" +
 			"0858037121987999716643812574028291115057151"),
@@ -172,23 +169,41 @@ func (curve *nistCurve[Point]) pointToAffine(p Point) (x, y *big.Int) {
 }
 
 func (curve *nistCurve[Point]) Add(x1, y1, x2, y2 *big.Int) (*big.Int, *big.Int) {
-	p1, err := curve.pointFromAffine(x1, y1)
+	var x, y *big.Int
+	var err error
+	subtle.WithDataIndependentTiming(func() {
+		var p1, p2 Point
+		p1, err = curve.pointFromAffine(x1, y1)
+		if err != nil {
+			return
+		}
+		p2, err = curve.pointFromAffine(x2, y2)
+		if err != nil {
+			return
+		}
+		x, y = curve.pointToAffine(p1.Add(p1, p2))
+	})
 	if err != nil {
 		panic("crypto/elliptic: Add was called on an invalid point")
 	}
-	p2, err := curve.pointFromAffine(x2, y2)
-	if err != nil {
-		panic("crypto/elliptic: Add was called on an invalid point")
-	}
-	return curve.pointToAffine(p1.Add(p1, p2))
+	return x, y
 }
 
 func (curve *nistCurve[Point]) Double(x1, y1 *big.Int) (*big.Int, *big.Int) {
-	p, err := curve.pointFromAffine(x1, y1)
+	var x, y *big.Int
+	var err error
+	subtle.WithDataIndependentTiming(func() {
+		var p Point
+		p, err = curve.pointFromAffine(x1, y1)
+		if err != nil {
+			return
+		}
+		x, y = curve.pointToAffine(p.Double(p))
+	})
 	if err != nil {
 		panic("crypto/elliptic: Double was called on an invalid point")
 	}
-	return curve.pointToAffine(p.Double(p))
+	return x, y
 }
 
 // normalizeScalar brings the scalar within the byte size of the order of the
@@ -207,45 +222,46 @@ func (curve *nistCurve[Point]) normalizeScalar(scalar []byte) []byte {
 }
 
 func (curve *nistCurve[Point]) ScalarMult(Bx, By *big.Int, scalar []byte) (*big.Int, *big.Int) {
-	p, err := curve.pointFromAffine(Bx, By)
-	if err != nil {
+	var x, y *big.Int
+	var pErr, sErr error
+	subtle.WithDataIndependentTiming(func() {
+		var p Point
+		p, pErr = curve.pointFromAffine(Bx, By)
+		if pErr != nil {
+			return
+		}
+		scalar = curve.normalizeScalar(scalar)
+		p, sErr = p.ScalarMult(p, scalar)
+		if sErr != nil {
+			return
+		}
+		x, y = curve.pointToAffine(p)
+	})
+	if pErr != nil {
 		panic("crypto/elliptic: ScalarMult was called on an invalid point")
 	}
-	scalar = curve.normalizeScalar(scalar)
-	p, err = p.ScalarMult(p, scalar)
-	if err != nil {
+	if sErr != nil {
 		panic("crypto/elliptic: nistec rejected normalized scalar")
 	}
-	return curve.pointToAffine(p)
+	return x, y
 }
 
 func (curve *nistCurve[Point]) ScalarBaseMult(scalar []byte) (*big.Int, *big.Int) {
-	scalar = curve.normalizeScalar(scalar)
-	p, err := curve.newPoint().ScalarBaseMult(scalar)
+	var x, y *big.Int
+	var err error
+	subtle.WithDataIndependentTiming(func() {
+		scalar = curve.normalizeScalar(scalar)
+		var p Point
+		p, err = curve.newPoint().ScalarBaseMult(scalar)
+		if err != nil {
+			return
+		}
+		x, y = curve.pointToAffine(p)
+	})
 	if err != nil {
 		panic("crypto/elliptic: nistec rejected normalized scalar")
 	}
-	return curve.pointToAffine(p)
-}
-
-// CombinedMult returns [s1]G + [s2]P where G is the generator. It's used
-// through an interface upgrade in crypto/ecdsa.
-func (curve *nistCurve[Point]) CombinedMult(Px, Py *big.Int, s1, s2 []byte) (x, y *big.Int) {
-	s1 = curve.normalizeScalar(s1)
-	q, err := curve.newPoint().ScalarBaseMult(s1)
-	if err != nil {
-		panic("crypto/elliptic: nistec rejected normalized scalar")
-	}
-	p, err := curve.pointFromAffine(Px, Py)
-	if err != nil {
-		panic("crypto/elliptic: CombinedMult was called on an invalid point")
-	}
-	s2 = curve.normalizeScalar(s2)
-	p, err = p.ScalarMult(p, s2)
-	if err != nil {
-		panic("crypto/elliptic: nistec rejected normalized scalar")
-	}
-	return curve.pointToAffine(p.Add(p, q))
+	return x, y
 }
 
 func (curve *nistCurve[Point]) Unmarshal(data []byte) (x, y *big.Int) {

@@ -11,25 +11,36 @@ package main
 // Defined in tracebackctxt_c.c.
 extern void C1(void);
 extern void C2(void);
+extern void C1Unwind(void);
+extern void C2Unwind(void);
 extern void tcContext(void*);
 extern void tcContextSimple(void*);
 extern void tcTraceback(void*);
 extern void tcSymbolizer(void*);
+extern void tcUnwindContext(void*);
+extern void tcUnwindTraceback(void*);
+extern void tcUnwindSymbolizer(void*);
 extern int getContextCount(void);
 extern void TracebackContextPreemptionCallGo(int);
+extern void TracebackContextProfileCallGo(void);
 */
 import "C"
 
 import (
 	"fmt"
+	"io"
 	"runtime"
+	"runtime/pprof"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 )
 
 func init() {
 	register("TracebackContext", TracebackContext)
+	register("TracebackContextUnwind", TracebackContextUnwind)
 	register("TracebackContextPreemption", TracebackContextPreemption)
+	register("TracebackContextProfile", TracebackContextProfile)
 }
 
 var tracebackOK bool
@@ -108,6 +119,69 @@ wantLoop:
 	}
 }
 
+func TracebackContextUnwind() {
+	runtime.SetCgoTraceback(0, unsafe.Pointer(C.tcUnwindTraceback), unsafe.Pointer(C.tcUnwindContext), unsafe.Pointer(C.tcUnwindSymbolizer))
+	C.C1Unwind()
+	if got := C.getContextCount(); got != 0 {
+		fmt.Printf("at end contextCount == %d, expected 0\n", got)
+		tracebackOK = false
+	}
+	if tracebackOK {
+		fmt.Println("OK")
+	}
+}
+
+//export G1Unwind
+func G1Unwind() {
+	C.C2Unwind()
+}
+
+//export G2Unwind
+func G2Unwind() {
+	pc := make([]uintptr, 64)
+	n := runtime.Callers(0, pc)
+	cf := runtime.CallersFrames(pc[:n])
+	var frames []runtime.Frame
+	for {
+		frame, more := cf.Next()
+		frames = append(frames, frame)
+		if !more {
+			break
+		}
+	}
+
+	want := []string{
+		"main.G2Unwind",
+		"C2Unwind",
+		"main.G1Unwind",
+		"C1Unwind",
+		"main.TracebackContextUnwind",
+	}
+
+	ok := true
+	i := 0
+wantLoop:
+	for _, w := range want {
+		for ; i < len(frames); i++ {
+			if frames[i].Function == w {
+				i++
+				continue wantLoop
+			}
+		}
+		fmt.Printf("did not find function %s in\n", w)
+		for _, f := range frames {
+			fmt.Println(f)
+		}
+		ok = false
+		break
+	}
+	tracebackOK = ok
+	if got := C.getContextCount(); got != 2 {
+		fmt.Printf("at bottom contextCount == %d, expected 2\n", got)
+		tracebackOK = false
+	}
+}
+
 // Issue 47441.
 func TracebackContextPreemption() {
 	runtime.SetCgoTraceback(0, unsafe.Pointer(C.tcTraceback), unsafe.Pointer(C.tcContextSimple), unsafe.Pointer(C.tcSymbolizer))
@@ -133,4 +207,42 @@ func TracebackContextPreemption() {
 func TracebackContextPreemptionGoFunction(i C.int) {
 	// Do some busy work.
 	fmt.Sprintf("%d\n", i)
+}
+
+// Regression test for issue 71395.
+//
+// The SIGPROF handler can call the SetCgoTraceback traceback function if the
+// context function is also provided. Ensure that call is safe.
+func TracebackContextProfile() {
+	runtime.SetCgoTraceback(0, unsafe.Pointer(C.tcTraceback), unsafe.Pointer(C.tcContextSimple), unsafe.Pointer(C.tcSymbolizer))
+
+	if err := pprof.StartCPUProfile(io.Discard); err != nil {
+		panic(fmt.Sprintf("error starting CPU profile: %v", err))
+	}
+	defer pprof.StopCPUProfile()
+
+	const calls = 1e5
+	var wg sync.WaitGroup
+	for i := 0; i < runtime.GOMAXPROCS(0); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < calls; j++ {
+				C.TracebackContextProfileCallGo()
+			}
+		}()
+	}
+	wg.Wait()
+
+	fmt.Println("OK")
+}
+
+var sink atomic.Pointer[byte]
+
+//export TracebackContextProfileGoFunction
+func TracebackContextProfileGoFunction() {
+	// Issue 71395 occurs when SIGPROF lands on code running on the system
+	// stack in a cgo callback. The allocator uses the system stack.
+	b := make([]byte, 128)
+	sink.Store(&b[0])
 }

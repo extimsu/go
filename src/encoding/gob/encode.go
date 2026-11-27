@@ -394,6 +394,7 @@ func (enc *Encoder) encodeInterface(b *encBuffer, iv reflect.Value) {
 	state.sendZero = true
 	if iv.IsNil() {
 		state.encodeUint(0)
+		enc.freeEncoderState(state)
 		return
 	}
 
@@ -440,11 +441,14 @@ func (enc *Encoder) encodeGobEncoder(b *encBuffer, ut *userTypeInfo, v reflect.V
 	// We know it's one of these.
 	switch ut.externalEnc {
 	case xGob:
-		data, err = v.Interface().(GobEncoder).GobEncode()
+		gobEncoder, _ := reflect.TypeAssert[GobEncoder](v)
+		data, err = gobEncoder.GobEncode()
 	case xBinary:
-		data, err = v.Interface().(encoding.BinaryMarshaler).MarshalBinary()
+		binaryMarshaler, _ := reflect.TypeAssert[encoding.BinaryMarshaler](v)
+		data, err = binaryMarshaler.MarshalBinary()
 	case xText:
-		data, err = v.Interface().(encoding.TextMarshaler).MarshalText()
+		textMarshaler, _ := reflect.TypeAssert[encoding.TextMarshaler](v)
+		data, err = textMarshaler.MarshalText()
 	}
 	if err != nil {
 		error_(err)
@@ -478,7 +482,7 @@ var encOpTable = [...]encOp{
 
 // encOpFor returns (a pointer to) the encoding op for the base type under rt and
 // the indirection count to reach it.
-func encOpFor(rt reflect.Type, inProgress map[reflect.Type]*encOp, building map[*typeInfo]bool) (*encOp, int) {
+func encOpFor(rt reflect.Type, inProgress map[reflect.Type]*encOp, building map[*typeInfo]*encEngine) (*encOp, int) {
 	ut := userType(rt)
 	// If the type implements GobEncoder, we handle it without further processing.
 	if ut.externalEnc != 0 {
@@ -537,13 +541,10 @@ func encOpFor(rt reflect.Type, inProgress map[reflect.Type]*encOp, building map[
 			}
 		case reflect.Struct:
 			// Generate a closure that calls out to the engine for the nested type.
-			getEncEngine(userType(typ), building)
-			info := mustGetTypeInfo(typ)
+			engine := getEncEngine(userType(typ), building)
 			op = func(i *encInstr, state *encoderState, sv reflect.Value) {
 				state.update(i)
-				// indirect through info to delay evaluation for recursive structs
-				enc := info.encoder.Load()
-				state.enc.encodeStruct(state.b, enc, sv)
+				state.enc.encodeStruct(state.b, engine, sv)
 			}
 		case reflect.Interface:
 			op = func(i *encInstr, state *encoderState, iv reflect.Value) {
@@ -590,9 +591,11 @@ func gobEncodeOpFor(ut *userTypeInfo) (*encOp, int) {
 }
 
 // compileEnc returns the engine to compile the type.
-func compileEnc(ut *userTypeInfo, building map[*typeInfo]bool) *encEngine {
+// This is called from a recursive context; encLock must be locked.
+func compileEnc(info *typeInfo, ut *userTypeInfo, building map[*typeInfo]*encEngine) *encEngine {
 	srt := ut.base
 	engine := new(encEngine)
+	building[info] = engine // insert early to indicate building in progress, break any cycles
 	seen := make(map[reflect.Type]*encOp)
 	rt := ut.base
 	if ut.externalEnc != 0 {
@@ -620,41 +623,53 @@ func compileEnc(ut *userTypeInfo, building map[*typeInfo]bool) *encEngine {
 	return engine
 }
 
-// getEncEngine returns the engine to compile the type.
-func getEncEngine(ut *userTypeInfo, building map[*typeInfo]bool) *encEngine {
+// getEncEngine returns the engine for ut.
+// encLock must be locked.
+func getEncEngine(ut *userTypeInfo, building map[*typeInfo]*encEngine) *encEngine {
 	info, err := getTypeInfo(ut)
 	if err != nil {
 		error_(err)
 	}
-	enc := info.encoder.Load()
-	if enc == nil {
-		enc = buildEncEngine(info, ut, building)
+	if enc := info.encoder.Load(); enc != nil {
+		return enc
 	}
-	return enc
+	if enc, ok := building[info]; ok {
+		return enc
+	}
+	return compileEnc(info, ut, building)
 }
 
-func buildEncEngine(info *typeInfo, ut *userTypeInfo, building map[*typeInfo]bool) *encEngine {
-	// Check for recursive types.
-	if building != nil && building[info] {
-		return nil
+var encLock sync.Mutex // protects creation of encoders
+
+// getEncEngineOuter returns the engine for ut.
+// Use encLock to serialize compilation.
+func getEncEngineOuter(ut *userTypeInfo) *encEngine {
+	info, err := getTypeInfo(ut)
+	if err != nil {
+		error_(err)
 	}
-	info.encInit.Lock()
-	defer info.encInit.Unlock()
-	enc := info.encoder.Load()
-	if enc == nil {
-		if building == nil {
-			building = make(map[*typeInfo]bool)
-		}
-		building[info] = true
-		enc = compileEnc(ut, building)
-		info.encoder.Store(enc)
+	if enc := info.encoder.Load(); enc != nil {
+		return enc
+	}
+	// serialize all encoder compilation, because type cycles can cause deadlocks.
+	encLock.Lock()
+	defer encLock.Unlock()
+	// if some other goroutine took care of this while the mutex was locked,
+	// don't repeat the work.
+	if enc := info.encoder.Load(); enc != nil {
+		return enc
+	}
+	building := make(map[*typeInfo]*encEngine)
+	enc := compileEnc(info, ut, building)
+	for info, e := range building {
+		info.encoder.Store(e)
 	}
 	return enc
 }
 
 func (enc *Encoder) encode(b *encBuffer, value reflect.Value, ut *userTypeInfo) {
 	defer catchError(&enc.err)
-	engine := getEncEngine(ut, nil)
+	engine := getEncEngineOuter(ut)
 	indir := ut.indir
 	if ut.externalEnc != 0 {
 		indir = int(ut.encIndir)
@@ -662,7 +677,7 @@ func (enc *Encoder) encode(b *encBuffer, value reflect.Value, ut *userTypeInfo) 
 	for i := 0; i < indir; i++ {
 		value = reflect.Indirect(value)
 	}
-	if ut.externalEnc == 0 && value.Type().Kind() == reflect.Struct {
+	if ut.externalEnc == 0 && value.Kind() == reflect.Struct {
 		enc.encodeStruct(b, engine, value)
 	} else {
 		enc.encodeSingle(b, engine, value)

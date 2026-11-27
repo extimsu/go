@@ -8,8 +8,10 @@ import (
 	"encoding"
 	"fmt"
 	"hash"
+	"internal/testhash"
 	"io"
 	"math/rand"
+	"strings"
 	"testing"
 )
 
@@ -21,6 +23,10 @@ func TestCastagnoliRace(t *testing.T) {
 	ieee := NewIEEE()
 	go MakeTable(Castagnoli)
 	ieee.Write([]byte("hello"))
+}
+
+func TestHashInterface(t *testing.T) {
+	testhash.TestHash(t, func() hash.Hash { return NewIEEE() })
 }
 
 type test struct {
@@ -62,6 +68,8 @@ var golden = []test{
 	{0x8c79fd79, 0x297a88ed, "Even if I could be Shakespeare, I think I should still choose to be Faraday. - A. Huxley", "crc\x01ʇ\x91Ml+\xb8\xa7", "crc\x01wB\x84\x81\xbf\xd6S\xdd"},
 	{0xa20b7167, 0x66ed1d8b, "The fugacity of a constituent in a mixture of gases at a given temperature is proportional to its mole fraction.  Lewis-Randall Rule", "crc\x01ʇ\x91M<lR[", "crc\x01wB\x84\x81{\xaco\xb1"},
 	{0x8e0bb443, 0xdcded527, "How can you write a big system without C++?  -Paul Glick", "crc\x01ʇ\x91M\x0e\x88\x89\xed", "crc\x01wB\x84\x813\xd7C\u007f"},
+	{0x1010dab0, 0x8a11661f, strings.Repeat("01234567", 1024), "crc\x01ʇ\x91M\x92\xe5\xba\xf3", "crc\x01wB\x84\x81\x1a\x02\x88Y"},
+	{0x772d04d7, 0x5a6f5c45, strings.Repeat("a", 1024+65), "crc\x01ʇ\x91M\xe7Љ\xd1", "crc\x01wB\x84\x81\x95B\xa9("},
 }
 
 // testGoldenIEEE verifies that the given function returns
@@ -133,8 +141,20 @@ func TestGoldenMarshal(t *testing.T) {
 				continue
 			}
 
+			stateAppend, err := h.(encoding.BinaryAppender).AppendBinary(make([]byte, 4, 32))
+			if err != nil {
+				t.Errorf("could not marshal: %v", err)
+				continue
+			}
+			stateAppend = stateAppend[4:]
+
 			if string(state) != g.halfStateIEEE {
 				t.Errorf("IEEE(%q) state = %q, want %q", g.in, state, g.halfStateIEEE)
+				continue
+			}
+
+			if string(stateAppend) != g.halfStateIEEE {
+				t.Errorf("IEEE(%q) state = %q, want %q", g.in, stateAppend, g.halfStateIEEE)
 				continue
 			}
 
@@ -165,8 +185,20 @@ func TestGoldenMarshal(t *testing.T) {
 				continue
 			}
 
+			stateAppend, err := h.(encoding.BinaryAppender).AppendBinary(make([]byte, 4, 32))
+			if err != nil {
+				t.Errorf("could not marshal: %v", err)
+				continue
+			}
+			stateAppend = stateAppend[4:]
+
 			if string(state) != g.halfStateCastagnoli {
 				t.Errorf("Castagnoli(%q) state = %q, want %q", g.in, state, g.halfStateCastagnoli)
+				continue
+			}
+
+			if string(stateAppend) != g.halfStateCastagnoli {
+				t.Errorf("Castagnoli(%q) state = %q, want %q", g.in, stateAppend, g.halfStateCastagnoli)
 				continue
 			}
 
@@ -199,7 +231,7 @@ func TestMarshalTableMismatch(t *testing.T) {
 	}
 }
 
-// TestSimple tests the slicing-by-8 algorithm.
+// TestSlicing tests the slicing-by-8 algorithm.
 func TestSlicing(t *testing.T) {
 	tab := slicingMakeTable(IEEE)
 	testGoldenIEEE(t, func(b []byte) uint32 {
@@ -245,6 +277,40 @@ func TestArchCastagnoli(t *testing.T) {
 	testCrossCheck(t, archUpdateCastagnoli, func(crc uint32, b []byte) uint32 {
 		return slicingUpdate(crc, slicingTable, b)
 	})
+}
+
+// TestArchMisaligned verifies that the arch-specific implementations handle
+// arbitrarily misaligned inputs correctly, matching the slicing-by-8 result
+// for every alignment offset 0..15 and for lengths around the fold cutoffs.
+// Some implementations (e.g. RISC-V CLMUL) read multi-byte words with LD,
+// which requires the address to be aligned; they must realign the input
+// themselves.
+func TestArchMisaligned(t *testing.T) {
+	if !archAvailableIEEE() {
+		t.Skip("arch-specific IEEE not available")
+	}
+	archInitIEEE()
+	archInitCastagnoli()
+	slicingIeee := slicingMakeTable(IEEE)
+	slicingCast := slicingMakeTable(Castagnoli)
+
+	lengths := []int{16, 17, 31, 32, 33, 47, 48, 63, 64, 65, 79, 80, 96,
+		127, 128, 129, 255, 256, 511, 512, 1024, 4096}
+	for _, n := range lengths {
+		for align := 0; align < 16; align++ {
+			buf := make([]byte, n+align+16) // +16 so a 16-byte word never reads past p
+			p := buf[align : align+n]
+			_, _ = rand.Read(p)
+			for _, crcInit := range []uint32{0, 0xdeadbeef} {
+				if got, want := archUpdateIEEE(crcInit, p), slicingUpdate(crcInit, slicingIeee, p); got != want {
+					t.Fatalf("IEEE n=%d align=%d crc=%08x: got %08x want %08x", n, align, crcInit, got, want)
+				}
+				if got, want := archUpdateCastagnoli(crcInit, p), slicingUpdate(crcInit, slicingCast, p); got != want {
+					t.Fatalf("Castagnoli n=%d align=%d crc=%08x: got %08x want %08x", n, align, crcInit, got, want)
+				}
+			}
+		}
+	}
 }
 
 func TestGolden(t *testing.T) {
@@ -300,7 +366,7 @@ func BenchmarkCRC32(b *testing.B) {
 
 func benchmarkAll(h hash.Hash32) func(b *testing.B) {
 	return func(b *testing.B) {
-		for _, size := range []int{15, 40, 512, 1 << 10, 4 << 10, 32 << 10} {
+		for _, size := range []int{15, 16, 32, 40, 60, 64, 120, 128, 400, 512, 1 << 10, 4 << 10, 32 << 10} {
 			name := fmt.Sprint(size)
 			if size >= 1024 {
 				name = fmt.Sprintf("%dkB", size/1024)

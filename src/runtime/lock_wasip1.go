@@ -17,7 +17,13 @@ const (
 
 	active_spin     = 4
 	active_spin_cnt = 30
+
+	mutexMLocksDelta = 16
 )
+
+type mWaitList struct{}
+
+func lockVerifyMSize() {}
 
 func mutexContended(l *mutex) bool {
 	return false
@@ -37,7 +43,7 @@ func lock2(l *mutex) {
 	if gp.m.locks < 0 {
 		throw("lock count")
 	}
-	gp.m.locks++
+	gp.m.locks += mutexMLocksDelta
 	l.key = mutex_locked
 }
 
@@ -50,7 +56,7 @@ func unlock2(l *mutex) {
 		throw("unlock of unlocked lock")
 	}
 	gp := getg()
-	gp.m.locks--
+	gp.m.locks -= mutexMLocksDelta
 	if gp.m.locks < 0 {
 		throw("lock count")
 	}
@@ -77,6 +83,18 @@ func notesleep(n *note) {
 func notetsleep(n *note, ns int64) bool {
 	throw("notetsleep not supported by wasi")
 	return false
+}
+
+//go:nosplit
+func semacreate(mp *m) {}
+
+func semasleep(ns int64) int32 {
+	throw("semasleep not supported by wasi")
+	return 0
+}
+
+func semawakeup(mp *m) {
+	throw("semawakeup not supported by wasi")
 }
 
 // same as runtime·notetsleep, but called on user g (not g0)
@@ -109,3 +127,6 @@ func checkTimeouts() {}
 
 //go:wasmimport wasi_snapshot_preview1 sched_yield
 func sched_yield() errno
+
+func stealRunnextSleep(ns int64) {}
+func stealRunnextWake()          {}

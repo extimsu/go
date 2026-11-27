@@ -92,8 +92,8 @@ package runtime
 
 import (
 	"internal/goos"
-	"runtime/internal/atomic"
-	"runtime/internal/sys"
+	"internal/runtime/atomic"
+	"internal/runtime/sys"
 	"unsafe"
 )
 
@@ -281,14 +281,18 @@ type scavengerState struct {
 	// g is the goroutine the scavenger is bound to.
 	g *g
 
-	// parked is whether or not the scavenger is parked.
-	parked bool
-
 	// timer is the timer used for the scavenger to sleep.
 	timer *timer
 
 	// sysmonWake signals to sysmon that it should wake the scavenger.
 	sysmonWake atomic.Uint32
+
+	// parked is whether or not the scavenger is parked.
+	parked bool
+
+	// printControllerReset instructs printScavTrace to signal that
+	// the controller was reset.
+	printControllerReset bool
 
 	// targetCPUFraction is the target CPU overhead for the scavenger.
 	targetCPUFraction float64
@@ -311,10 +315,6 @@ type scavengerState struct {
 	// using the controller and we hold sleepRatio at a conservative
 	// value. Used if the controller's assumptions fail to hold.
 	controllerCooldown int64
-
-	// printControllerReset instructs printScavTrace to signal that
-	// the controller was reset.
-	printControllerReset bool
 
 	// sleepStub is a stub used for testing to avoid actually having
 	// the scavenger sleep.
@@ -361,10 +361,10 @@ func (s *scavengerState) init() {
 	s.g = getg()
 
 	s.timer = new(timer)
-	s.timer.arg = s
-	s.timer.f = func(s any, _ uintptr) {
+	f := func(s any, _ uintptr, _ int64) {
 		s.(*scavengerState).wake()
 	}
+	s.timer.init(f, s)
 
 	// input: fraction of CPU time actually used.
 	// setpoint: ideal CPU fraction.
@@ -497,7 +497,7 @@ func (s *scavengerState) sleep(worked float64) {
 		// because we can't close over any variables without
 		// failing escape analysis.
 		start := nanotime()
-		resetTimer(s.timer, start+sleepTime)
+		s.timer.reset(start+sleepTime, 0)
 
 		// Mark ourselves as asleep and go to sleep.
 		s.parked = true
@@ -512,7 +512,7 @@ func (s *scavengerState) sleep(worked float64) {
 		// reason we might fail is that we've already woken up, but the timer
 		// might be in the process of firing on some other P; essentially we're
 		// racing with it. That's totally OK. Double wake-ups are perfectly safe.
-		stopTimer(s.timer)
+		s.timer.stop()
 		unlock(&s.lock)
 	} else {
 		unlock(&s.lock)
@@ -601,9 +601,8 @@ func (s *scavengerState) run() (released uintptr, worked float64) {
 		// Accumulate the amount of time spent scavenging.
 		r, duration := s.scavenge(scavengeQuantum)
 
-		// On some platforms we may see end >= start if the time it takes to scavenge
-		// memory is less than the minimum granularity of its clock (e.g. Windows) or
-		// due to clock bugs.
+		// A scavenging operation may take less time than the clock can measure.
+		// In that case, duration is zero.
 		//
 		// In this case, just assume scavenging takes 10 µs per regular physical page
 		// (determined empirically), and conservatively ignore the impact of huge pages
@@ -773,8 +772,6 @@ func (p *pageAlloc) scavengeOne(ci chunkIdx, searchIdx uint, max uintptr) uintpt
 			unlock(p.mheapLock)
 
 			if !p.test {
-				pageTraceScav(getg().m.p.ptr(), 0, addr, uintptr(npages))
-
 				// Only perform sys* operations if we're not in a test.
 				// It's dangerous to do so otherwise.
 				sysUnused(unsafe.Pointer(addr), uintptr(npages)*pageSize)
@@ -1137,7 +1134,7 @@ func (s *scavengeIndex) alloc(ci chunkIdx, npages uint) {
 	// TODO(mknyszek): Consider eagerly backing memory with huge pages
 	// here and track whether we believe this chunk is backed by huge pages.
 	// In the past we've attempted to use sysHugePageCollapse (which uses
-	// MADV_COLLAPSE on Linux, and is unsupported elswhere) for this purpose,
+	// MADV_COLLAPSE on Linux, and is unsupported elsewhere) for this purpose,
 	// but that caused performance issues in production environments.
 	s.chunks[ci].store(sc)
 }
